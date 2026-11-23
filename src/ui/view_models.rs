@@ -32,7 +32,7 @@ pub struct ContinueItem {
 
 /// The network lookups `continue_items` needs, injectable for tests.
 pub trait Catalog {
-    fn search(&self, title: &str, mode: Mode) -> Vec<ShowSummary>;
+    fn search(&self, title: &str, mode: Mode) -> anyhow::Result<Vec<ShowSummary>>;
     fn episodes(&self, show: &ShowSummary, mode: Mode) -> Vec<String>;
     fn media(&self, anilist_id: i64) -> Option<AniListMedia>;
 }
@@ -40,12 +40,15 @@ pub trait Catalog {
 /// Shows to pick up again, newest first: the app's own progress, then
 /// ani-cli history entries (newest lines last in its file) for shows without
 /// app progress, matched by title. `mode` applies to history entries, which
-/// do not record one. Blocks on `catalog`; run it off the UI thread.
+/// do not record one. `misses` holds (mode, normalized title) pairs no search
+/// matched; keep it for the session so they are not searched again. Blocks on
+/// `catalog`; run it off the UI thread.
 pub fn continue_items(
     db: &Mutex<Db>,
     history: &[HistoryEntry],
     mode: Mode,
     catalog: &impl Catalog,
+    misses: &mut HashSet<(Mode, String)>,
 ) -> Vec<ContinueItem> {
     let recent = lock(db)
         .recent_progress(PROGRESS_SHOWS)
@@ -78,10 +81,21 @@ pub fn continue_items(
             fraction,
         ));
     }
+    let mut seen_titles: HashSet<String> = HashSet::new();
+    for id in &seen {
+        if let Some(record) = stored_show(db, id) {
+            seen_titles.extend(show_titles(db, &record.summary));
+        }
+    }
     for entry in history.iter().rev().take(HISTORY_ENTRIES) {
-        let Some(record) = match_history(db, catalog, entry, mode) else {
+        let wanted = normalize_title(history_title(&entry.title));
+        if wanted.is_empty() || seen_titles.contains(&wanted) {
+            continue;
+        }
+        let Some(record) = match_history(db, catalog, entry, mode, misses) else {
             continue;
         };
+        seen_titles.extend(show_titles(db, &record.summary));
         if !seen.insert(record.summary.id.clone()) {
             continue;
         }
@@ -131,18 +145,34 @@ fn item_for(
     }
 }
 
+/// Normalized titles a history entry about `show` could carry.
+fn show_titles(db: &Mutex<Db>, show: &ShowSummary) -> Vec<String> {
+    let provider = lock(db).get_provider_title(&show.id).ok().flatten();
+    [
+        Some(show.title.as_str()),
+        show.english_title.as_deref(),
+        provider.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(normalize_title)
+    .filter(|t| !t.is_empty())
+    .collect()
+}
+
 /// The show a history entry is about: one whose remembered provider title
-/// matches, else an AllAnime search result with an equal (normalized) title,
-/// which is then remembered with the entry's title as its provider title.
+/// matches, else an AllAnime search result with an equal (normalized) title.
+/// A searched show without a provider title gets the entry's title as one.
 fn match_history(
     db: &Mutex<Db>,
     catalog: &impl Catalog,
     entry: &HistoryEntry,
     mode: Mode,
+    misses: &mut HashSet<(Mode, String)>,
 ) -> Option<ShowRecord> {
     let title = history_title(&entry.title);
     let wanted = normalize_title(title);
-    if wanted.is_empty() {
+    if wanted.is_empty() || misses.contains(&(mode, wanted.clone())) {
         return None;
     }
     let known = lock(db).provider_titles().unwrap_or_else(|err| {
@@ -156,12 +186,19 @@ fn match_history(
     {
         return Some(record);
     }
-    let found = catalog.search(title, mode).into_iter().find(|s| {
+    let results = catalog
+        .search(title, mode)
+        .inspect_err(|err| eprintln!("ani-gui: searching AllAnime for {title:?}: {err:#}"))
+        .ok()?;
+    let Some(found) = results.into_iter().find(|s| {
         normalize_title(&s.title) == wanted
             || s.english_title
                 .as_deref()
                 .is_some_and(|t| normalize_title(t) == wanted)
-    })?;
+    }) else {
+        misses.insert((mode, wanted));
+        return None;
+    };
     let db = lock(db);
     let record = match db.get_show(&found.id) {
         Ok(Some(record)) => record,
@@ -177,7 +214,12 @@ fn match_history(
             record
         }
     };
-    if let Err(err) = db.set_provider_title(&record.summary.id, title) {
+    let saved = match db.get_provider_title(&record.summary.id) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => db.set_provider_title(&record.summary.id, title),
+        Err(err) => Err(err),
+    };
+    if let Err(err) = saved {
         eprintln!("ani-gui: saving provider title: {err:#}");
     }
     Some(record)
@@ -312,6 +354,8 @@ pub struct EpisodeRow {
     pub thumb: Option<String>,
     pub fraction: f32,
     pub completed: bool,
+    /// Where playing this episode starts: its saved position unless finished.
+    pub start: f64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -329,10 +373,16 @@ impl ShowPageModel {
     pub fn build(
         show: &ShowSummary,
         media: Option<&AniListMedia>,
-        episodes: &[String],
+        episodes: Option<&[String]>,
         progress: &[Progress],
         mode: Mode,
     ) -> ShowPageModel {
+        let Some(episodes) = episodes else {
+            return ShowPageModel {
+                play_label: "Couldn't load episodes".into(),
+                ..ShowPageModel::default()
+            };
+        };
         if episodes.is_empty() {
             let other = match mode {
                 Mode::Sub => Mode::Dub,
@@ -360,12 +410,14 @@ impl ShowPageModel {
             .map(|ep| {
                 let watched = progress.iter().find(|p| p.ep == *ep);
                 let meta = media.and_then(|m| episode_meta(m, ep));
+                let completed = watched.is_some_and(progress::is_completed);
                 EpisodeRow {
                     ep: ep.clone(),
                     title: meta.and_then(|(title, _)| title).map(str::to_string),
                     thumb: meta.map(|(_, thumb)| thumb.to_string()),
                     fraction: watched.map_or(0.0, watched_fraction),
-                    completed: watched.is_some_and(progress::is_completed),
+                    completed,
+                    start: watched.filter(|_| !completed).map_or(0.0, |p| p.position),
                 }
             })
             .collect();
@@ -376,6 +428,36 @@ impl ShowPageModel {
             episodes: rows,
         }
     }
+}
+
+/// The Download-range control's starting bounds: the first unwatched
+/// episode (else the first) through the last.
+pub fn default_download_range(rows: &[EpisodeRow]) -> Option<(String, String)> {
+    let last = rows.last()?;
+    let first = rows.iter().find(|r| !r.completed).unwrap_or(&rows[0]);
+    Some((first.ep.clone(), last.ep.clone()))
+}
+
+/// The episodes numbered from `from` to `to` (either order, inclusive), in
+/// list order, or why there are none.
+pub fn download_range(episodes: &[String], from: &str, to: &str) -> Result<Vec<String>, String> {
+    let (Ok(a), Ok(b)) = (from.trim().parse::<f64>(), to.trim().parse::<f64>()) else {
+        return Err("Enter episode numbers, like 1 and 12".into());
+    };
+    let (low, high) = if a <= b { (a, b) } else { (b, a) };
+    let picked: Vec<String> = episodes
+        .iter()
+        .filter(|ep| ep.parse::<f64>().is_ok_and(|n| (low..=high).contains(&n)))
+        .cloned()
+        .collect();
+    if picked.is_empty() {
+        return Err(format!(
+            "No episodes between {} and {}",
+            from.trim(),
+            to.trim()
+        ));
+    }
+    Ok(picked)
 }
 
 #[cfg(test)]
@@ -445,13 +527,17 @@ mod tests {
     #[derive(Default)]
     struct FakeCatalog {
         results: Vec<ShowSummary>,
+        offline: bool,
         searches: RefCell<Vec<String>>,
     }
 
     impl Catalog for FakeCatalog {
-        fn search(&self, title: &str, _: Mode) -> Vec<ShowSummary> {
+        fn search(&self, title: &str, _: Mode) -> anyhow::Result<Vec<ShowSummary>> {
             self.searches.borrow_mut().push(title.to_string());
-            self.results.clone()
+            if self.offline {
+                anyhow::bail!("offline");
+            }
+            Ok(self.results.clone())
         }
         fn episodes(&self, _: &ShowSummary, _: Mode) -> Vec<String> {
             eps(5)
@@ -514,7 +600,7 @@ mod tests {
             progress("s1", "4", 1400.0, 1400.0, 10),
             progress("s1", "5", 560.0, 1400.0, 20),
         ];
-        let model = ShowPageModel::build(&s, None, &eps(10), &watched, Mode::Sub);
+        let model = ShowPageModel::build(&s, None, Some(&eps(10)), &watched, Mode::Sub);
         assert_eq!(model.play_label, "Resume E5");
         assert_eq!(model.play_target, Some(("5".into(), 560.0)));
         assert_eq!(model.episodes.len(), 10);
@@ -534,7 +620,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let model = ShowPageModel::build(&s, Some(&media), &eps(3), &[], Mode::Sub);
+        let model = ShowPageModel::build(&s, Some(&media), Some(&eps(3)), &[], Mode::Sub);
         assert_eq!(model.play_label, "Play E1");
         assert_eq!(model.play_target, Some(("1".into(), 0.0)));
         assert_eq!(model.episodes[0].thumb, None);
@@ -551,11 +637,73 @@ mod tests {
     #[test]
     fn show_page_model_no_episodes_in_mode() {
         let s = show("s1", "Frieren", None);
-        let model = ShowPageModel::build(&s, None, &[], &[], Mode::Dub);
+        let model = ShowPageModel::build(&s, None, Some(&[]), &[], Mode::Dub);
         assert_eq!(model.play_label, "No dub episodes");
         assert_eq!(model.play_target, None);
         assert_eq!(model.other_mode, Some(Mode::Sub));
         assert!(model.episodes.is_empty());
+    }
+
+    #[test]
+    fn show_page_model_episode_list_failed() {
+        let s = show("s1", "Frieren", None);
+        let model = ShowPageModel::build(&s, None, None, &[], Mode::Sub);
+        assert_eq!(model.play_label, "Couldn't load episodes");
+        assert_eq!(model.play_target, None);
+        assert_eq!(model.other_mode, None);
+        assert!(model.episodes.is_empty());
+    }
+
+    #[test]
+    fn episode_rows_resume_where_left_off_unless_completed() {
+        let s = show("s1", "Frieren", None);
+        let watched = [
+            progress("s1", "2", 100.0, 1400.0, 5),
+            progress("s1", "4", 1400.0, 1400.0, 10),
+            progress("s1", "5", 560.0, 1400.0, 20),
+        ];
+        let model = ShowPageModel::build(&s, None, Some(&eps(6)), &watched, Mode::Sub);
+        let starts: Vec<f64> = model.episodes.iter().map(|r| r.start).collect();
+        assert_eq!(starts, [0.0, 100.0, 0.0, 0.0, 560.0, 0.0]);
+    }
+
+    #[test]
+    fn download_range_defaults_to_first_unwatched_through_last() {
+        let s = show("s1", "Frieren", None);
+        let watched = [
+            progress("s1", "1", 1400.0, 1400.0, 5),
+            progress("s1", "2", 1400.0, 1400.0, 6),
+            progress("s1", "3", 300.0, 1400.0, 7),
+        ];
+        let model = ShowPageModel::build(&s, None, Some(&eps(6)), &watched, Mode::Sub);
+        assert_eq!(
+            default_download_range(&model.episodes),
+            Some(("3".into(), "6".into()))
+        );
+        let all = [progress("s1", "1", 1400.0, 1400.0, 5)];
+        let model = ShowPageModel::build(&s, None, Some(&eps(1)), &all, Mode::Sub);
+        assert_eq!(
+            default_download_range(&model.episodes),
+            Some(("1".into(), "1".into()))
+        );
+        assert_eq!(default_download_range(&[]), None);
+    }
+
+    #[test]
+    fn download_range_selects_episodes_between_bounds() {
+        let list: Vec<String> = ["1", "2", "2.5", "3", "10"].map(String::from).into();
+        let between = Ok(["2", "2.5", "3"].map(String::from).to_vec());
+        assert_eq!(download_range(&list, "2", "3"), between);
+        assert_eq!(download_range(&list, "3", "2"), between);
+        assert_eq!(download_range(&list, " 10 ", "10"), Ok(vec!["10".into()]));
+        assert_eq!(
+            download_range(&list, "4", "9"),
+            Err("No episodes between 4 and 9".into())
+        );
+        assert_eq!(
+            download_range(&list, "first", "3"),
+            Err("Enter episode numbers, like 1 and 12".into())
+        );
     }
 
     #[test]
@@ -577,6 +725,7 @@ mod tests {
             &[history("3", "Frieren: Beyond Journey's End")],
             Mode::Sub,
             &catalog,
+            &mut HashSet::new(),
         );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].show_id, "aa1");
@@ -609,6 +758,7 @@ mod tests {
             &[history("1", "Frieren: Beyond Journey's End")],
             Mode::Sub,
             &catalog,
+            &mut HashSet::new(),
         );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].show_id, "known");
@@ -633,10 +783,93 @@ mod tests {
             &[history("4", "Frieren"), history("1", "Nothing Like It")],
             Mode::Sub,
             &catalog,
+            &mut HashSet::new(),
         );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].ep, "2");
         assert_eq!(items[0].start, 300.0);
         assert!((items[0].fraction - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn continue_items_skips_seen_shows_before_searching() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        store(&db, &show("aa1", "Sousou no Frieren", Some("Frieren")));
+        db.lock()
+            .unwrap()
+            .save_progress(&progress("aa1", "2", 300.0, 1200.0, 50))
+            .unwrap();
+        let catalog = FakeCatalog {
+            results: vec![show("aa1", "Sousou no Frieren", Some("Frieren"))],
+            ..Default::default()
+        };
+        let items = continue_items(
+            &db,
+            &[history("4", "Frieren")],
+            Mode::Sub,
+            &catalog,
+            &mut HashSet::new(),
+        );
+        assert_eq!(items.len(), 1);
+        assert!(catalog.searches.borrow().is_empty());
+    }
+
+    #[test]
+    fn continue_items_never_overwrites_a_provider_title() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        store(&db, &show("aa1", "Sousou no Frieren", None));
+        db.lock()
+            .unwrap()
+            .set_provider_title("aa1", "Frieren (picked)")
+            .unwrap();
+        let catalog = FakeCatalog {
+            results: vec![show("aa1", "Sousou no Frieren", None)],
+            ..Default::default()
+        };
+        let items = continue_items(
+            &db,
+            &[history("2", "Sousou no Frieren")],
+            Mode::Sub,
+            &catalog,
+            &mut HashSet::new(),
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            db.lock()
+                .unwrap()
+                .get_provider_title("aa1")
+                .unwrap()
+                .as_deref(),
+            Some("Frieren (picked)")
+        );
+    }
+
+    #[test]
+    fn continue_items_remembers_misses() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        let catalog = FakeCatalog {
+            results: vec![show("x", "Something Else", None)],
+            ..Default::default()
+        };
+        let mut misses = HashSet::new();
+        let history = [history("1", "Nothing Like It")];
+        assert!(continue_items(&db, &history, Mode::Sub, &catalog, &mut misses).is_empty());
+        assert!(continue_items(&db, &history, Mode::Sub, &catalog, &mut misses).is_empty());
+        assert_eq!(catalog.searches.borrow().len(), 1);
+    }
+
+    #[test]
+    fn continue_items_retries_searches_that_failed() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        let catalog = FakeCatalog {
+            offline: true,
+            ..Default::default()
+        };
+        let mut misses = HashSet::new();
+        let history = [history("1", "Frieren")];
+        continue_items(&db, &history, Mode::Sub, &catalog, &mut misses);
+        continue_items(&db, &history, Mode::Sub, &catalog, &mut misses);
+        assert!(misses.is_empty());
+        assert_eq!(catalog.searches.borrow().len(), 2);
     }
 }

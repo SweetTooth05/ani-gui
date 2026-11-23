@@ -26,7 +26,6 @@ mod paths;
 mod player;
 #[allow(dead_code)]
 mod progress;
-#[allow(dead_code)]
 mod ui;
 
 use gpui::{

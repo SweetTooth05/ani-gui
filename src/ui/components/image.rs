@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::time::Duration;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    AbsoluteLength, Animation, AnimationExt, App, Asset, Div, EdgesRefinement, Hsla,
+    AbsoluteLength, Animation, AnimationExt, App, Asset, Div, EdgesRefinement, Global, Hsla,
     ImageAssetLoader, ImageCacheError, Img, IntoElement, ObjectFit, Pixels, RenderImage, Resource,
     SharedString, Window, div, img, prelude::*, pulsating_between,
 };
@@ -13,11 +13,14 @@ use crate::app::AppState;
 use crate::ui::theme;
 use crate::{images, paths};
 
-/// URL → local file, for every image fetched this session.
-static LOCAL: LazyLock<Mutex<HashMap<String, PathBuf>>> = LazyLock::new(Default::default);
+/// Decoded images kept in memory; older ones are decoded again from disk.
+const KEEP_DECODED: usize = 200;
+const RETRY_FIRST: Duration = Duration::from_secs(2);
+const RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Downloads (once, into the image cache) and decodes a remote image. gpui
-/// runs `load`'s future on its background executor and caches the result.
+/// runs `load`'s future on its background executor and caches the result
+/// until `remote_image` removes it.
 struct RemoteImage;
 
 impl Asset for RemoteImage {
@@ -36,20 +39,105 @@ impl Asset for RemoteImage {
         let path: Arc<Path> = dir.join(images::cache_key(&url)).into();
         let decode = <ImageAssetLoader as Asset>::load(Resource::Path(path), cx);
         async move {
-            fetch(&url, &dir).map_err(|err| ImageCacheError::Other(Arc::new(err)))?;
+            images::cached_image(&url, &dir)
+                .map_err(|err| ImageCacheError::Other(Arc::new(err)))?;
             decode.await
         }
     }
 }
 
-fn fetch(url: &str, dir: &Path) -> anyhow::Result<()> {
-    let local = || LOCAL.lock().unwrap_or_else(PoisonError::into_inner);
-    if local().contains_key(url) {
-        return Ok(());
+/// Which decoded images to keep (the least recently drawn go first once
+/// there are more than `capacity`) and when failed URLs may be tried again.
+struct ImagePolicy<T> {
+    capacity: usize,
+    tick: u64,
+    loaded: HashMap<String, (u64, T)>,
+    /// URL → (earliest retry, failures in a row).
+    failed: HashMap<String, (Instant, u32)>,
+}
+
+impl<T: Clone> ImagePolicy<T> {
+    fn new(capacity: usize) -> Self {
+        ImagePolicy {
+            capacity,
+            tick: 0,
+            loaded: HashMap::new(),
+            failed: HashMap::new(),
+        }
     }
-    let path = images::cached_image(url, dir)?;
-    local().insert(url.to_string(), path);
-    Ok(())
+
+    /// Notes that `url` was drawn; returns the image evicted to make room.
+    fn drawn(&mut self, url: &str, image: &T) -> Option<(String, T)> {
+        self.tick += 1;
+        if let Some(entry) = self.loaded.get_mut(url) {
+            entry.0 = self.tick;
+            return None;
+        }
+        self.failed.remove(url);
+        self.loaded
+            .insert(url.to_string(), (self.tick, image.clone()));
+        if self.loaded.len() <= self.capacity {
+            return None;
+        }
+        let oldest = self
+            .loaded
+            .iter()
+            .min_by_key(|(_, (tick, _))| *tick)
+            .map(|(url, _)| url.clone())?;
+        self.loaded
+            .remove(&oldest)
+            .map(|(_, image)| (oldest, image))
+    }
+
+    /// Notes a failed load; the wait before the next try doubles each time.
+    fn failed(&mut self, url: &str, now: Instant) {
+        let failures = self.failed.get(url).map_or(0, |(_, n)| *n) + 1;
+        let wait = RETRY_FIRST
+            .saturating_mul(1 << (failures - 1).min(16))
+            .min(RETRY_MAX);
+        self.failed.insert(url.to_string(), (now + wait, failures));
+    }
+
+    fn waiting(&self, url: &str, now: Instant) -> bool {
+        self.failed.get(url).is_some_and(|(retry, _)| now < *retry)
+    }
+}
+
+struct Images(ImagePolicy<Arc<RenderImage>>);
+
+impl Default for Images {
+    fn default() -> Self {
+        Images(ImagePolicy::new(KEEP_DECODED))
+    }
+}
+
+impl Global for Images {}
+
+/// Loads `url` for this frame: evicts the least recently drawn image once
+/// too many are decoded, and forgets failures so a later frame retries.
+fn use_remote(
+    url: &SharedString,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+    let now = Instant::now();
+    if cx.default_global::<Images>().0.waiting(url, now) {
+        return Some(Err(ImageCacheError::Asset("waiting to retry".into())));
+    }
+    let result = window.use_asset::<RemoteImage>(url, cx)?;
+    match &result {
+        Ok(image) => {
+            if let Some((old_url, old)) = cx.default_global::<Images>().0.drawn(url, image) {
+                cx.remove_asset::<RemoteImage>(&old_url.into());
+                cx.drop_image(old, Some(window));
+            }
+        }
+        Err(_) => {
+            cx.default_global::<Images>().0.failed(url, now);
+            cx.remove_asset::<RemoteImage>(url);
+        }
+    }
+    Some(result)
 }
 
 /// An image filling its parent (cover fit), with a shimmer while it loads
@@ -60,7 +148,7 @@ pub fn remote_image(url: &str) -> Img {
         if url.is_empty() {
             return Some(Err(ImageCacheError::Asset("no image".into())));
         }
-        window.use_asset::<RemoteImage>(&url, cx)
+        use_remote(&url, window, cx)
     })
     .size_full()
     .object_fit(ObjectFit::Cover)
@@ -112,4 +200,47 @@ pub fn shimmer() -> impl IntoElement {
             .with_easing(pulsating_between(0.35, 0.9)),
         |this, delta| this.opacity(delta),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evicts_the_least_recently_drawn() {
+        let mut policy = ImagePolicy::new(2);
+        assert_eq!(policy.drawn("a", &1), None);
+        assert_eq!(policy.drawn("b", &2), None);
+        assert_eq!(policy.drawn("a", &1), None);
+        assert_eq!(policy.drawn("c", &3), Some(("b".to_string(), 2)));
+        assert_eq!(policy.drawn("a", &1), None);
+        assert_eq!(policy.drawn("b", &2), Some(("c".to_string(), 3)));
+    }
+
+    #[test]
+    fn failed_urls_wait_longer_after_each_failure() {
+        let mut policy = ImagePolicy::<u8>::new(2);
+        let t0 = Instant::now();
+        assert!(!policy.waiting("a", t0));
+        policy.failed("a", t0);
+        assert!(policy.waiting("a", t0 + Duration::from_secs(1)));
+        assert!(!policy.waiting("a", t0 + RETRY_FIRST));
+        policy.failed("a", t0);
+        assert!(policy.waiting("a", t0 + RETRY_FIRST));
+        assert!(!policy.waiting("a", t0 + RETRY_FIRST * 2));
+        for _ in 0..20 {
+            policy.failed("a", t0);
+        }
+        assert!(!policy.waiting("a", t0 + RETRY_MAX));
+        assert!(!policy.waiting("b", t0));
+    }
+
+    #[test]
+    fn a_successful_load_clears_the_failure() {
+        let mut policy = ImagePolicy::new(2);
+        let t0 = Instant::now();
+        policy.failed("a", t0);
+        policy.drawn("a", &1);
+        assert!(!policy.waiting("a", t0));
+    }
 }

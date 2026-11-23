@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex, PoisonError};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
@@ -62,6 +62,8 @@ pub struct HomePage {
     refresh_task: Option<Task<()>>,
     /// Play/open in flight, with what the hero's Play button says meanwhile.
     action: Option<(Task<()>, SharedString)>,
+    /// History titles no AllAnime search matched this session.
+    history_misses: Arc<Mutex<HashSet<(Mode, String)>>>,
     scroll: ScrollHandle,
     rows: [ScrollHandle; 3],
 }
@@ -76,6 +78,7 @@ impl HomePage {
             refreshed: false,
             refresh_task: None,
             action: None,
+            history_misses: Arc::default(),
             scroll: ScrollHandle::new(),
             rows: Default::default(),
         };
@@ -94,6 +97,7 @@ impl HomePage {
         };
         let db = state.db.clone();
         let mode = state.settings.mode;
+        let misses = self.history_misses.clone();
         let first = !self.refreshed && self.data.is_empty();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             if first {
@@ -113,7 +117,9 @@ impl HomePage {
                 };
                 this.update(cx, |page, cx| page.set_data(data, cx)).ok();
             }
-            let (data, hero_play) = cx.background_spawn(async move { load(&db, mode) }).await;
+            let (data, hero_play) = cx
+                .background_spawn(async move { load(&db, mode, &misses) })
+                .await;
             this.update(cx, |page, cx| {
                 page.refresh_task = None;
                 page.refreshed = true;
@@ -122,6 +128,7 @@ impl HomePage {
             })
             .ok();
         }));
+        cx.notify();
     }
 
     fn set_data(&mut self, data: HomeData, cx: &mut Context<Self>) {
@@ -497,9 +504,17 @@ impl Render for HomePage {
                     )
                     .child(
                         div().child(
-                            button("home-retry", "Try again")
-                                .kind(ButtonKind::Secondary)
-                                .on_click(cx.listener(|page, _, _, cx| page.refresh(cx))),
+                            button(
+                                "home-retry",
+                                if self.refresh_task.is_some() {
+                                    "Trying again…"
+                                } else {
+                                    "Try again"
+                                },
+                            )
+                            .kind(ButtonKind::Secondary)
+                            .disabled(self.refresh_task.is_some())
+                            .on_click(cx.listener(|page, _, _, cx| page.refresh(cx))),
                         ),
                     )
                     .into_any_element()
@@ -568,11 +583,8 @@ type EpisodeMemo = HashMap<(String, Mode), (Instant, Vec<String>)>;
 static EPISODES: LazyLock<Mutex<EpisodeMemo>> = LazyLock::new(Default::default);
 
 impl Catalog for LiveCatalog<'_> {
-    fn search(&self, title: &str, mode: Mode) -> Vec<ShowSummary> {
-        allanime::search(title, mode).unwrap_or_else(|err| {
-            eprintln!("ani-gui: searching AllAnime for {title:?}: {err:#}");
-            Vec::new()
-        })
+    fn search(&self, title: &str, mode: Mode) -> Result<Vec<ShowSummary>> {
+        allanime::search(title, mode)
     }
 
     fn episodes(&self, show: &ShowSummary, mode: Mode) -> Vec<String> {
@@ -613,10 +625,17 @@ fn read_snapshot(db: &Mutex<Db>) -> Option<HomeData> {
 
 /// Everything Home shows, fetched fresh (catalog calls use their own cache),
 /// and the hero's show ready to play.
-fn load(db: &Mutex<Db>, mode: Mode) -> (HomeData, Option<HeroPlay>) {
+fn load(
+    db: &Mutex<Db>,
+    mode: Mode,
+    misses: &Mutex<HashSet<(Mode, String)>>,
+) -> (HomeData, Option<HeroPlay>) {
     let live = LiveCatalog { db };
     let history = history::read(&paths::ani_cli_history_path());
-    let continue_items = view_models::continue_items(db, &history, mode, &live);
+    let continue_items = {
+        let mut misses = misses.lock().unwrap_or_else(PoisonError::into_inner);
+        view_models::continue_items(db, &history, mode, &live, &mut misses)
+    };
     let trending = catalog::trending(db);
     let seeds: Vec<i64> = continue_items
         .iter()
@@ -661,7 +680,9 @@ fn hero_play(
             (show, item.mode, item.ep.clone(), item.start, episodes)
         }
         HeroSource::Trending(media) => {
-            let show = catalog::resolve_allanime(media, mode)?
+            // Sub lists nearly everything; a show without dub episodes then
+            // reports that below instead of looking missing.
+            let show = catalog::resolve_allanime(media, Mode::Sub)?
                 .ok_or_else(|| anyhow!("{} isn't on AllAnime", media_title(media)))?;
             lock(db).upsert_show(&ShowRecord {
                 summary: show.clone(),

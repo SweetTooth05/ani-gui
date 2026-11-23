@@ -187,9 +187,11 @@ impl Root {
         })
         .detach();
         let downloads = started.downloads.clone();
-        cx.on_app_quit(move |_, cx| {
-            let downloads = downloads.clone();
-            cx.background_spawn(async move { downloads.shutdown() })
+        // gpui waits only 100 ms for quit futures, too short for shutdown()'s
+        // grace period before it kills stuck ani-cli processes.
+        cx.on_app_quit(move |_, _| {
+            downloads.shutdown();
+            async {}
         })
         .detach();
         cx.set_global(AppState {

@@ -3,8 +3,8 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
+    App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
     fill, point, prelude::*, px, relative, size,
@@ -64,7 +64,10 @@ pub struct TextInput {
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
+    /// How far the text is scrolled left to keep the cursor in view.
+    scroll_x: Pixels,
     is_selecting: bool,
+    compact: bool,
 }
 
 impl EventEmitter<Changed> for TextInput {}
@@ -80,12 +83,28 @@ impl TextInput {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
+            scroll_x: px(0.),
             is_selecting: false,
+            compact: false,
         }
+    }
+
+    /// A smaller field, for numbers and short values.
+    pub fn compact(mut self) -> Self {
+        self.compact = true;
+        self
     }
 
     pub fn text(&self) -> &str {
         &self.content
+    }
+
+    /// Replaces the content without emitting `Changed`.
+    pub fn set_text(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.content = text.into();
+        self.selected_range = self.content.len()..self.content.len();
+        self.marked_range = None;
+        cx.notify();
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
@@ -217,7 +236,7 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        line.closest_index_for_x(position.x - bounds.left() + self.scroll_x)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -363,7 +382,7 @@ impl EntityInputHandler for TextInput {
         self.selected_range = new_selected_range_utf16
             .as_ref()
             .map(|range_utf16| self.range_from_utf16(range_utf16))
-            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
+            .map(|new_range| new_range.start + range.start..new_range.end + range.start)
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         cx.emit(Changed);
         cx.notify();
@@ -380,11 +399,11 @@ impl EntityInputHandler for TextInput {
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range.start),
+                bounds.left() + last_layout.x_for_index(range.start) - self.scroll_x,
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range.end),
+                bounds.left() + last_layout.x_for_index(range.end) - self.scroll_x,
                 bounds.bottom(),
             ),
         ))
@@ -398,7 +417,7 @@ impl EntityInputHandler for TextInput {
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
-        let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
+        let utf8_index = last_layout.index_for_x(point.x - line_point.x + self.scroll_x)?;
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -409,6 +428,7 @@ struct TextElement {
 
 struct PrepaintState {
     line: Option<ShapedLine>,
+    scroll_x: Pixels,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
 }
@@ -504,11 +524,19 @@ impl Element for TextElement {
             .text_system()
             .shape_line(display_text, font_size, &runs, None);
         // With only the placeholder shown, the cursor sits at its start.
-        let cursor_pos = if input.content.is_empty() {
+        let cursor_x = if input.content.is_empty() {
             px(0.)
         } else {
             line.x_for_index(cursor)
         };
+        let width = bounds.size.width - px(2.);
+        let scroll_x = input
+            .scroll_x
+            .min(cursor_x)
+            .max(cursor_x - width)
+            .min((line.width - width).max(px(0.)))
+            .max(px(0.));
+        let cursor_pos = cursor_x - scroll_x;
         let (selection, cursor) = if selected_range.is_empty() {
             (
                 None,
@@ -525,11 +553,11 @@ impl Element for TextElement {
                 Some(fill(
                     Bounds::from_corners(
                         point(
-                            bounds.left() + line.x_for_index(selected_range.start),
+                            bounds.left() + line.x_for_index(selected_range.start) - scroll_x,
                             bounds.top(),
                         ),
                         point(
-                            bounds.left() + line.x_for_index(selected_range.end),
+                            bounds.left() + line.x_for_index(selected_range.end) - scroll_x,
                             bounds.bottom(),
                         ),
                     ),
@@ -540,6 +568,7 @@ impl Element for TextElement {
         };
         PrepaintState {
             line: Some(line),
+            scroll_x,
             cursor,
             selection,
         }
@@ -561,23 +590,28 @@ impl Element for TextElement {
             ElementInputHandler::new(bounds, self.input.clone()),
             cx,
         );
-        if let Some(selection) = prepaint.selection.take() {
-            window.paint_quad(selection)
-        }
         let Some(line) = prepaint.line.take() else {
             return;
         };
-        if let Err(err) = line.paint(bounds.origin, window.line_height(), window, cx) {
-            eprintln!("ani-gui: painting text input: {err:#}");
-        }
-        if focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
+        let scroll_x = prepaint.scroll_x;
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            if let Some(selection) = prepaint.selection.take() {
+                window.paint_quad(selection)
+            }
+            let origin = point(bounds.left() - scroll_x, bounds.top());
+            if let Err(err) = line.paint(origin, window.line_height(), window, cx) {
+                eprintln!("ani-gui: painting text input: {err:#}");
+            }
+            if focus_handle.is_focused(window)
+                && let Some(cursor) = prepaint.cursor.take()
+            {
+                window.paint_quad(cursor);
+            }
+        });
         self.input.update(cx, |input, _| {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            input.scroll_x = scroll_x;
         });
     }
 }
@@ -608,9 +642,21 @@ impl Render for TextInput {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .h(px(56.))
-            .px(px(20.))
-            .rounded(px(12.))
+            .overflow_hidden()
+            .when(self.compact, |d| {
+                d.h(px(38.))
+                    .px(px(12.))
+                    .rounded(px(8.))
+                    .text_size(px(theme::BODY))
+                    .line_height(px(22.))
+            })
+            .when(!self.compact, |d| {
+                d.h(px(56.))
+                    .px(px(20.))
+                    .rounded(px(12.))
+                    .text_size(px(20.))
+                    .line_height(px(28.))
+            })
             .bg(theme::raised())
             .border_1()
             .border_color(if focused {
@@ -618,8 +664,6 @@ impl Render for TextInput {
             } else {
                 theme::line()
             })
-            .text_size(px(20.))
-            .line_height(px(28.))
             .text_color(theme::text())
             .child(TextElement { input: cx.entity() })
     }

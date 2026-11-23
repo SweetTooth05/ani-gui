@@ -1,11 +1,11 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{
-    AnyElement, Context, FontWeight, IntoElement, ScrollHandle, SharedString, Subscription, Task,
-    WeakEntity, Window, div, linear_color_stop, linear_gradient, prelude::*, px, relative,
+    AnyElement, Context, Entity, FontWeight, IntoElement, ScrollHandle, SharedString, Subscription,
+    Task, WeakEntity, Window, div, linear_color_stop, linear_gradient, prelude::*, px, relative,
 };
 
 use crate::anicli::{self, ResolveOutcome};
@@ -16,6 +16,7 @@ use crate::model::{AniListMedia, DlStatus, Mode, Progress, ShowRecord, ShowSumma
 use crate::ui::components::button::{ButtonKind, button, segmented};
 use crate::ui::components::image::{remote_image, rounded_image, shimmer};
 use crate::ui::components::poster::progress_bar;
+use crate::ui::components::text_input::TextInput;
 use crate::ui::components::toast;
 use crate::ui::theme;
 use crate::ui::view_models::{self, EpisodeRow, ShowPageModel, media_title};
@@ -61,18 +62,27 @@ struct Pick {
 pub struct ShowPage {
     root: WeakEntity<Root>,
     target: ShowRef,
+    /// The mode everything shown is in.
     mode: Mode,
+    /// A mode being switched to; `mode` changes once it has loaded.
+    loading_mode: Option<Mode>,
     quality: String,
     loaded: Option<Loaded>,
     load_error: Option<String>,
     model: ShowPageModel,
     page: usize,
     downloads: HashMap<String, EpisodeDownload>,
+    /// Episodes whose downloads are being started, by mode.
+    queuing: HashSet<(Mode, String)>,
     /// Episode being resolved for playback.
     resolving: Option<String>,
     play_error: Option<String>,
     pick: Option<Pick>,
     load_task: Option<Task<()>>,
+    sync_task: Option<Task<()>>,
+    range_from: Entity<TextInput>,
+    range_to: Entity<TextInput>,
+    range_error: Option<String>,
     scroll: ScrollHandle,
     _downloads_changed: Option<Subscription>,
 }
@@ -92,16 +102,22 @@ impl ShowPage {
             root,
             target,
             mode,
+            loading_mode: None,
             quality,
             loaded: None,
             load_error: None,
             model: ShowPageModel::default(),
             page: 0,
             downloads: HashMap::new(),
+            queuing: HashSet::new(),
             resolving: None,
             play_error: None,
             pick: None,
             load_task: None,
+            sync_task: None,
+            range_from: cx.new(|cx| TextInput::new("From", cx).compact()),
+            range_to: cx.new(|cx| TextInput::new("To", cx).compact()),
+            range_error: None,
             scroll: ScrollHandle::new(),
             _downloads_changed: subscription,
         };
@@ -115,25 +131,45 @@ impl ShowPage {
 
     /// (Re)loads the show, its episodes in the current mode and progress.
     pub fn reload(&mut self, cx: &mut Context<Self>) {
-        let Some(db) = self.state(cx).map(|s| s.db.clone()) else {
+        self.load(self.mode, cx);
+    }
+
+    /// Loads everything in `mode` in the background; the page switches to
+    /// `mode` only once it has all of it.
+    fn load(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        let Some(state) = self.state(cx) else {
             return;
         };
+        let (db, manager) = (state.db.clone(), state.downloads.clone());
         let mut target = self.target.clone();
         if let Some(loaded) = &self.loaded {
             target.allanime = Some(loaded.show.clone());
         }
-        let mode = self.mode;
         self.load_error = None;
+        self.loading_mode = (mode != self.mode).then_some(mode);
         let task = cx.spawn(async move |this, cx| {
             let loaded = cx
-                .background_spawn(async move { load(&db, &target, mode) })
+                .background_spawn(async move {
+                    let loaded = load(&db, &target, mode)?;
+                    let downloads = episode_downloads(&manager, &loaded.show.id, mode);
+                    anyhow::Ok((loaded, downloads))
+                })
                 .await;
             this.update(cx, |page, cx| {
+                page.load_task = None;
+                page.loading_mode = None;
                 match loaded {
-                    Ok(loaded) => {
+                    Ok((loaded, downloads)) => {
+                        if page.mode != mode {
+                            page.play_error = None;
+                        }
+                        page.mode = mode;
                         page.loaded = Some(loaded);
-                        page.rebuild();
-                        page.sync_downloads(cx);
+                        page.downloads = downloads;
+                        page.rebuild(cx);
+                    }
+                    Err(err) if page.loaded.is_some() => {
+                        toast::error(cx, format!("Couldn't load {mode} episodes: {err:#}"));
                     }
                     Err(err) => page.load_error = Some(format!("{err:#}")),
                 }
@@ -145,17 +181,19 @@ impl ShowPage {
         cx.notify();
     }
 
-    fn rebuild(&mut self) {
+    fn rebuild(&mut self, cx: &mut Context<Self>) {
         let Some(l) = &self.loaded else {
             return;
         };
-        self.model = ShowPageModel::build(
-            &l.show,
-            l.media.as_ref(),
-            &l.episodes,
-            &l.progress,
-            self.mode,
-        );
+        let episodes = l.episodes_error.is_none().then_some(l.episodes.as_slice());
+        self.model =
+            ShowPageModel::build(&l.show, l.media.as_ref(), episodes, &l.progress, self.mode);
+        let (from, to) =
+            view_models::default_download_range(&self.model.episodes).unwrap_or_default();
+        self.range_from
+            .update(cx, |input, cx| input.set_text(from, cx));
+        self.range_to.update(cx, |input, cx| input.set_text(to, cx));
+        self.range_error = None;
         let target_index = self
             .model
             .play_target
@@ -169,30 +207,26 @@ impl ShowPage {
         let (Some(state), Some(loaded)) = (self.state(cx), &self.loaded) else {
             return;
         };
-        let mut downloads = HashMap::new();
-        // Newest first: the first record per episode wins.
-        for (record, live) in state.downloads.snapshot() {
-            if record.show_id != loaded.show.id || record.mode != self.mode {
-                continue;
-            }
-            downloads
-                .entry(record.ep.clone())
-                .or_insert(EpisodeDownload {
-                    id: record.id,
-                    status: record.status,
-                    percent: live.and_then(|p| p.percent).unwrap_or(record.progress),
-                    error: record.error,
-                });
-        }
-        self.downloads = downloads;
-        cx.notify();
+        let manager = state.downloads.clone();
+        let (show_id, mode) = (loaded.show.id.clone(), self.mode);
+        self.sync_task = Some(cx.spawn(async move |this, cx| {
+            let id = show_id.clone();
+            let downloads = cx
+                .background_spawn(async move { episode_downloads(&manager, &id, mode) })
+                .await;
+            this.update(cx, |page, cx| {
+                if page.mode == mode && page.loaded.as_ref().is_some_and(|l| l.show.id == show_id) {
+                    page.downloads = downloads;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
-        if self.mode != mode {
-            self.mode = mode;
-            self.play_error = None;
-            self.reload(cx);
+        if self.loading_mode.unwrap_or(self.mode) != mode {
+            self.load(mode, cx);
         }
     }
 
@@ -310,29 +344,85 @@ impl ShowPage {
     }
 
     fn download(&mut self, ep: String, cx: &mut Context<Self>) {
+        self.queue(vec![ep], cx);
+    }
+
+    fn download_range(&mut self, cx: &mut Context<Self>) {
+        let Some(loaded) = &self.loaded else {
+            return;
+        };
+        let from = self.range_from.read(cx).text().to_string();
+        let to = self.range_to.read(cx).text().to_string();
+        match view_models::download_range(&loaded.episodes, &from, &to) {
+            Ok(eps) => {
+                self.range_error = None;
+                self.queue(eps, cx);
+            }
+            Err(err) => self.range_error = Some(err),
+        }
+        cx.notify();
+    }
+
+    /// Starts (or retries) downloads of `eps` in the background, skipping
+    /// episodes already downloaded or on their way.
+    fn queue(&mut self, eps: Vec<String>, cx: &mut Context<Self>) {
         let Some(state) = self.state(cx) else {
             return;
         };
         let Some(loaded) = &self.loaded else {
             return;
         };
-        let retry_id = self
-            .downloads
-            .get(&ep)
-            .filter(|d| matches!(d.status, DlStatus::Failed | DlStatus::Cancelled))
-            .map(|d| d.id.clone());
+        let mode = self.mode;
+        let jobs: Vec<(String, Option<String>)> = eps
+            .into_iter()
+            .filter(|ep| !self.queuing.contains(&(mode, ep.clone())))
+            .filter_map(|ep| match self.downloads.get(&ep) {
+                None => Some((ep, None)),
+                Some(d) if matches!(d.status, DlStatus::Failed | DlStatus::Cancelled) => {
+                    let id = d.id.clone();
+                    Some((ep, Some(id)))
+                }
+                Some(_) => None,
+            })
+            .collect();
+        let title = loaded.show.display_title().to_string();
+        let label = match jobs.as_slice() {
+            [] => {
+                toast::info(cx, "Those episodes are already downloaded or queued");
+                return;
+            }
+            [(ep, _)] => format!("Downloading {title} episode {ep}"),
+            many => format!("Downloading {} episodes of {title}", many.len()),
+        };
         let db = state.db.clone();
         let manager = state.downloads.clone();
         let dir = state.settings.download_dir.clone();
         let show = loaded.show.clone();
-        let (mode, quality) = (self.mode, self.quality.clone());
-        let label = format!("Downloading {} episode {ep}", show.display_title());
-        let task = cx.spawn(async move |_, cx| {
-            cx.background_spawn(async move {
-                start_download(&db, &manager, &show, &ep, mode, &quality, dir, retry_id)
+        let quality = self.quality.clone();
+        let started: Vec<(Mode, String)> = jobs.iter().map(|(ep, _)| (mode, ep.clone())).collect();
+        self.queuing.extend(started.iter().cloned());
+        cx.notify();
+        let task = cx.spawn(async move |this, cx| {
+            let show_id = show.id.clone();
+            let downloads = cx
+                .background_spawn(async move {
+                    for (ep, retry_id) in jobs {
+                        start_download(&db, &manager, &show, &ep, mode, &quality, &dir, retry_id);
+                    }
+                    episode_downloads(&manager, &show.id, mode)
+                })
+                .await;
+            this.update(cx, |page, cx| {
+                for key in &started {
+                    page.queuing.remove(key);
+                }
+                if page.mode == mode && page.loaded.as_ref().is_some_and(|l| l.show.id == show_id) {
+                    page.downloads = downloads;
+                }
+                toast::info(cx, label);
+                cx.notify();
             })
-            .await;
-            cx.update(|cx| toast::info(cx, label)).ok();
+            .ok();
         });
         task.detach();
     }
@@ -483,7 +573,7 @@ impl ShowPage {
         };
         let target = self.model.play_target.clone();
         let in_list = self.loaded.as_ref().is_some_and(|l| l.in_list);
-        let mode = self.mode;
+        let mode = self.loading_mode.unwrap_or(self.mode);
         let mut quality = segmented("show-quality");
         for (value, label) in QUALITIES {
             quality = quality.option(
@@ -618,8 +708,23 @@ impl ShowPage {
             });
         let body: AnyElement = if let Some(err) = &loaded.episodes_error {
             div()
-                .text_color(theme::danger())
-                .child(format!("Couldn't load the episode list: {err}"))
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap(px(12.))
+                .child(
+                    div()
+                        .max_w(px(720.))
+                        .text_color(theme::danger())
+                        .child(format!("Couldn't load the episode list: {err}")),
+                )
+                .child(
+                    button("episodes-retry", "Try again")
+                        .kind(ButtonKind::Secondary)
+                        .compact()
+                        .disabled(self.load_task.is_some())
+                        .on_click(cx.listener(|page, _, _, cx| page.reload(cx))),
+                )
                 .into_any_element()
         } else if total == 0 {
             div()
@@ -654,21 +759,46 @@ impl ShowPage {
             .pt(px(48.))
             .pb(px(72.))
             .child(heading)
+            .when(total > 0, |d| d.child(self.render_range(cx)))
             .child(body)
+            .into_any_element()
+    }
+
+    fn render_range(&self, cx: &mut Context<Self>) -> AnyElement {
+        let field = |input: &Entity<TextInput>| div().w(px(76.)).child(input.clone());
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(10.))
+            .text_size(px(theme::SMALL))
+            .text_color(theme::text_dim())
+            .child("Download episodes")
+            .child(field(&self.range_from))
+            .child("to")
+            .child(field(&self.range_to))
+            .child(
+                button("download-range", "Download")
+                    .kind(ButtonKind::Secondary)
+                    .compact()
+                    .on_click(cx.listener(|page, _, _, cx| page.download_range(cx))),
+            )
+            .children(
+                self.range_error
+                    .clone()
+                    .map(|err| div().text_color(theme::danger()).child(err)),
+            )
             .into_any_element()
     }
 
     fn render_episode(&self, index: usize, row: &EpisodeRow, cx: &mut Context<Self>) -> AnyElement {
         let ep = row.ep.clone();
-        let resume = self
-            .model
-            .play_target
-            .as_ref()
-            .filter(|(target, _)| *target == row.ep)
-            .map_or(0.0, |(_, start)| *start);
+        let resume = row.start;
         let resolving_this = self.resolving.as_deref() == Some(row.ep.as_str());
         let download = self.downloads.get(&row.ep);
+        let queuing = self.queuing.contains(&(self.mode, row.ep.clone()));
         let (dl_label, dl_enabled): (SharedString, bool) = match download.map(|d| d.status) {
+            _ if queuing => ("Queued".into(), false),
             None => ("Download".into(), true),
             Some(DlStatus::Queued) => ("Queued".into(), false),
             Some(DlStatus::Running) => (
@@ -1044,7 +1174,7 @@ fn start_download(
     ep: &str,
     mode: Mode,
     quality: &str,
-    dir: PathBuf,
+    dir: &Path,
     retry_id: Option<String>,
 ) {
     if let Some(id) = retry_id
@@ -1054,5 +1184,30 @@ fn start_download(
     }
     let provider = lock(db).get_provider_title(&show.id).ok().flatten();
     let req = anicli::build_request(show, provider.as_deref(), ep, mode, quality);
-    manager.start(show, req, &dir);
+    manager.start(show, req, dir);
+}
+
+/// This show's downloads in `mode`, by episode. Reads the manager's state,
+/// so call it off the UI thread.
+fn episode_downloads(
+    manager: &DownloadManager,
+    show_id: &str,
+    mode: Mode,
+) -> HashMap<String, EpisodeDownload> {
+    let mut downloads = HashMap::new();
+    // Newest first: the first record per episode wins.
+    for (record, live) in manager.snapshot() {
+        if record.show_id != show_id || record.mode != mode {
+            continue;
+        }
+        downloads
+            .entry(record.ep.clone())
+            .or_insert(EpisodeDownload {
+                id: record.id,
+                status: record.status,
+                percent: live.and_then(|p| p.percent).unwrap_or(record.progress),
+                error: record.error,
+            });
+    }
+    downloads
 }
