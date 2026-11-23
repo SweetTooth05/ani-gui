@@ -22,6 +22,8 @@ mod net;
 #[allow(dead_code)]
 mod paths;
 #[allow(dead_code)]
+mod player;
+#[allow(dead_code)]
 mod progress;
 
 use gpui::{

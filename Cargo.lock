@@ -66,6 +66,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "gpui",
+ "libloading",
  "nix 0.31.4",
  "regex",
  "rusqlite",
