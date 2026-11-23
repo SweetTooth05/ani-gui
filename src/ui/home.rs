@@ -4,14 +4,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{
-    AnyElement, AsyncApp, Context, FontWeight, IntoElement, ScrollHandle, SharedString, Task,
+    AnyElement, App, AsyncApp, Context, FontWeight, IntoElement, ScrollHandle, SharedString, Task,
     WeakEntity, Window, div, linear_color_stop, linear_gradient, prelude::*, px, relative,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::app::{AppState, PlayRequest, Root, Route, ShowRef};
 use crate::db::{self, Db};
-use crate::model::{AniListMedia, Mode, ShowRecord, ShowSummary};
+use crate::model::{AniListMedia, Mode, Settings, ShowRecord, ShowSummary};
 use crate::ui::components::button::{ButtonKind, button};
 use crate::ui::components::image::{remote_image, shimmer};
 use crate::ui::components::poster::{episode_card, poster_card};
@@ -184,6 +184,7 @@ impl HomePage {
         let mode = cx
             .try_global::<AppState>()
             .map_or(Mode::default(), |s| s.settings.mode);
+        let quality = settings_quality(cx);
         self.start_play(
             "Finding episodes…",
             move |db| {
@@ -197,6 +198,7 @@ impl HomePage {
                     ep: play.ep,
                     start: play.start,
                     episodes: play.episodes,
+                    quality,
                     local_file: None,
                     stream: None,
                 })
@@ -206,6 +208,7 @@ impl HomePage {
     }
 
     fn play_item(&mut self, item: ContinueItem, cx: &mut Context<Self>) {
+        let quality = settings_quality(cx);
         self.start_play(
             "Opening…",
             move |db| {
@@ -220,6 +223,7 @@ impl HomePage {
                     ep: item.ep,
                     start: item.start,
                     episodes,
+                    quality,
                     local_file: None,
                     stream: None,
                 })
@@ -614,6 +618,13 @@ impl Catalog for LiveCatalog<'_> {
 
 fn lock(db: &Mutex<Db>) -> std::sync::MutexGuard<'_, Db> {
     db.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn settings_quality(cx: &App) -> String {
+    cx.try_global::<AppState>().map_or_else(
+        || Settings::default().quality,
+        |s| s.settings.quality.clone(),
+    )
 }
 
 fn read_snapshot(db: &Mutex<Db>) -> Option<HomeData> {

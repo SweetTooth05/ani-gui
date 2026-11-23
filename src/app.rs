@@ -71,6 +71,8 @@ pub struct PlayRequest {
     pub ep: String,
     pub start: f64,
     pub episodes: Vec<String>,
+    /// Stream quality for this play and the episodes autoplayed after it.
+    pub quality: String,
     pub local_file: Option<PathBuf>,
     /// Already resolved by the Show page; None means the player resolves it.
     pub stream: Option<Stream>,

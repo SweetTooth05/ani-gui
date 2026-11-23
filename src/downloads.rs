@@ -1011,7 +1011,7 @@ printf '[download] 100%% of  100.00MiB in 00:00:40 at 2.50MiB/s\n'"#,
         assert_eq!(rec.quality, "720");
         assert_eq!(
             fs::read_to_string(out.join("args.txt")).unwrap(),
-            "-d\n-S\n1\n-e\n3\n-q\n720\n--dub\nFrieren: Beyond Journey's End\n"
+            "-d\n-S\n1\n-e\n3\n-q\n720\n--dub\nFrieren%3A Beyond Journey%27s End\n"
         );
         let shims = dir.join("cache").join("shims");
         assert_eq!(

@@ -22,10 +22,12 @@ use image::RgbaImage;
 use crate::anicli::ResolveOutcome;
 use crate::app::{AppState, Back, PlayRequest, Root};
 use crate::db::{self, Db};
-use crate::model::{Mode, Progress, Stream};
+use crate::downloads::DownloadManager;
+use crate::model::{DownloadRecord, Mode, Progress, Stream};
 use crate::playback;
 use crate::player::{MpvPlayer, PlaybackState, PlayerError};
 use crate::ui::components::button::{ButtonKind, button};
+use crate::ui::components::pick_dialog::pick_dialog;
 use crate::ui::theme;
 
 actions!(
@@ -95,8 +97,8 @@ pub struct PlayerView {
     /// Handed to the player's change callback once the player exists.
     wake: Option<UnboundedSender<()>>,
     db: Option<Arc<Mutex<Db>>>,
+    downloads: Option<Arc<DownloadManager>>,
     shims: Result<PathBuf, String>,
-    quality: String,
     autoplay: bool,
     focus: FocusHandle,
     focused: bool,
@@ -108,7 +110,6 @@ pub struct PlayerView {
     eof_handled: bool,
     up_next: Option<UpNext>,
     image: Option<Arc<RenderImage>>,
-    image_serial: u64,
     /// Device-pixel size mpv renders at, and a newer one still settling.
     render_size: Option<(u32, u32)>,
     pending_size: Option<(u32, u32)>,
@@ -131,17 +132,17 @@ pub struct PlayerView {
 
 impl PlayerView {
     pub fn new(req: PlayRequest, root: WeakEntity<Root>, cx: &mut Context<Self>) -> Self {
-        let (db, shims, quality, autoplay) = match cx.try_global::<AppState>() {
+        let (db, downloads, shims, autoplay) = match cx.try_global::<AppState>() {
             Some(s) => (
                 Some(s.db.clone()),
+                Some(s.downloads.clone()),
                 s.shims.clone(),
-                s.settings.quality.clone(),
                 s.settings.autoplay_next,
             ),
             None => (
                 None,
+                None,
                 Err("The library isn't open yet.".to_string()),
-                "best".to_string(),
                 true,
             ),
         };
@@ -163,8 +164,8 @@ impl PlayerView {
             player: None,
             wake: Some(tx),
             db,
+            downloads,
             shims,
-            quality,
             autoplay,
             focus: cx.focus_handle(),
             focused: false,
@@ -174,7 +175,6 @@ impl PlayerView {
             eof_handled: false,
             up_next: None,
             image: None,
-            image_serial: 0,
             render_size: None,
             pending_size: None,
             resize_task: None,
@@ -267,7 +267,7 @@ impl PlayerView {
         };
         self.phase = Phase::Resolving { pick: None };
         let (show, ep) = (self.req.show.clone(), self.req.ep.clone());
-        let (mode, quality) = (self.req.mode, self.quality.clone());
+        let (mode, quality) = (self.req.mode, self.req.quality.clone());
         let resolved = cx.background_spawn(async move {
             playback::resolve(&db, &shims, &show, &ep, mode, &quality, chosen.as_deref())
         });
@@ -297,7 +297,7 @@ impl PlayerView {
     }
 
     fn load(&mut self, stream: Stream, cx: &mut Context<Self>) {
-        let Some(player) = &self.player else {
+        let Some(player) = self.player.as_ref().filter(|_| !self.leaving) else {
             return;
         };
         self.started = false;
@@ -348,20 +348,24 @@ impl PlayerView {
             self.started = true;
             self.saved_at = now.time_pos;
         }
-        if self.started {
-            if now.eof && !self.eof_handled {
-                self.eof_handled = true;
-                self.save(cx).detach();
-                self.queue_next(cx);
-            } else if (now.paused && !prev.paused && !now.eof)
-                || playback::should_save(self.saved_at, now.time_pos)
-            {
-                self.save(cx).detach();
-            }
-            if prev.eof && !now.eof {
-                self.eof_handled = false;
-                self.up_next = None;
-            }
+        let can_queue = self.autoplay && self.next_ep().is_some();
+        let d = playback::decide(
+            &prev,
+            &now,
+            self.started,
+            self.saved_at,
+            self.eof_handled,
+            can_queue,
+        );
+        self.eof_handled = d.eof_handled;
+        if d.save {
+            self.save(cx).detach();
+        }
+        if d.queue_next {
+            self.queue_next(cx);
+        }
+        if d.cancel_up_next {
+            self.up_next = None;
         }
         if now.paused != prev.paused {
             self.poke(cx);
@@ -374,18 +378,12 @@ impl PlayerView {
         if !self.started {
             return None;
         }
-        let s = self.state;
-        let position = if s.eof && s.duration > 0.0 {
-            s.duration
-        } else {
-            s.time_pos
-        };
         Some(Progress {
             show_id: self.req.show.id.clone(),
             mode: self.req.mode,
             ep: self.req.ep.clone(),
-            position,
-            duration: s.duration,
+            position: playback::saved_position(&self.state),
+            duration: self.state.duration,
             updated_at: db::now(),
         })
     }
@@ -403,9 +401,6 @@ impl PlayerView {
     }
 
     fn queue_next(&mut self, cx: &mut Context<Self>) {
-        if !self.autoplay {
-            return;
-        }
         let Some(ep) = self.next_ep() else {
             return;
         };
@@ -422,7 +417,7 @@ impl PlayerView {
     }
 
     fn play_next(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.phase, Phase::Playing) {
+        if self.leaving || !matches!(self.phase, Phase::Playing) {
             return;
         }
         if let Some(ep) = self.next_ep() {
@@ -430,9 +425,13 @@ impl PlayerView {
         }
     }
 
-    /// Saves the current episode, then finds and plays `ep` (ani-cli records
-    /// it in its history like any other play).
+    /// Saves the current episode, then plays `ep` in the same quality: from
+    /// its saved position unless finished, and from its download if there
+    /// is one (otherwise ani-cli finds it and records it in its history).
     fn advance(&mut self, ep: String, cx: &mut Context<Self>) {
+        if self.leaving {
+            return;
+        }
         self.save(cx).detach();
         self.up_next = None;
         if let Some(player) = &self.player {
@@ -445,7 +444,37 @@ impl PlayerView {
         self.req.start = 0.0;
         self.req.stream = None;
         self.req.local_file = None;
-        self.resolve(None, cx);
+        self.phase = Phase::Resolving { pick: None };
+        let (db, downloads) = (self.db.clone(), self.downloads.clone());
+        let (show_id, mode, ep) = (self.req.show.id.clone(), self.req.mode, self.req.ep.clone());
+        let found = cx.background_spawn(async move {
+            let saved = db
+                .and_then(|db| {
+                    let db = db.lock().unwrap_or_else(PoisonError::into_inner);
+                    db.progress_for_show(&show_id, mode).ok()
+                })
+                .unwrap_or_default();
+            let records: Vec<DownloadRecord> = downloads
+                .map(|d| d.snapshot().into_iter().map(|(record, _)| record).collect())
+                .unwrap_or_default();
+            let file = playback::downloaded_file(&records, &show_id, mode, &ep)
+                .filter(|path| path.is_file());
+            (playback::resume_point(&saved, &ep), file)
+        });
+        self.resolve_task = Some(cx.spawn(async move |this, cx| {
+            let (start, file) = found.await;
+            this.update(cx, |view, cx| {
+                if view.leaving {
+                    return;
+                }
+                view.req.start = start;
+                view.req.local_file = file;
+                view.start_episode(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     /// Pauses, saves progress, then returns to the previous page.
@@ -454,6 +483,7 @@ impl PlayerView {
             return;
         }
         self.leaving = true;
+        self.up_next = None;
         if let Some(player) = &self.player {
             player.set_pause(true);
         }
@@ -678,27 +708,22 @@ impl PlayerView {
 
     /// Swaps in the player's newest frame, freeing the previous texture.
     fn sync_frame(&mut self, window: &mut Window) {
-        let frame = self.playing().and_then(MpvPlayer::latest_frame);
-        match frame {
-            Some(frame) if frame.serial != self.image_serial => {
-                // gpui's images hold BGRA, which is what mpv renders.
-                let Some(pixels) =
-                    RgbaImage::from_raw(frame.width, frame.height, frame.data.clone())
-                else {
-                    return;
-                };
-                let image = Arc::new(RenderImage::new(vec![image::Frame::new(pixels)]));
-                self.image_serial = frame.serial;
-                if let Some(old) = self.image.replace(image) {
-                    let _ = window.drop_image(old);
-                }
+        let Some(player) = self.playing() else {
+            if let Some(old) = self.image.take() {
+                let _ = window.drop_image(old);
             }
-            None => {
-                if let Some(old) = self.image.take() {
-                    let _ = window.drop_image(old);
-                }
-            }
-            Some(_) => {}
+            return;
+        };
+        let Some(frame) = player.take_frame() else {
+            return;
+        };
+        // gpui's images hold BGRA, which is what mpv renders.
+        let Some(pixels) = RgbaImage::from_raw(frame.width, frame.height, frame.data) else {
+            return;
+        };
+        let image = Arc::new(RenderImage::new(vec![image::Frame::new(pixels)]));
+        if let Some(old) = self.image.replace(image) {
+            let _ = window.drop_image(old);
         }
     }
 
@@ -1111,79 +1136,13 @@ impl PlayerView {
     }
 
     fn render_pick(&self, candidates: &[String], cx: &mut Context<Self>) -> AnyElement {
-        let title = self.req.show.display_title().to_string();
-        div()
-            .id("pick-scrim")
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme::scrim())
-            .child(
-                div()
-                    .id("pick")
-                    .w(px(560.))
-                    .max_h(px(560.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(16.))
-                    .p(px(28.))
-                    .rounded(px(16.))
-                    .bg(theme::night())
-                    .border_1()
-                    .border_color(theme::line())
-                    .shadow_lg()
-                    .child(
-                        div()
-                            .font_family(theme::DISPLAY_FONT)
-                            .font_weight(FontWeight::BOLD)
-                            .text_size(px(34.))
-                            .child("Which one is it?"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme::BODY))
-                            .line_height(relative(1.45))
-                            .text_color(theme::text_dim())
-                            .child(format!(
-                                "ani-cli's search didn't find an exact match for \u{201c}{title}\u{201d}. \
-                                 Pick the matching show and it will be used from now on."
-                            )),
-                    )
-                    .child(
-                        div()
-                            .id("pick-list")
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.))
-                            .overflow_y_scroll()
-                            .children(candidates.iter().enumerate().map(|(i, c)| {
-                                let chosen = c.clone();
-                                div()
-                                    .id(("candidate", i))
-                                    .px(px(16.))
-                                    .py(px(12.))
-                                    .rounded(px(10.))
-                                    .bg(theme::raised())
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme::raised_hover()))
-                                    .on_click(cx.listener(move |view, _, _, cx| {
-                                        view.choose(chosen.clone(), cx)
-                                    }))
-                                    .child(c.clone())
-                            })),
-                    )
-                    .child(
-                        div().flex().justify_end().child(
-                            button("pick-cancel", "Cancel")
-                                .kind(ButtonKind::Ghost)
-                                .on_click(cx.listener(|view, _, window, cx| view.go_back(window, cx))),
-                        ),
-                    ),
-            )
-            .into_any_element()
+        pick_dialog(
+            self.req.show.display_title(),
+            candidates,
+            cx.listener(|view, title: &str, _, cx| view.choose(title.to_string(), cx)),
+            cx.listener(|view, _, window, cx| view.go_back(window, cx)),
+            None,
+        )
     }
 
     fn render_failed(

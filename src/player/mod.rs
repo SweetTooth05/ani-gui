@@ -97,12 +97,30 @@ struct FrameSlot {
     /// False from `stop` until the next `load`: mpv may still hand out
     /// frames while it tears playback down.
     live: bool,
+    /// A frame was published since the last clear, even if it was taken.
+    shown: bool,
 }
 
 impl FrameSlot {
     fn clear(&mut self) {
         self.generation += 1;
         self.latest = None;
+        self.shown = false;
+    }
+
+    fn publish(&mut self, frame: Frame) {
+        self.latest = Some(Arc::new(frame));
+        self.shown = true;
+    }
+
+    fn take(&mut self) -> Option<Frame> {
+        let frame = self.latest.take()?;
+        Some(Arc::try_unwrap(frame).unwrap_or_else(|f| Frame {
+            width: f.width,
+            height: f.height,
+            data: f.data.clone(),
+            serial: f.serial,
+        }))
     }
 }
 
@@ -280,6 +298,8 @@ impl MpvPlayer {
             slot.generation += 1;
             slot.live = true;
         }
+        // `pause` outlives the file, and keep-open sets it at the end.
+        self.set_pause(false);
         let opts = loadfile_options(s, start_secs);
         let mut rc = self
             .shared
@@ -357,8 +377,9 @@ impl MpvPlayer {
         }
     }
 
-    pub fn latest_frame(&self) -> Option<Arc<Frame>> {
-        lock(&self.shared.frame).latest.clone()
+    /// Moves the newest frame out; `None` until the next one is rendered.
+    pub fn take_frame(&self) -> Option<Frame> {
+        lock(&self.shared.frame).take()
     }
 
     pub fn state(&self) -> PlaybackState {
@@ -484,7 +505,7 @@ fn render_loop(shared: &Shared, ctx: RenderCtx) {
             0
         };
         // A redraw (after a resize) only makes sense once video is showing.
-        let redraw = redraw && lock(&shared.frame).latest.is_some();
+        let redraw = redraw && lock(&shared.frame).shown;
         if flags & ffi::MPV_RENDER_UPDATE_FRAME == 0 && !redraw {
             continue;
         }
@@ -499,12 +520,12 @@ fn render_loop(shared: &Shared, ctx: RenderCtx) {
                 continue;
             }
             serial += 1;
-            slot.latest = Some(Arc::new(Frame {
+            slot.publish(Frame {
                 width: w,
                 height: h,
                 data,
                 serial,
-            }));
+            });
         }
         shared.notify();
     }
@@ -637,6 +658,32 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
+    fn frame(serial: u64) -> Frame {
+        Frame {
+            width: 2,
+            height: 1,
+            data: vec![1, 2, 3, 255, 4, 5, 6, 255],
+            serial,
+        }
+    }
+
+    #[test]
+    fn frame_slot_take_moves_frame_out() {
+        let mut slot = FrameSlot::default();
+        assert!(slot.take().is_none());
+        slot.publish(frame(1));
+        let data = slot.latest.as_ref().expect("published").data.as_ptr();
+        let taken = slot.take().expect("frame");
+        assert_eq!(taken.serial, 1);
+        assert_eq!(taken.data.as_ptr(), data, "moved, not copied");
+        assert!(slot.take().is_none(), "taken frames don't come back");
+        assert!(slot.shown, "video is still showing after a take");
+        slot.publish(frame(2));
+        slot.clear();
+        assert!(slot.take().is_none());
+        assert!(!slot.shown);
+    }
+
     #[test]
     fn loadfile_options_quote_values() {
         let s = Stream {
@@ -749,13 +796,15 @@ mod tests {
         };
         player.load(&stream, 0.0).expect("load");
 
+        let mut frame = None;
         assert!(
-            wait_for(Duration::from_secs(5), || player
-                .latest_frame()
-                .is_some_and(|f| f.width > 0)),
+            wait_for(Duration::from_secs(5), || {
+                frame = player.take_frame();
+                frame.as_ref().is_some_and(|f| f.width > 0)
+            }),
             "no frame within 5 s"
         );
-        let frame = player.latest_frame().expect("frame");
+        let frame = frame.expect("frame");
         assert_eq!(frame.data.len(), (frame.width * frame.height * 4) as usize);
         let pixels = frame.data.as_chunks::<4>().0;
         assert!(pixels.iter().all(|px| px[3] == 0xff));
@@ -785,20 +834,38 @@ mod tests {
             player.state().time_pos
         );
 
+        // Every frame so far was taken: a paused or ended clip must still be
+        // redrawn at the new size.
         player.set_render_size(160, 120);
         assert!(
             wait_for(Duration::from_secs(5), || player
-                .latest_frame()
+                .take_frame()
                 .is_some_and(|f| f.width == 160 && f.height == 120)),
             "no 160x120 frame after resize"
         );
 
+        // mpv pauses at the end (keep-open); the next load still plays.
+        assert!(
+            wait_for(Duration::from_secs(5), || {
+                let s = player.state();
+                s.eof && s.paused
+            }),
+            "clip did not end paused: {:?}",
+            player.state()
+        );
+        player.load(&stream, 0.0).expect("reload");
+        assert!(
+            wait_for(Duration::from_secs(5), || {
+                let s = player.state();
+                !s.paused && !s.eof && s.time_pos > 0.2
+            }),
+            "next load did not play: {:?}",
+            player.state()
+        );
+
         player.stop();
         std::thread::sleep(Duration::from_millis(300));
-        assert!(
-            player.latest_frame().is_none(),
-            "frame came back after stop"
-        );
+        assert!(player.take_frame().is_none(), "frame came back after stop");
 
         drop(player);
         let _ = std::fs::remove_dir_all(&dir);

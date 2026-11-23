@@ -406,10 +406,24 @@ pub(crate) fn episode_args(req: &EpisodeRequest) -> Vec<OsString> {
     if req.mode == Mode::Dub {
         args.push("--dub".into());
     }
-    // ani-cli puts the query into the search URL unencoded; hianime answers
-    // HTTP 400 for typographic apostrophes (AllAnime's "Journey’s").
-    args.push(req.query.replace(['’', '‘'], "'").into());
+    args.push(search_query(&req.query).into());
     args
+}
+
+/// `query` as ani-cli must receive it: ani-cli only turns spaces into `+`
+/// before pasting it into hianime's `search?keyword=` URL, so everything
+/// else that isn't URL-safe is percent-encoded here (hianime answers
+/// HTTP 400 for raw non-ASCII such as AllAnime's "Journey’s").
+fn search_query(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    for b in query.replace(['’', '‘'], "'").bytes() {
+        if b == b' ' || b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// The tail of ani-cli's output, without colour codes, blank lines and
@@ -745,8 +759,20 @@ mod tests {
         let req = build_request(&frieren(), None, "1", Mode::Sub, "best");
         assert_eq!(
             episode_args(&req),
-            ["-e", "1", "-q", "best", "Frieren: Beyond Journey's End"]
+            ["-e", "1", "-q", "best", "Frieren%3A Beyond Journey%27s End"]
         );
+    }
+
+    #[test]
+    fn search_query_percent_encodes_all_but_spaces() {
+        assert_eq!(
+            search_query("Re:Zero − Starting Life in Another World"),
+            "Re%3AZero %E2%88%92 Starting Life in Another World"
+        );
+        assert_eq!(search_query("Tom & Jerry?"), "Tom %26 Jerry%3F");
+        assert_eq!(search_query("100% #1 a+b/c"), "100%25 %231 a%2Bb%2Fc");
+        assert_eq!(search_query("Kaguya‘s ’Love’"), "Kaguya%27s %27Love%27");
+        assert_eq!(search_query("Dr._Stone-2~x"), "Dr._Stone-2~x");
     }
 
     #[test]
@@ -955,7 +981,7 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
         assert_eq!(
             fs::read_to_string(&log).unwrap(),
             format!(
-                "--no-detach|-e|1|-q|best|--dub|Frieren: Beyond Journey's End|{env_line}\n\
+                "--no-detach|-e|1|-q|best|--dub|Frieren%3A Beyond Journey%27s End|{env_line}\n\
                  --no-detach|-e|1|-q|best|--dub|Sousou no Frieren|{env_line}\n"
             )
         );

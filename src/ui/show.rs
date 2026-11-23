@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, IntoElement, ScrollHandle, SharedString, Subscription,
-    Task, WeakEntity, Window, div, linear_color_stop, linear_gradient, prelude::*, px, relative,
+    AnyElement, ClickEvent, Context, Entity, FontWeight, IntoElement, ScrollHandle, SharedString,
+    Subscription, Task, WeakEntity, Window, div, linear_color_stop, linear_gradient, prelude::*,
+    px, relative,
 };
 
 use crate::anicli::{self, ResolveOutcome};
@@ -15,6 +16,7 @@ use crate::downloads::DownloadManager;
 use crate::model::{AniListMedia, DlStatus, Mode, Progress, ShowRecord, ShowSummary};
 use crate::ui::components::button::{ButtonKind, button, segmented};
 use crate::ui::components::image::{remote_image, rounded_image, shimmer};
+use crate::ui::components::pick_dialog::pick_dialog;
 use crate::ui::components::poster::progress_bar;
 use crate::ui::components::text_input::TextInput;
 use crate::ui::components::toast;
@@ -296,7 +298,7 @@ impl ShowPage {
         self.pick = None;
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
-            let (show_bg, ep_bg) = (show.clone(), ep.clone());
+            let (show_bg, ep_bg, quality_bg) = (show.clone(), ep.clone(), quality.clone());
             let outcome = cx
                 .background_spawn(async move {
                     playback::resolve(
@@ -305,7 +307,7 @@ impl ShowPage {
                         &show_bg,
                         &ep_bg,
                         mode,
-                        &quality,
+                        &quality_bg,
                         chosen.as_deref(),
                     )
                 })
@@ -320,6 +322,7 @@ impl ShowPage {
                             ep,
                             start,
                             episodes,
+                            quality,
                             local_file: None,
                             stream: Some(stream),
                         };
@@ -942,86 +945,17 @@ impl ShowPage {
             .as_ref()
             .map(|l| l.show.display_title().to_string())
             .unwrap_or_else(|| self.target.title.clone());
-        div()
-            .id("pick-scrim")
-            .absolute()
-            .inset_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .bg(theme::scrim())
-            .on_click(cx.listener(|page, _, _, cx| {
-                page.pick = None;
-                cx.notify();
-            }))
-            .child(
-                div()
-                    .id("pick")
-                    .w(px(560.))
-                    .max_h(px(560.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(16.))
-                    .p(px(28.))
-                    .rounded(px(16.))
-                    .bg(theme::night())
-                    .border_1()
-                    .border_color(theme::line())
-                    .shadow_lg()
-                    .on_click(|_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .font_family(theme::DISPLAY_FONT)
-                            .font_weight(FontWeight::BOLD)
-                            .text_size(px(34.))
-                            .child("Which one is it?"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme::BODY))
-                            .line_height(relative(1.45))
-                            .text_color(theme::text_dim())
-                            .child(format!(
-                                "ani-cli's search didn't find an exact match for \u{201c}{title}\u{201d}. \
-                                 Pick the matching show and it will be used from now on."
-                            )),
-                    )
-                    .child(
-                        div()
-                            .id("pick-list")
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.))
-                            .overflow_y_scroll()
-                            .children(pick.candidates.iter().enumerate().map(|(i, c)| {
-                                let chosen = c.clone();
-                                div()
-                                    .id(("candidate", i))
-                                    .px(px(16.))
-                                    .py(px(12.))
-                                    .rounded(px(10.))
-                                    .bg(theme::raised())
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(theme::raised_hover()))
-                                    .on_click(cx.listener(move |page, _, _, cx| {
-                                        page.choose(chosen.clone(), cx)
-                                    }))
-                                    .child(c.clone())
-                            })),
-                    )
-                    .child(
-                        div().flex().justify_end().child(
-                            button("pick-cancel", "Cancel")
-                                .kind(ButtonKind::Ghost)
-                                .on_click(cx.listener(|page, _, _, cx| {
-                                    page.pick = None;
-                                    cx.notify();
-                                })),
-                        ),
-                    ),
-            )
-            .into_any_element()
+        let dismiss = |page: &mut Self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>| {
+            page.pick = None;
+            cx.notify();
+        };
+        pick_dialog(
+            &title,
+            &pick.candidates,
+            cx.listener(|page, title: &str, _, cx| page.choose(title.to_string(), cx)),
+            cx.listener(dismiss),
+            Some(Box::new(cx.listener(dismiss))),
+        )
     }
 }
 

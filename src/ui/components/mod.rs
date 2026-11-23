@@ -1,5 +1,6 @@
 pub mod button;
 pub mod image;
+pub mod pick_dialog;
 pub mod poster;
 pub mod row;
 pub mod text_input;
