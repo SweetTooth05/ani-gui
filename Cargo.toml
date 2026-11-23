@@ -9,6 +9,7 @@ license = "GPL-3.0-or-later"
 anyhow = "1.0.105"
 futures = "0.3.34"
 gpui = "0.2.2"
+image = { version = "0.25.10", default-features = false }
 libloading = "0.8.9"
 nix = { version = "0.31.4", features = ["fs", "process", "signal", "term"] }
 regex = "1.13.2"

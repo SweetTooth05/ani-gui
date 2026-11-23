@@ -22,6 +22,7 @@ mod model;
 mod net;
 #[allow(dead_code)]
 mod paths;
+mod playback;
 #[allow(dead_code)]
 mod player;
 #[allow(dead_code)]

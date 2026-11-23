@@ -5,16 +5,16 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use futures::StreamExt;
 use gpui::{
-    App, Context, Entity, FocusHandle, Global, KeyBinding, MouseButton, NavigationDirection,
-    SharedString, Window, actions, div, prelude::*, px,
+    App, Context, Entity, EntityId, FocusHandle, Global, KeyBinding, MouseButton,
+    NavigationDirection, SharedString, Window, actions, div, prelude::*, px,
 };
 
 use crate::db::Db;
 use crate::downloads::DownloadManager;
 use crate::model::{Mode, Settings, ShowSummary, Stream};
-use crate::ui::components::button::{ButtonKind, button};
 use crate::ui::components::toast::{self, Toasts};
 use crate::ui::home::HomePage;
+use crate::ui::player_view::{self, PlayerView};
 use crate::ui::search::SearchPage;
 use crate::ui::show::ShowPage;
 use crate::ui::{sidebar, theme};
@@ -24,6 +24,7 @@ actions!(ani_gui, [Back]);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("alt-left", Back, None)]);
+    player_view::bind_keys(cx);
 }
 
 /// Shared app services, set once startup has opened the database.
@@ -79,6 +80,7 @@ enum Page {
     Home(Entity<HomePage>),
     Search(Entity<SearchPage>),
     Show(Entity<ShowPage>),
+    Player(Entity<PlayerView>),
     /// Rendered by `Root` itself (pages later tasks build).
     Static,
 }
@@ -234,11 +236,11 @@ impl Root {
                 let show = show.clone();
                 Page::Show(cx.new(|cx| ShowPage::new(show, root, cx)))
             }
-            Route::MyList
-            | Route::Calendar
-            | Route::Downloads
-            | Route::Settings
-            | Route::Player(_) => Page::Static,
+            Route::Player(req) => {
+                let req = req.clone();
+                Page::Player(cx.new(|cx| PlayerView::new(req, root, cx)))
+            }
+            Route::MyList | Route::Calendar | Route::Downloads | Route::Settings => Page::Static,
         };
         if !matches!(route, Route::Show(_) | Route::Player(_)) {
             self.stack.clear();
@@ -247,8 +249,25 @@ impl Root {
         cx.notify();
     }
 
-    /// Returns to the previous page, if any.
+    /// Returns to the previous page, if any. The player saves its progress
+    /// first and then calls `close_player`.
     pub fn back(&mut self, cx: &mut Context<Self>) {
+        if let Some(Page::Player(player)) = self.stack.last().map(|e| &e.page) {
+            player.clone().update(cx, |player, cx| player.leave(cx));
+            return;
+        }
+        self.pop(cx);
+    }
+
+    /// Leaves the player page `id` if it is still the current page.
+    pub fn close_player(&mut self, id: EntityId, cx: &mut Context<Self>) {
+        let current = self.stack.last().map(|e| &e.page);
+        if matches!(current, Some(Page::Player(player)) if player.entity_id() == id) {
+            self.pop(cx);
+        }
+    }
+
+    fn pop(&mut self, cx: &mut Context<Self>) {
         if self.stack.len() > 1 {
             self.stack.pop();
             match self.stack.last().map(|e| &e.page) {
@@ -264,7 +283,7 @@ impl Root {
         self.stack.last().map(|e| &e.route)
     }
 
-    fn render_page(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_page(&self) -> gpui::AnyElement {
         let Some(entry) = self.stack.last() else {
             return div().into_any_element();
         };
@@ -272,14 +291,7 @@ impl Root {
             (Page::Home(home), _) => home.clone().into_any_element(),
             (Page::Search(search), _) => search.clone().into_any_element(),
             (Page::Show(show), _) => show.clone().into_any_element(),
-            (Page::Static, Route::Player(req)) => {
-                let detail = format!("{}, episode {}", req.show.display_title(), req.ep);
-                placeholder(
-                    "The player arrives in the next build",
-                    detail,
-                    Some(Box::new(cx.listener(|this, _, _, cx| this.back(cx)))),
-                )
-            }
+            (Page::Player(player), _) => player.clone().into_any_element(),
             (Page::Static, route) => {
                 let title = match route {
                     Route::MyList => "My List",
@@ -287,15 +299,13 @@ impl Root {
                     Route::Downloads => "Downloads",
                     _ => "Settings",
                 };
-                placeholder(title, "This page is coming soon.".into(), None)
+                placeholder(title, "This page is coming soon.".into())
             }
         }
     }
 }
 
-type ClickHandler = Box<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>;
-
-fn placeholder(title: &str, detail: String, on_back: Option<ClickHandler>) -> gpui::AnyElement {
+fn placeholder(title: &str, detail: String) -> gpui::AnyElement {
     div()
         .size_full()
         .flex()
@@ -318,13 +328,6 @@ fn placeholder(title: &str, detail: String, on_back: Option<ClickHandler>) -> gp
                 .text_color(theme::text_dim())
                 .child(detail),
         )
-        .children(on_back.map(|on_back| {
-            div().pt_4().child(
-                button("placeholder-back", "Back")
-                    .kind(ButtonKind::Secondary)
-                    .on_click(on_back),
-            )
-        }))
         .into_any_element()
 }
 
@@ -335,8 +338,8 @@ impl Render for Root {
             Phase::Failed(err) => placeholder(
                 "Couldn't open your library",
                 format!("{err}\nDatabase: {}", paths::db_path().display()),
-                None,
             ),
+            Phase::Ready if matches!(self.current(), Some(Route::Player(_))) => self.render_page(),
             Phase::Ready => {
                 let active = self.current().cloned().unwrap_or(Route::Home);
                 div()
@@ -349,7 +352,7 @@ impl Render for Root {
                             .h_full()
                             .min_w_0()
                             .overflow_hidden()
-                            .child(self.render_page(cx)),
+                            .child(self.render_page()),
                     )
                     .into_any_element()
             }

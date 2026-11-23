@@ -67,6 +67,7 @@ dependencies = [
  "anyhow",
  "futures",
  "gpui",
+ "image",
  "libloading",
  "nix 0.31.4",
  "regex",

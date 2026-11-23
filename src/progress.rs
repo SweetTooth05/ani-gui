@@ -25,7 +25,7 @@ pub fn history_continue(entry_ep: &str, episodes: &[String]) -> Option<String> {
 /// The episode following `ep` in `episodes` (sorted as AllAnime lists them).
 /// Labels compare numerically when both parse ("05" is "5"); an `ep` missing
 /// from the list continues at the first numerically higher episode.
-fn next_after(ep: &str, episodes: &[String]) -> Option<String> {
+pub fn next_after(ep: &str, episodes: &[String]) -> Option<String> {
     let num = |e: &str| e.parse::<f64>().ok().filter(|n| n.is_finite());
     let target = num(ep);
     let same = |e: &str| e == ep || (target.is_some() && num(e) == target);

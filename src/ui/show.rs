@@ -20,7 +20,7 @@ use crate::ui::components::text_input::TextInput;
 use crate::ui::components::toast;
 use crate::ui::theme;
 use crate::ui::view_models::{self, EpisodeRow, ShowPageModel, media_title};
-use crate::{allanime, catalog};
+use crate::{allanime, catalog, playback};
 
 const QUALITIES: [(&str, &str); 4] = [
     ("best", "Best"),
@@ -299,7 +299,15 @@ impl ShowPage {
             let (show_bg, ep_bg) = (show.clone(), ep.clone());
             let outcome = cx
                 .background_spawn(async move {
-                    resolve(&db, &shims, &show_bg, &ep_bg, mode, &quality, chosen)
+                    playback::resolve(
+                        &db,
+                        &shims,
+                        &show_bg,
+                        &ep_bg,
+                        mode,
+                        &quality,
+                        chosen.as_deref(),
+                    )
                 })
                 .await;
             this.update(cx, |page, cx| {
@@ -1144,26 +1152,6 @@ fn load(db: &Mutex<Db>, target: &ShowRef, mode: Mode) -> Result<Loaded> {
         in_list,
         episodes_error,
     })
-}
-
-fn resolve(
-    db: &Mutex<Db>,
-    shims: &std::path::Path,
-    show: &ShowSummary,
-    ep: &str,
-    mode: Mode,
-    quality: &str,
-    chosen: Option<String>,
-) -> Result<ResolveOutcome> {
-    let provider = match chosen {
-        Some(title) => {
-            lock(db).set_provider_title(&show.id, &title)?;
-            Some(title)
-        }
-        None => lock(db).get_provider_title(&show.id)?,
-    };
-    let req = anicli::build_request(show, provider.as_deref(), ep, mode, quality);
-    anicli::resolve(&req, shims)
 }
 
 #[allow(clippy::too_many_arguments)]
