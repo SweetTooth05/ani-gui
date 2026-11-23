@@ -406,7 +406,9 @@ pub(crate) fn episode_args(req: &EpisodeRequest) -> Vec<OsString> {
     if req.mode == Mode::Dub {
         args.push("--dub".into());
     }
-    args.push(req.query.as_str().into());
+    // ani-cli puts the query into the search URL unencoded; hianime answers
+    // HTTP 400 for typographic apostrophes (AllAnime's "Journey’s").
+    args.push(req.query.replace(['’', '‘'], "'").into());
     args
 }
 
@@ -739,6 +741,15 @@ mod tests {
     }
 
     #[test]
+    fn episode_args_search_with_ascii_apostrophes() {
+        let req = build_request(&frieren(), None, "1", Mode::Sub, "best");
+        assert_eq!(
+            episode_args(&req),
+            ["-e", "1", "-q", "best", "Frieren: Beyond Journey's End"]
+        );
+    }
+
+    #[test]
     fn build_request_prefers_provider_title() {
         let req = build_request(
             &frieren(),
@@ -944,7 +955,7 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
         assert_eq!(
             fs::read_to_string(&log).unwrap(),
             format!(
-                "--no-detach|-e|1|-q|best|--dub|Frieren: Beyond Journey’s End|{env_line}\n\
+                "--no-detach|-e|1|-q|best|--dub|Frieren: Beyond Journey's End|{env_line}\n\
                  --no-detach|-e|1|-q|best|--dub|Sousou no Frieren|{env_line}\n"
             )
         );
