@@ -129,7 +129,7 @@ never writes it. File: `$ANI_CLI_HIST_DIR` or `$XDG_STATE_HOME/ani-cli` or
 `~/.local/state/ani-cli`, file `ani-hsts`, lines `ep\tid\ttitle` (ids are the
 provider's, e.g. hianime slugs). On startup the app reads it for Continue
 Watching: entries without app progress are matched to the catalog by title
-(AllAnime search, normalized-title equality, else first result) and the
+(AllAnime search, normalized-title equality; no match → entry skipped, so a wrong show is never stored) and the
 history title is stored as that show's provider title.
 
 ### Player
@@ -182,7 +182,7 @@ My List, Calendar, Downloads, Settings.
 - **Home:** hero banner (first Continue Watching show, else top Trending):
   banner image with gradient, title, genres · year · score, synopsis, Resume /
   Play and + My List. Rows: Continue Watching (landscape cards, episode label,
-  progress bar), For You, Trending This Season (portrait posters). Rows scroll
+  progress bar), For You, Trending now (portrait posters). Rows scroll
   horizontally.
 - **Search:** text field (debounced 300 ms), Sub/Dub toggle, poster grid.
 - **Show page:** banner + cover, metadata, synopsis, genres, Sub/Dub toggle,
