@@ -10,7 +10,7 @@ pub const API: &str = "https://graphql.anilist.co";
 
 const CARD_FRAGMENT: &str = "fragment card on Media { id title { romaji english } \
     coverImage { extraLarge large } bannerImage description genres averageScore \
-    seasonYear format status episodes nextAiringEpisode { episode airingAt } }";
+    seasonYear format status episodes isAdult nextAiringEpisode { episode airingAt } }";
 
 const MEDIA_GQL: &str = "query ($id: Int) { Media(id: $id, type: ANIME) { \
     ...card streamingEpisodes { title thumbnail } } }";
@@ -138,7 +138,7 @@ pub fn parse_schedule(v: &Value) -> (Vec<Airing>, bool) {
         .map(|items| {
             items
                 .iter()
-                .filter(|a| a["media"].is_object())
+                .filter(|a| is_listable(&a["media"]))
                 .filter_map(|a| {
                     Some(Airing {
                         media: parse_media(&a["media"]),
@@ -175,10 +175,15 @@ pub fn parse_recommendations(v: &Value, seeds: &[i64]) -> Vec<AniListMedia> {
         .filter_map(|m| m["recommendations"]["nodes"].as_array())
         .flatten()
         .map(|node| &node["mediaRecommendation"])
-        .filter(|rec| rec.is_object())
+        .filter(|rec| is_listable(rec))
         .map(parse_media)
         .filter(|rec| seen.insert(rec.id))
         .collect()
+}
+
+/// A media object that is not marked adult.
+fn is_listable(media: &Value) -> bool {
+    media.is_object() && media["isAdult"].as_bool() != Some(true)
 }
 
 pub fn media(id: i64) -> Result<AniListMedia> {
@@ -326,5 +331,28 @@ mod tests {
             .map(|m| m.id)
             .collect();
         assert_eq!(ids, [10, 20, 30]);
+    }
+
+    #[test]
+    fn schedule_and_recommendations_skip_adult() {
+        assert!(CARD_FRAGMENT.contains("isAdult"));
+        let (items, _) = parse_schedule(&json!({ "data": { "Page": { "airingSchedules": [
+            { "episode": 1, "airingAt": 10, "media": { "id": 1, "isAdult": true } },
+            { "episode": 2, "airingAt": 20, "media": { "id": 2, "isAdult": false } },
+            { "episode": 3, "airingAt": 30, "media": { "id": 3 } }
+        ] } } }));
+        let ids: Vec<i64> = items.iter().map(|a| a.media.id).collect();
+        assert_eq!(ids, [2, 3]);
+
+        let rec =
+            |id: i64, adult: bool| json!({ "mediaRecommendation": { "id": id, "isAdult": adult } });
+        let v = json!({ "data": { "Page": { "media": [
+            { "id": 1, "recommendations": { "nodes": [rec(10, true), rec(20, false)] } }
+        ] } } });
+        let ids: Vec<i64> = parse_recommendations(&v, &[1])
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, [20]);
     }
 }

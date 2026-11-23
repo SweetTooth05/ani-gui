@@ -3,7 +3,6 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use anyhow::Result;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 
 use crate::db::{self, Db};
 use crate::model::{Airing, AniListMedia, Mode, ShowSummary};
@@ -45,12 +44,26 @@ pub fn for_you(db: &Mutex<Db>, seed_ids: &[i64]) -> Vec<AniListMedia> {
 /// matches from a romaji-title search, then an English-title search, else the
 /// first result.
 pub fn resolve_allanime(media: &AniListMedia, mode: Mode) -> Result<Option<ShowSummary>> {
-    let romaji = allanime::search(&media.title_romaji, mode)?;
+    resolve_with(media, mode, allanime::search)
+}
+
+fn resolve_with<S>(media: &AniListMedia, mode: Mode, search: S) -> Result<Option<ShowSummary>>
+where
+    S: Fn(&str, Mode) -> Result<Vec<ShowSummary>>,
+{
+    let romaji = search(&media.title_romaji, mode)?;
     if let Some(show) = pick_match(&romaji, media.id) {
         return Ok(Some(show));
     }
     let english = match &media.title_english {
-        Some(title) if *title != media.title_romaji => allanime::search(title, mode)?,
+        Some(title) if *title != media.title_romaji => match search(title, mode) {
+            Ok(found) => found,
+            Err(err) if !romaji.is_empty() => {
+                eprintln!("ani-gui: searching AllAnime for {title:?}: {err:#}");
+                Vec::new()
+            }
+            Err(err) => return Err(err),
+        },
         _ => Vec::new(),
     };
     if let Some(show) = pick_match(&english, media.id) {
@@ -75,32 +88,36 @@ where
     T: Serialize + DeserializeOwned,
     F: FnOnce() -> Result<T>,
 {
-    let value = cached_or(db, key, TTL_SECS, || Ok(serde_json::to_value(fetch()?)?))?;
-    serde_json::from_value(value)
-        .inspect_err(|err| eprintln!("ani-gui: cached {key} is unreadable: {err}"))
-        .ok()
+    cached_or(db, key, TTL_SECS, fetch)
 }
 
 /// Fresh cache entry, else `fetch` (stored on success), else the stale entry
-/// when the fetch fails. The DB lock is not held while fetching.
-fn cached_or<F: FnOnce() -> Result<Value>>(
-    db: &Mutex<Db>,
-    key: &str,
-    ttl: i64,
-    fetch: F,
-) -> Option<Value> {
+/// when the fetch fails. Entries that no longer decode as `T` count as
+/// missing. The DB lock is not held while fetching.
+fn cached_or<T, F>(db: &Mutex<Db>, key: &str, ttl: i64, fetch: F) -> Option<T>
+where
+    T: Serialize + DeserializeOwned,
+    F: FnOnce() -> Result<T>,
+{
     let read = |json: Result<Option<String>>| {
         json.inspect_err(|err| eprintln!("ani-gui: reading cache {key}: {err:#}"))
             .ok()
             .flatten()
-            .and_then(|json| serde_json::from_str(&json).ok())
+            .and_then(|json| {
+                serde_json::from_str(&json)
+                    .inspect_err(|err| eprintln!("ani-gui: cached {key} is unreadable: {err}"))
+                    .ok()
+            })
     };
     if let Some(value) = read(lock(db).cache_get(key, ttl)) {
         return Some(value);
     }
     match fetch() {
         Ok(value) => {
-            if let Err(err) = lock(db).cache_put(key, &value.to_string()) {
+            let stored = serde_json::to_string(&value)
+                .map_err(anyhow::Error::from)
+                .and_then(|json| lock(db).cache_put(key, &json));
+            if let Err(err) = stored {
                 eprintln!("ani-gui: writing cache {key}: {err:#}");
             }
             Some(value)
@@ -115,7 +132,7 @@ fn cached_or<F: FnOnce() -> Result<Value>>(
 #[cfg(test)]
 mod tests {
     use anyhow::anyhow;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
 
@@ -126,7 +143,10 @@ mod tests {
     #[test]
     fn cache_get_stale_allowed() {
         let db = db();
-        assert_eq!(cached_or(&db, "k", 3600, || Err(anyhow!("offline"))), None);
+        assert_eq!(
+            cached_or::<Value, _>(&db, "k", 3600, || Err(anyhow!("offline"))),
+            None
+        );
 
         db.lock()
             .unwrap()
@@ -151,7 +171,7 @@ mod tests {
             Some("[1,2]")
         );
         assert_eq!(
-            cached_or(&db, "k", 3600, || panic!("fresh cache must not refetch")),
+            cached_or::<Value, _>(&db, "k", 3600, || panic!("fresh cache must not refetch")),
             Some(json!([1, 2]))
         );
         assert_eq!(cached_or(&db, "k", -1, || Ok(json!([3]))), Some(json!([3])));
@@ -169,5 +189,69 @@ mod tests {
         assert_eq!(pick_match(&results, 9).map(|s| s.id), Some("c".into()));
         assert_eq!(pick_match(&results, 8), None);
         assert_eq!(pick_match(&[], 9), None);
+    }
+
+    #[test]
+    fn cached_refetches_unreadable_fresh_row() {
+        let db = db();
+        db.lock()
+            .unwrap()
+            .cache_put("anilist:trending", r#"{"old_shape":true}"#)
+            .unwrap();
+        let fresh = AniListMedia {
+            id: 5,
+            title_romaji: "Fresh".into(),
+            ..Default::default()
+        };
+        let got: Option<Vec<AniListMedia>> =
+            cached(&db, "anilist:trending", || Ok(vec![fresh.clone()]));
+        assert_eq!(got, Some(vec![fresh.clone()]));
+        let stored = db
+            .lock()
+            .unwrap()
+            .cache_get_stale("anilist:trending")
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<AniListMedia>>(&stored.unwrap()).unwrap(),
+            [fresh]
+        );
+
+        // An unreadable stale row is no fallback either.
+        db.lock().unwrap().cache_put("k", "[1]").unwrap();
+        let got: Option<Vec<AniListMedia>> = cached(&db, "k", || Err(anyhow!("offline")));
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_romaji_when_english_search_fails() {
+        let media = AniListMedia {
+            id: 154587,
+            title_romaji: "Sousou no Frieren".into(),
+            title_english: Some("Frieren: Beyond Journey's End".into()),
+            ..Default::default()
+        };
+        let show = |id: &str| ShowSummary {
+            id: id.into(),
+            sub_count: 1,
+            ..Default::default()
+        };
+        let search = |q: &str, _: Mode| -> Result<Vec<ShowSummary>> {
+            if q.starts_with("Frieren") {
+                Err(anyhow!("HTTP 503"))
+            } else {
+                Ok(vec![show("romaji-1"), show("romaji-2")])
+            }
+        };
+        let got = resolve_with(&media, Mode::Sub, search).unwrap();
+        assert_eq!(got.map(|s| s.id).as_deref(), Some("romaji-1"));
+
+        let nothing = |q: &str, _: Mode| -> Result<Vec<ShowSummary>> {
+            if q.starts_with("Frieren") {
+                Err(anyhow!("HTTP 503"))
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        assert!(resolve_with(&media, Mode::Sub, nothing).is_err());
     }
 }

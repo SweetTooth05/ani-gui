@@ -66,6 +66,8 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "gpui",
+ "nix 0.31.4",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
