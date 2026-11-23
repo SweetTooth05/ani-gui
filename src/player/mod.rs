@@ -6,7 +6,7 @@
 
 mod ffi;
 
-use std::ffi::{CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -14,15 +14,16 @@ use std::thread::{self, JoinHandle};
 use std::{iter, ptr};
 
 use crate::model::Stream;
-use ffi::{Api, MpvEventProperty, MpvHandle, MpvRenderContext, MpvRenderParam};
+use ffi::{Api, MpvEventEndFile, MpvEventProperty, MpvHandle, MpvRenderContext, MpvRenderParam};
 
 const LIBRARY: &str = "libmpv.so.2";
+const HWDEC: &CStr = c"auto-copy";
 const DEFAULT_SIZE: (u32, u32) = (1280, 720);
 const MAX_SIDE: u32 = 16384;
 const STRIDE_ALIGN: usize = 64;
 
 /// Observed properties; the index is the `reply_userdata` mpv echoes back.
-const PROPERTIES: [(&std::ffi::CStr, c_int); 7] = [
+const PROPERTIES: [(&CStr, c_int); 7] = [
     (c"time-pos", ffi::MPV_FORMAT_DOUBLE),
     (c"duration", ffi::MPV_FORMAT_DOUBLE),
     (c"pause", ffi::MPV_FORMAT_FLAG),
@@ -87,11 +88,30 @@ struct Wake {
     shutdown: bool,
 }
 
+#[derive(Default)]
+struct FrameSlot {
+    latest: Option<Arc<Frame>>,
+    /// Bumped by `load`, `stop` and load failures so a render begun before
+    /// them can't publish its frame afterwards.
+    generation: u64,
+    /// False from `stop` until the next `load`: mpv may still hand out
+    /// frames while it tears playback down.
+    live: bool,
+}
+
+impl FrameSlot {
+    fn clear(&mut self) {
+        self.generation += 1;
+        self.latest = None;
+    }
+}
+
 struct Shared {
     api: Api,
     mpv: Handle,
     state: Mutex<PlaybackState>,
-    frame: Mutex<Option<Arc<Frame>>>,
+    frame: Mutex<FrameSlot>,
+    last_error: Mutex<Option<String>>,
     render_size: Mutex<(u32, u32)>,
     wake: Mutex<Wake>,
     wake_cv: Condvar,
@@ -125,6 +145,12 @@ impl Shared {
     }
 
     fn command(&self, args: &[&str]) -> Result<(), PlayerError> {
+        let rc = self.command_rc(args)?;
+        self.check(rc)
+    }
+
+    /// Runs a command and returns mpv's raw status code.
+    fn command_rc(&self, args: &[&str]) -> Result<c_int, PlayerError> {
         let owned = args
             .iter()
             .map(|a| CString::new(*a))
@@ -136,8 +162,7 @@ impl Shared {
             .chain(iter::once(ptr::null()))
             .collect();
         // SAFETY: argv is a NULL-terminated array of C strings outliving the call.
-        let rc = unsafe { (self.api.command)(self.mpv.0, argv.as_mut_ptr()) };
-        self.check(rc)
+        Ok(unsafe { (self.api.command)(self.mpv.0, argv.as_mut_ptr()) })
     }
 
     fn set_property(&self, name: &str, value: &str) -> Result<(), PlayerError> {
@@ -168,10 +193,10 @@ pub struct MpvPlayer {
 
 impl MpvPlayer {
     pub fn new() -> Result<MpvPlayer, PlayerError> {
-        MpvPlayer::with_library(LIBRARY)
+        MpvPlayer::with_library(LIBRARY, HWDEC)
     }
 
-    fn with_library(name: &str) -> Result<MpvPlayer, PlayerError> {
+    fn with_library(name: &str, hwdec: &CStr) -> Result<MpvPlayer, PlayerError> {
         let api =
             Api::load(name).map_err(|e| PlayerError::LibraryMissing(format!("{name}: {e}")))?;
         // SAFETY: plain constructor.
@@ -179,7 +204,7 @@ impl MpvPlayer {
         if mpv.is_null() {
             return Err(PlayerError::Mpv("mpv_create failed".into()));
         }
-        let render_ctx = match init(&api, mpv) {
+        let render_ctx = match init(&api, mpv, hwdec) {
             Ok(ctx) => ctx,
             Err(err) => {
                 // SAFETY: mpv is a valid handle with no render context.
@@ -192,7 +217,8 @@ impl MpvPlayer {
             api,
             mpv: Handle(mpv),
             state: Mutex::new(PlaybackState::default()),
-            frame: Mutex::new(None),
+            frame: Mutex::new(FrameSlot::default()),
+            last_error: Mutex::new(None),
             render_size: Mutex::new(DEFAULT_SIZE),
             wake: Mutex::new(Wake::default()),
             wake_cv: Condvar::new(),
@@ -246,10 +272,30 @@ impl MpvPlayer {
     }
 
     /// Starts `s` (a URL, or a local path in `s.url`) at `start_secs`.
+    /// Failures to open it arrive later through `last_error`.
     pub fn load(&self, s: &Stream, start_secs: f64) -> Result<(), PlayerError> {
+        *lock(&self.shared.last_error) = None;
+        {
+            let mut slot = lock(&self.shared.frame);
+            slot.generation += 1;
+            slot.live = true;
+        }
         let opts = loadfile_options(s, start_secs);
-        self.shared
-            .command(&["loadfile", &s.url, "replace", "-1", &opts])
+        let mut rc = self
+            .shared
+            .command_rc(&loadfile_args(&s.url, &opts, true))?;
+        if rc == ffi::MPV_ERROR_INVALID_PARAMETER {
+            // mpv < 0.38 has no index argument.
+            rc = self
+                .shared
+                .command_rc(&loadfile_args(&s.url, &opts, false))?;
+        }
+        self.shared.check(rc)
+    }
+
+    /// Why the last loaded stream failed to play, until the next `load`.
+    pub fn last_error(&self) -> Option<String> {
+        lock(&self.shared.last_error).clone()
     }
 
     // Controls are best-effort; mpv rejects most of them while nothing is loaded.
@@ -292,7 +338,9 @@ impl MpvPlayer {
 
     pub fn stop(&self) {
         let _ = self.shared.command(&["stop"]);
-        *lock(&self.shared.frame) = None;
+        let mut slot = lock(&self.shared.frame);
+        slot.clear();
+        slot.live = false;
     }
 
     /// Size of the frames rendered from now on (clamped to at least 1×1).
@@ -310,7 +358,7 @@ impl MpvPlayer {
     }
 
     pub fn latest_frame(&self) -> Option<Arc<Frame>> {
-        lock(&self.shared.frame).clone()
+        lock(&self.shared.frame).latest.clone()
     }
 
     pub fn state(&self) -> PlaybackState {
@@ -342,7 +390,7 @@ impl Drop for MpvPlayer {
 
 /// Sets options, initializes mpv, observes properties and creates the SW
 /// render context (which must exist before a file loads with `vo=libmpv`).
-fn init(api: &Api, mpv: *mut MpvHandle) -> Result<RenderCtx, PlayerError> {
+fn init(api: &Api, mpv: *mut MpvHandle, hwdec: &CStr) -> Result<RenderCtx, PlayerError> {
     let check = |rc: c_int| {
         if rc < 0 {
             Err(PlayerError::Mpv(api.error_message(rc)))
@@ -352,7 +400,7 @@ fn init(api: &Api, mpv: *mut MpvHandle) -> Result<RenderCtx, PlayerError> {
     };
     for (name, value) in [
         (c"vo", c"libmpv"),
-        (c"hwdec", c"auto-copy"),
+        (c"hwdec", hwdec),
         (c"keep-open", c"yes"),
     ] {
         // SAFETY: valid handle and static C strings.
@@ -397,6 +445,17 @@ fn loadfile_options(s: &Stream, start_secs: f64) -> String {
     .join(",")
 }
 
+/// `loadfile` argv: mpv ≥ 0.38 takes an insert index before the options,
+/// older versions take the options third.
+fn loadfile_args<'a>(url: &'a str, opts: &'a str, with_index: bool) -> Vec<&'a str> {
+    let mut args = vec!["loadfile", url, "replace"];
+    if with_index {
+        args.push("-1");
+    }
+    args.push(opts);
+    args
+}
+
 fn render_loop(shared: &Shared, ctx: RenderCtx) {
     let api = &shared.api;
     let mut buf = Vec::new();
@@ -425,21 +484,29 @@ fn render_loop(shared: &Shared, ctx: RenderCtx) {
             0
         };
         // A redraw (after a resize) only makes sense once video is showing.
-        let redraw = redraw && lock(&shared.frame).is_some();
+        let redraw = redraw && lock(&shared.frame).latest.is_some();
         if flags & ffi::MPV_RENDER_UPDATE_FRAME == 0 && !redraw {
             continue;
         }
         let (w, h) = *lock(&shared.render_size);
-        if let Some(data) = render(api, ctx.0, w, h, &mut buf) {
+        let generation = lock(&shared.frame).generation;
+        let Some(data) = render(api, ctx.0, w, h, &mut buf) else {
+            continue;
+        };
+        {
+            let mut slot = lock(&shared.frame);
+            if !slot.live || slot.generation != generation {
+                continue;
+            }
             serial += 1;
-            *lock(&shared.frame) = Some(Arc::new(Frame {
+            slot.latest = Some(Arc::new(Frame {
                 width: w,
                 height: h,
                 data,
                 serial,
             }));
-            shared.notify();
         }
+        shared.notify();
     }
     // SAFETY: render thread owns ctx; freed before mpv_terminate_destroy.
     unsafe {
@@ -517,6 +584,18 @@ fn event_loop(shared: &Shared) {
         let event = unsafe { &*event };
         match event.event_id {
             ffi::MPV_EVENT_SHUTDOWN => break,
+            // Events are ordered, so this also drops an error from a file
+            // replaced before its failure was reported.
+            ffi::MPV_EVENT_START_FILE => *lock(&shared.last_error) = None,
+            ffi::MPV_EVENT_END_FILE if !event.data.is_null() => {
+                // SAFETY: END_FILE carries an mpv_event_end_file.
+                let end = unsafe { &*(event.data as *const MpvEventEndFile) };
+                if end.reason == ffi::MPV_END_FILE_REASON_ERROR {
+                    *lock(&shared.last_error) = Some(api.error_message(end.error));
+                    lock(&shared.frame).clear();
+                    shared.notify();
+                }
+            }
             ffi::MPV_EVENT_PROPERTY_CHANGE if !event.data.is_null() => {
                 // SAFETY: PROPERTY_CHANGE carries an mpv_event_property.
                 let prop = unsafe { &*(event.data as *const MpvEventProperty) };
@@ -576,8 +655,49 @@ mod tests {
     }
 
     #[test]
+    fn loadfile_args_both_forms() {
+        assert_eq!(
+            loadfile_args("u", "o=%1%x", true),
+            ["loadfile", "u", "replace", "-1", "o=%1%x"]
+        );
+        assert_eq!(
+            loadfile_args("u", "o=%1%x", false),
+            ["loadfile", "u", "replace", "o=%1%x"]
+        );
+    }
+
+    /// Hardware decoding off keeps tests quiet and independent of the GPU.
+    fn test_player() -> Option<MpvPlayer> {
+        match MpvPlayer::with_library(LIBRARY, c"no") {
+            Ok(p) => Some(p),
+            Err(PlayerError::LibraryMissing(msg)) => {
+                eprintln!("skipping: libmpv not available: {msg}");
+                None
+            }
+            Err(err) => panic!("player init failed: {err}"),
+        }
+    }
+
+    #[test]
+    fn load_missing_file_reports_error() {
+        let Some(player) = test_player() else { return };
+        let stream = Stream {
+            url: "/nonexistent/ani-gui-player-test.mp4".into(),
+            referrer: None,
+            audio_file: None,
+            sub_file: None,
+            title: None,
+        };
+        player.load(&stream, 0.0).expect("load");
+        assert!(
+            wait_for(Duration::from_secs(2), || player.last_error().is_some()),
+            "no error reported for a missing file"
+        );
+    }
+
+    #[test]
     fn load_library_missing_returns_error() {
-        match MpvPlayer::with_library("libdoes-not-exist.so") {
+        match MpvPlayer::with_library("libdoes-not-exist.so", c"no") {
             Err(PlayerError::LibraryMissing(msg)) => assert!(!msg.is_empty()),
             Err(other) => panic!("expected LibraryMissing, got {other}"),
             Ok(_) => panic!("expected LibraryMissing, got a player"),
@@ -619,14 +739,7 @@ mod tests {
             eprintln!("skipping: ffmpeg is not available to generate a test clip");
             return;
         };
-        let player = match MpvPlayer::new() {
-            Ok(p) => p,
-            Err(PlayerError::LibraryMissing(msg)) => {
-                eprintln!("skipping: libmpv not available: {msg}");
-                return;
-            }
-            Err(err) => panic!("player init failed: {err}"),
-        };
+        let Some(player) = test_player() else { return };
         let stream = Stream {
             url: clip.to_string_lossy().into_owned(),
             referrer: None,
@@ -650,6 +763,7 @@ mod tests {
             pixels.iter().any(|px| px[..3] != [0, 0, 0]),
             "frame is all black"
         );
+        assert_eq!(player.last_error(), None);
 
         assert!(
             wait_for(Duration::from_secs(5), || (player.state().duration - 3.0)
@@ -677,6 +791,13 @@ mod tests {
                 .latest_frame()
                 .is_some_and(|f| f.width == 160 && f.height == 120)),
             "no 160x120 frame after resize"
+        );
+
+        player.stop();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            player.latest_frame().is_none(),
+            "frame came back after stop"
         );
 
         drop(player);

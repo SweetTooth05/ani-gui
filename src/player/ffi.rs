@@ -19,9 +19,15 @@ pub const MPV_FORMAT_NONE: c_int = 0;
 pub const MPV_FORMAT_FLAG: c_int = 3;
 pub const MPV_FORMAT_DOUBLE: c_int = 5;
 
+pub const MPV_ERROR_INVALID_PARAMETER: c_int = -4;
+
 pub const MPV_EVENT_NONE: c_int = 0;
 pub const MPV_EVENT_SHUTDOWN: c_int = 1;
+pub const MPV_EVENT_START_FILE: c_int = 6;
+pub const MPV_EVENT_END_FILE: c_int = 7;
 pub const MPV_EVENT_PROPERTY_CHANGE: c_int = 22;
+
+pub const MPV_END_FILE_REASON_ERROR: c_int = 4;
 
 pub const MPV_RENDER_PARAM_INVALID: c_int = 0;
 pub const MPV_RENDER_PARAM_API_TYPE: c_int = 1;
@@ -46,6 +52,15 @@ pub struct MpvEventProperty {
     pub name: *const c_char,
     pub format: c_int,
     pub data: *mut c_void,
+}
+
+#[repr(C)]
+pub struct MpvEventEndFile {
+    pub reason: c_int,
+    pub error: c_int,
+    pub playlist_entry_id: i64,
+    pub playlist_insert_id: i64,
+    pub playlist_insert_num_entries: c_int,
 }
 
 #[repr(C)]
