@@ -1,0 +1,1058 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+use anyhow::{Context as _, Result, anyhow};
+use gpui::{
+    AnyElement, Context, FontWeight, IntoElement, ScrollHandle, SharedString, Subscription, Task,
+    WeakEntity, Window, div, linear_color_stop, linear_gradient, prelude::*, px, relative,
+};
+
+use crate::anicli::{self, ResolveOutcome};
+use crate::app::{AppState, PlayRequest, Root, Route, ShowRef};
+use crate::db::{self, Db};
+use crate::downloads::DownloadManager;
+use crate::model::{AniListMedia, DlStatus, Mode, Progress, ShowRecord, ShowSummary};
+use crate::ui::components::button::{ButtonKind, button, segmented};
+use crate::ui::components::image::{remote_image, rounded_image, shimmer};
+use crate::ui::components::poster::progress_bar;
+use crate::ui::components::toast;
+use crate::ui::theme;
+use crate::ui::view_models::{self, EpisodeRow, ShowPageModel, media_title};
+use crate::{allanime, catalog};
+
+const QUALITIES: [(&str, &str); 4] = [
+    ("best", "Best"),
+    ("1080", "1080p"),
+    ("720", "720p"),
+    ("480", "480p"),
+];
+/// Long shows list their episodes a hundred at a time.
+const EPISODE_PAGE: usize = 100;
+const BANNER_H: f32 = 340.;
+const COVER_W: f32 = 200.;
+const COVER_H: f32 = 300.;
+
+struct Loaded {
+    show: ShowSummary,
+    media: Option<AniListMedia>,
+    episodes: Vec<String>,
+    progress: Vec<Progress>,
+    in_list: bool,
+    /// Why the episode list could not be fetched.
+    episodes_error: Option<String>,
+}
+
+/// A download's state for one episode of this show.
+struct EpisodeDownload {
+    id: String,
+    status: DlStatus,
+    percent: f32,
+    error: Option<String>,
+}
+
+/// ani-cli's candidate titles, awaiting the user's choice for one play.
+struct Pick {
+    candidates: Vec<String>,
+    ep: String,
+    start: f64,
+}
+
+pub struct ShowPage {
+    root: WeakEntity<Root>,
+    target: ShowRef,
+    mode: Mode,
+    quality: String,
+    loaded: Option<Loaded>,
+    load_error: Option<String>,
+    model: ShowPageModel,
+    page: usize,
+    downloads: HashMap<String, EpisodeDownload>,
+    /// Episode being resolved for playback.
+    resolving: Option<String>,
+    play_error: Option<String>,
+    pick: Option<Pick>,
+    load_task: Option<Task<()>>,
+    scroll: ScrollHandle,
+    _downloads_changed: Option<Subscription>,
+}
+
+impl ShowPage {
+    pub fn new(target: ShowRef, root: WeakEntity<Root>, cx: &mut Context<Self>) -> Self {
+        let (mode, quality, watch) = match cx.try_global::<AppState>() {
+            Some(s) => (
+                s.settings.mode,
+                s.settings.quality.clone(),
+                Some(s.downloads_changed.clone()),
+            ),
+            None => (Mode::default(), "best".to_string(), None),
+        };
+        let subscription = watch.map(|w| cx.observe(&w, |page, _, cx| page.sync_downloads(cx)));
+        let mut page = ShowPage {
+            root,
+            target,
+            mode,
+            quality,
+            loaded: None,
+            load_error: None,
+            model: ShowPageModel::default(),
+            page: 0,
+            downloads: HashMap::new(),
+            resolving: None,
+            play_error: None,
+            pick: None,
+            load_task: None,
+            scroll: ScrollHandle::new(),
+            _downloads_changed: subscription,
+        };
+        page.reload(cx);
+        page
+    }
+
+    fn state<'a>(&self, cx: &'a Context<Self>) -> Option<&'a AppState> {
+        cx.try_global::<AppState>()
+    }
+
+    /// (Re)loads the show, its episodes in the current mode and progress.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        let Some(db) = self.state(cx).map(|s| s.db.clone()) else {
+            return;
+        };
+        let mut target = self.target.clone();
+        if let Some(loaded) = &self.loaded {
+            target.allanime = Some(loaded.show.clone());
+        }
+        let mode = self.mode;
+        self.load_error = None;
+        let task = cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_spawn(async move { load(&db, &target, mode) })
+                .await;
+            this.update(cx, |page, cx| {
+                match loaded {
+                    Ok(loaded) => {
+                        page.loaded = Some(loaded);
+                        page.rebuild();
+                        page.sync_downloads(cx);
+                    }
+                    Err(err) => page.load_error = Some(format!("{err:#}")),
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.load_task = Some(task);
+        cx.notify();
+    }
+
+    fn rebuild(&mut self) {
+        let Some(l) = &self.loaded else {
+            return;
+        };
+        self.model = ShowPageModel::build(
+            &l.show,
+            l.media.as_ref(),
+            &l.episodes,
+            &l.progress,
+            self.mode,
+        );
+        let target_index = self
+            .model
+            .play_target
+            .as_ref()
+            .and_then(|(ep, _)| l.episodes.iter().position(|e| e == ep))
+            .unwrap_or(0);
+        self.page = target_index / EPISODE_PAGE;
+    }
+
+    fn sync_downloads(&mut self, cx: &mut Context<Self>) {
+        let (Some(state), Some(loaded)) = (self.state(cx), &self.loaded) else {
+            return;
+        };
+        let mut downloads = HashMap::new();
+        // Newest first: the first record per episode wins.
+        for (record, live) in state.downloads.snapshot() {
+            if record.show_id != loaded.show.id || record.mode != self.mode {
+                continue;
+            }
+            downloads
+                .entry(record.ep.clone())
+                .or_insert(EpisodeDownload {
+                    id: record.id,
+                    status: record.status,
+                    percent: live.and_then(|p| p.percent).unwrap_or(record.progress),
+                    error: record.error,
+                });
+        }
+        self.downloads = downloads;
+        cx.notify();
+    }
+
+    fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.play_error = None;
+            self.reload(cx);
+        }
+    }
+
+    fn toggle_list(&mut self, cx: &mut Context<Self>) {
+        let Some(db) = self.state(cx).map(|s| s.db.clone()) else {
+            return;
+        };
+        let Some(loaded) = self.loaded.as_mut() else {
+            return;
+        };
+        let add = !loaded.in_list;
+        loaded.in_list = add;
+        let id = loaded.show.id.clone();
+        cx.notify();
+        let task = cx.spawn(async move |this, cx| {
+            let saved = cx
+                .background_spawn(async move {
+                    let db = lock(&db);
+                    if add {
+                        db.my_list_add(&id)
+                    } else {
+                        db.my_list_remove(&id)
+                    }
+                })
+                .await;
+            if let Err(err) = saved {
+                this.update(cx, |page, cx| {
+                    if let Some(loaded) = page.loaded.as_mut() {
+                        loaded.in_list = !add;
+                    }
+                    toast::error(cx, format!("Couldn't update My List: {err:#}"));
+                    cx.notify();
+                })
+                .ok();
+            }
+        });
+        task.detach();
+    }
+
+    /// Resolves `ep` with ani-cli and opens the player. With `chosen`, that
+    /// title (picked from ani-cli's results) becomes the show's provider title
+    /// first, so this and later runs search for it.
+    fn play(&mut self, ep: String, start: f64, chosen: Option<String>, cx: &mut Context<Self>) {
+        if self.resolving.is_some() {
+            return;
+        }
+        let Some(state) = self.state(cx) else {
+            return;
+        };
+        let Some(loaded) = &self.loaded else {
+            return;
+        };
+        let shims = match &state.shims {
+            Ok(shims) => shims.clone(),
+            Err(err) => {
+                self.play_error = Some(err.clone());
+                cx.notify();
+                return;
+            }
+        };
+        let db = state.db.clone();
+        let show = loaded.show.clone();
+        let episodes = loaded.episodes.clone();
+        let (mode, quality) = (self.mode, self.quality.clone());
+        self.resolving = Some(ep.clone());
+        self.play_error = None;
+        self.pick = None;
+        cx.notify();
+        let task = cx.spawn(async move |this, cx| {
+            let (show_bg, ep_bg) = (show.clone(), ep.clone());
+            let outcome = cx
+                .background_spawn(async move {
+                    resolve(&db, &shims, &show_bg, &ep_bg, mode, &quality, chosen)
+                })
+                .await;
+            this.update(cx, |page, cx| {
+                page.resolving = None;
+                match outcome {
+                    Ok(ResolveOutcome::Stream(stream)) => {
+                        let req = PlayRequest {
+                            show,
+                            mode,
+                            ep,
+                            start,
+                            episodes,
+                            local_file: None,
+                            stream: Some(stream),
+                        };
+                        page.root
+                            .update(cx, |root, cx| root.navigate(Route::Player(req), cx))
+                            .ok();
+                    }
+                    Ok(ResolveOutcome::NeedsPick(candidates)) => {
+                        page.pick = Some(Pick {
+                            candidates,
+                            ep,
+                            start,
+                        });
+                    }
+                    Err(err) => {
+                        page.play_error = Some(format!("Couldn't start episode {ep}: {err:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        task.detach();
+    }
+
+    fn choose(&mut self, title: String, cx: &mut Context<Self>) {
+        if let Some(pick) = self.pick.take() {
+            self.play(pick.ep, pick.start, Some(title), cx);
+        }
+    }
+
+    fn download(&mut self, ep: String, cx: &mut Context<Self>) {
+        let Some(state) = self.state(cx) else {
+            return;
+        };
+        let Some(loaded) = &self.loaded else {
+            return;
+        };
+        let retry_id = self
+            .downloads
+            .get(&ep)
+            .filter(|d| matches!(d.status, DlStatus::Failed | DlStatus::Cancelled))
+            .map(|d| d.id.clone());
+        let db = state.db.clone();
+        let manager = state.downloads.clone();
+        let dir = state.settings.download_dir.clone();
+        let show = loaded.show.clone();
+        let (mode, quality) = (self.mode, self.quality.clone());
+        let label = format!("Downloading {} episode {ep}", show.display_title());
+        let task = cx.spawn(async move |_, cx| {
+            cx.background_spawn(async move {
+                start_download(&db, &manager, &show, &ep, mode, &quality, dir, retry_id)
+            })
+            .await;
+            cx.update(|cx| toast::info(cx, label)).ok();
+        });
+        task.detach();
+    }
+
+    fn back(&self, cx: &mut Context<Self>) {
+        self.root.update(cx, |root, cx| root.back(cx)).ok();
+    }
+
+    fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
+        let loaded = self.loaded.as_ref();
+        let media = loaded.and_then(|l| l.media.as_ref());
+        let title = match (media, loaded) {
+            (Some(m), _) => media_title(m).to_string(),
+            (None, Some(l)) => l.show.display_title().to_string(),
+            (None, None) => self.target.title.clone(),
+        };
+        let banner = media
+            .and_then(|m| m.banner_url.clone())
+            .or_else(|| loaded.map(|l| l.show.cover_url.clone()));
+        let cover = media
+            .map(|m| m.cover_url.clone())
+            .filter(|c| !c.is_empty())
+            .or_else(|| loaded.map(|l| l.show.cover_url.clone()));
+        let mut meta: Vec<String> = Vec::new();
+        if let Some(m) = media {
+            meta.extend(m.year.map(|y| y.to_string()));
+            meta.extend(m.format.clone());
+            meta.extend(m.episodes.map(|n| format!("{n} episodes")));
+            meta.extend(m.score.map(|s| format!("Score {s}")));
+            meta.extend(m.status.as_deref().map(status_label));
+        }
+        let synopsis = media.and_then(|m| m.synopsis.clone());
+        let genres = media.map(|m| m.genres.clone()).unwrap_or_default();
+
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(BANNER_H))
+                    .overflow_hidden()
+                    .child(div().absolute().inset_0().child(match &banner {
+                        Some(url) => remote_image(url).into_any_element(),
+                        None => shimmer().into_any_element(),
+                    }))
+                    .child(div().absolute().inset_0().bg(linear_gradient(
+                        0.,
+                        linear_color_stop(theme::night_alpha(1.), 0.),
+                        linear_color_stop(theme::night_alpha(0.35), 0.75),
+                    )))
+                    .child(
+                        div().absolute().top(px(20.)).left(px(24.)).child(
+                            button("show-back", "‹ Back")
+                                .kind(ButtonKind::Secondary)
+                                .compact()
+                                .on_click(cx.listener(|page, _, _, cx| page.back(cx))),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .gap(px(36.))
+                    .px(theme::gutter())
+                    .mt(px(-130.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(COVER_W))
+                            .h(px(COVER_H))
+                            .rounded(px(12.))
+                            .shadow_lg()
+                            .child(match &cover {
+                                Some(url) => rounded_image(url, px(12.), theme::night(), None)
+                                    .into_any_element(),
+                                None => div()
+                                    .size_full()
+                                    .rounded(px(12.))
+                                    .overflow_hidden()
+                                    .child(shimmer())
+                                    .into_any_element(),
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(14.))
+                            .child(
+                                div()
+                                    .font_family(theme::DISPLAY_FONT)
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_size(px(theme::PAGE_TITLE))
+                                    .line_height(relative(1.))
+                                    .line_clamp(2)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap(px(14.))
+                                    .text_size(px(theme::SMALL))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_dim())
+                                    .children(meta.into_iter().map(|m| div().child(m)))
+                                    .children(genres.into_iter().take(5).map(|g| {
+                                        div()
+                                            .px(px(10.))
+                                            .py(px(3.))
+                                            .rounded(px(6.))
+                                            .border_1()
+                                            .border_color(theme::line())
+                                            .child(g)
+                                    })),
+                            )
+                            .children(synopsis.map(|s| {
+                                div()
+                                    .max_w(px(720.))
+                                    .text_size(px(theme::BODY))
+                                    .line_height(relative(1.55))
+                                    .text_color(theme::text_dim())
+                                    .line_clamp(4)
+                                    .text_ellipsis()
+                                    .child(view_models::blurb(&s))
+                            }))
+                            .child(self.render_controls(cx)),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        let ready = self.loaded.is_some();
+        let resolving = self.resolving.is_some();
+        let play_label: SharedString = if resolving {
+            "Finding stream…".into()
+        } else if ready {
+            self.model.play_label.clone().into()
+        } else {
+            "Loading…".into()
+        };
+        let target = self.model.play_target.clone();
+        let in_list = self.loaded.as_ref().is_some_and(|l| l.in_list);
+        let mode = self.mode;
+        let mut quality = segmented("show-quality");
+        for (value, label) in QUALITIES {
+            quality = quality.option(
+                label,
+                self.quality == value,
+                cx.listener(move |page, _, _, cx| {
+                    page.quality = value.to_string();
+                    cx.notify();
+                }),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .pt(px(6.))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        button("show-play", play_label)
+                            .disabled(target.is_none() || resolving)
+                            .on_click(cx.listener(move |page, _, _, cx| {
+                                if let Some((ep, start)) = target.clone() {
+                                    page.play(ep, start, None, cx);
+                                }
+                            })),
+                    )
+                    .children(self.model.other_mode.filter(|_| ready).map(|other| {
+                        button(
+                            "show-switch-mode",
+                            format!("Watch in {}", mode_label(other)),
+                        )
+                        .kind(ButtonKind::Secondary)
+                        .on_click(cx.listener(move |page, _, _, cx| page.set_mode(other, cx)))
+                    }))
+                    .child(
+                        button(
+                            "show-list",
+                            if in_list { "In My List" } else { "+ My List" },
+                        )
+                        .kind(ButtonKind::Secondary)
+                        .disabled(!ready)
+                        .on_click(cx.listener(|page, _, _, cx| page.toggle_list(cx))),
+                    )
+                    .child(
+                        segmented("show-mode")
+                            .option(
+                                "Sub",
+                                mode == Mode::Sub,
+                                cx.listener(|page, _, _, cx| page.set_mode(Mode::Sub, cx)),
+                            )
+                            .option(
+                                "Dub",
+                                mode == Mode::Dub,
+                                cx.listener(|page, _, _, cx| page.set_mode(Mode::Dub, cx)),
+                            ),
+                    )
+                    .child(quality),
+            )
+            .children(self.play_error.clone().map(|err| {
+                div()
+                    .max_w(px(720.))
+                    .text_size(px(theme::SMALL))
+                    .line_height(relative(1.45))
+                    .text_color(theme::danger())
+                    .child(err)
+            }))
+            .into_any_element()
+    }
+
+    fn render_episodes(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(loaded) = &self.loaded else {
+            return div().into_any_element();
+        };
+        let total = self.model.episodes.len();
+        let pages = total.div_ceil(EPISODE_PAGE);
+        let start = (self.page * EPISODE_PAGE).min(total);
+        let end = (start + EPISODE_PAGE).min(total);
+        let heading = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .flex()
+                    .items_baseline()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .font_family(theme::DISPLAY_FONT)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_size(px(theme::SECTION))
+                            .child("Episodes"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::SMALL))
+                            .text_color(theme::text_muted())
+                            .child(format!("{total} in {}", mode_label(self.mode))),
+                    ),
+            )
+            .when(pages > 1, |h| {
+                h.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(6.))
+                        .children((0..pages).map(|p| {
+                            let first = p * EPISODE_PAGE;
+                            let last = ((p + 1) * EPISODE_PAGE).min(total) - 1;
+                            let label = format!(
+                                "{}–{}",
+                                self.model.episodes[first].ep, self.model.episodes[last].ep
+                            );
+                            button(("ep-page", p), label)
+                                .kind(if p == self.page {
+                                    ButtonKind::Secondary
+                                } else {
+                                    ButtonKind::Ghost
+                                })
+                                .compact()
+                                .on_click(cx.listener(move |page, _, _, cx| {
+                                    page.page = p;
+                                    cx.notify();
+                                }))
+                        })),
+                )
+            });
+        let body: AnyElement = if let Some(err) = &loaded.episodes_error {
+            div()
+                .text_color(theme::danger())
+                .child(format!("Couldn't load the episode list: {err}"))
+                .into_any_element()
+        } else if total == 0 {
+            div()
+                .text_color(theme::text_dim())
+                .child(match self.model.other_mode {
+                    Some(other) => format!(
+                        "No {} episodes yet. It's available in {}.",
+                        mode_label(self.mode),
+                        mode_label(other)
+                    ),
+                    None => format!("No {} episodes yet.", mode_label(self.mode)),
+                })
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .children(
+                    self.model.episodes[start..end]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, row)| self.render_episode(start + i, row, cx)),
+                )
+                .into_any_element()
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(18.))
+            .px(theme::gutter())
+            .pt(px(48.))
+            .pb(px(72.))
+            .child(heading)
+            .child(body)
+            .into_any_element()
+    }
+
+    fn render_episode(&self, index: usize, row: &EpisodeRow, cx: &mut Context<Self>) -> AnyElement {
+        let ep = row.ep.clone();
+        let resume = self
+            .model
+            .play_target
+            .as_ref()
+            .filter(|(target, _)| *target == row.ep)
+            .map_or(0.0, |(_, start)| *start);
+        let resolving_this = self.resolving.as_deref() == Some(row.ep.as_str());
+        let download = self.downloads.get(&row.ep);
+        let (dl_label, dl_enabled): (SharedString, bool) = match download.map(|d| d.status) {
+            None => ("Download".into(), true),
+            Some(DlStatus::Queued) => ("Queued".into(), false),
+            Some(DlStatus::Running) => (
+                format!("{:.0}%", download.map_or(0.0, |d| d.percent)).into(),
+                false,
+            ),
+            Some(DlStatus::Done) => ("Downloaded".into(), false),
+            Some(DlStatus::Failed | DlStatus::Cancelled) => ("Retry download".into(), true),
+        };
+        let dl_error = download
+            .filter(|d| d.status == DlStatus::Failed)
+            .and_then(|d| d.error.clone());
+        let thumb = div()
+            .relative()
+            .flex_none()
+            .w(px(176.))
+            .h(px(99.))
+            .rounded(px(8.))
+            .bg(theme::raised())
+            .child(match &row.thumb {
+                Some(url) => rounded_image(
+                    url,
+                    px(8.),
+                    theme::night(),
+                    Some(("episode", theme::raised().into())),
+                )
+                .into_any_element(),
+                None => div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .font_family(theme::DISPLAY_FONT)
+                    .font_weight(FontWeight::BOLD)
+                    .text_size(px(40.))
+                    .text_color(theme::text_muted())
+                    .child(row.ep.clone())
+                    .into_any_element(),
+            })
+            .when(row.fraction > 0.0, |t| {
+                t.child(
+                    progress_bar(row.fraction)
+                        .absolute()
+                        .bottom(px(8.))
+                        .left(px(8.))
+                        .right(px(8.)),
+                )
+            });
+        let play_ep = ep.clone();
+        div()
+            .id(("episode", index))
+            .group("episode")
+            .flex()
+            .items_center()
+            .gap(px(20.))
+            .p(px(10.))
+            .rounded(px(12.))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme::raised()))
+            .on_click(
+                cx.listener(move |page, _, _, cx| page.play(play_ep.clone(), resume, None, cx)),
+            )
+            .child(thumb)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(format!("Episode {}", row.ep))
+                            .when(row.completed, |d| {
+                                d.child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme::text_muted())
+                                        .child("Watched"),
+                                )
+                            })
+                            .when(resolving_this, |d| {
+                                d.child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme::accent())
+                                        .child("Finding stream…"),
+                                )
+                            }),
+                    )
+                    .children(row.title.clone().map(|t| {
+                        div()
+                            .text_size(px(14.))
+                            .text_color(theme::text_dim())
+                            .truncate()
+                            .child(t)
+                    }))
+                    .children(dl_error.map(|e| {
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme::danger())
+                            .truncate()
+                            .child(format!("Download failed: {e}"))
+                    })),
+            )
+            .child(
+                div()
+                    .id(("download-slot", index))
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(
+                        button(("download", index), dl_label)
+                            .kind(ButtonKind::Ghost)
+                            .compact()
+                            .disabled(!dl_enabled)
+                            .on_click(cx.listener(move |page, _, _, cx| {
+                                cx.stop_propagation();
+                                page.download(ep.clone(), cx)
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_pick(&self, pick: &Pick, cx: &mut Context<Self>) -> AnyElement {
+        let title = self
+            .loaded
+            .as_ref()
+            .map(|l| l.show.display_title().to_string())
+            .unwrap_or_else(|| self.target.title.clone());
+        div()
+            .id("pick-scrim")
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::scrim())
+            .on_click(cx.listener(|page, _, _, cx| {
+                page.pick = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .id("pick")
+                    .w(px(560.))
+                    .max_h(px(560.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(16.))
+                    .p(px(28.))
+                    .rounded(px(16.))
+                    .bg(theme::night())
+                    .border_1()
+                    .border_color(theme::line())
+                    .shadow_lg()
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .font_family(theme::DISPLAY_FONT)
+                            .font_weight(FontWeight::BOLD)
+                            .text_size(px(34.))
+                            .child("Which one is it?"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::BODY))
+                            .line_height(relative(1.45))
+                            .text_color(theme::text_dim())
+                            .child(format!(
+                                "ani-cli's search didn't find an exact match for \u{201c}{title}\u{201d}. \
+                                 Pick the matching show and it will be used from now on."
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("pick-list")
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .overflow_y_scroll()
+                            .children(pick.candidates.iter().enumerate().map(|(i, c)| {
+                                let chosen = c.clone();
+                                div()
+                                    .id(("candidate", i))
+                                    .px(px(16.))
+                                    .py(px(12.))
+                                    .rounded(px(10.))
+                                    .bg(theme::raised())
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(theme::raised_hover()))
+                                    .on_click(cx.listener(move |page, _, _, cx| {
+                                        page.choose(chosen.clone(), cx)
+                                    }))
+                                    .child(c.clone())
+                            })),
+                    )
+                    .child(
+                        div().flex().justify_end().child(
+                            button("pick-cancel", "Cancel")
+                                .kind(ButtonKind::Ghost)
+                                .on_click(cx.listener(|page, _, _, cx| {
+                                    page.pick = None;
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for ShowPage {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content: AnyElement = match (&self.loaded, &self.load_error) {
+            (None, Some(err)) => div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .px(theme::gutter())
+                .pt(px(120.))
+                .child(
+                    div()
+                        .font_family(theme::DISPLAY_FONT)
+                        .font_weight(FontWeight::BOLD)
+                        .text_size(px(theme::PAGE_TITLE))
+                        .child(self.target.title.clone()),
+                )
+                .child(
+                    div()
+                        .max_w(px(720.))
+                        .text_color(theme::danger())
+                        .child(format!("Couldn't open this show: {err}")),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(10.))
+                        .child(
+                            button("show-retry", "Try again")
+                                .on_click(cx.listener(|page, _, _, cx| page.reload(cx))),
+                        )
+                        .child(
+                            button("show-error-back", "Back")
+                                .kind(ButtonKind::Secondary)
+                                .on_click(cx.listener(|page, _, _, cx| page.back(cx))),
+                        ),
+                )
+                .into_any_element(),
+            _ => div()
+                .flex()
+                .flex_col()
+                .child(self.render_header(cx))
+                .child(self.render_episodes(cx))
+                .into_any_element(),
+        };
+        div()
+            .relative()
+            .size_full()
+            .child(
+                div()
+                    .id("show")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .child(content),
+            )
+            .children(self.pick.as_ref().map(|pick| self.render_pick(pick, cx)))
+    }
+}
+
+fn mode_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Sub => "Sub",
+        Mode::Dub => "Dub",
+    }
+}
+
+fn status_label(status: &str) -> String {
+    match status {
+        "RELEASING" => "Airing".into(),
+        "FINISHED" => "Finished".into(),
+        "NOT_YET_RELEASED" => "Upcoming".into(),
+        "CANCELLED" => "Cancelled".into(),
+        "HIATUS" => "On hiatus".into(),
+        other => other.to_string(),
+    }
+}
+
+fn lock(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
+    db.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The AllAnime show (resolved from AniList when only that is known), its
+/// AniList details, and its episodes and progress in `mode`. Saves the show.
+fn load(db: &Mutex<Db>, target: &ShowRef, mode: Mode) -> Result<Loaded> {
+    let (show, media) = match &target.allanime {
+        Some(show) => {
+            let media = show
+                .anilist_id
+                .or(target.anilist_id)
+                .and_then(|id| catalog::media(db, id));
+            (show.clone(), media)
+        }
+        None => {
+            let id = target.anilist_id.context("nothing identifies this show")?;
+            let media = catalog::media(db, id).context("AniList didn't return this show")?;
+            // Sub lists nearly everything, so the match works whatever `mode` is.
+            let show = catalog::resolve_allanime(&media, Mode::Sub)?
+                .ok_or_else(|| anyhow!("{} isn't on AllAnime", media_title(&media)))?;
+            (show, Some(media))
+        }
+    };
+    let stored = lock(db).get_show(&show.id).ok().flatten();
+    let media = media.or_else(|| stored.and_then(|s| s.media));
+    lock(db).upsert_show(&ShowRecord {
+        summary: show.clone(),
+        media: media.clone(),
+        updated_at: db::now(),
+    })?;
+    let (episodes, episodes_error) = if show.count(mode) == 0 {
+        (Vec::new(), None)
+    } else {
+        match allanime::episodes(&show.id, mode) {
+            Ok(eps) => (eps, None),
+            Err(err) => (Vec::new(), Some(format!("{err:#}"))),
+        }
+    };
+    let db = lock(db);
+    let progress = db.progress_for_show(&show.id, mode)?;
+    let in_list = db.my_list_contains(&show.id)?;
+    Ok(Loaded {
+        show,
+        media,
+        episodes,
+        progress,
+        in_list,
+        episodes_error,
+    })
+}
+
+fn resolve(
+    db: &Mutex<Db>,
+    shims: &std::path::Path,
+    show: &ShowSummary,
+    ep: &str,
+    mode: Mode,
+    quality: &str,
+    chosen: Option<String>,
+) -> Result<ResolveOutcome> {
+    let provider = match chosen {
+        Some(title) => {
+            lock(db).set_provider_title(&show.id, &title)?;
+            Some(title)
+        }
+        None => lock(db).get_provider_title(&show.id)?,
+    };
+    let req = anicli::build_request(show, provider.as_deref(), ep, mode, quality);
+    anicli::resolve(&req, shims)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_download(
+    db: &Mutex<Db>,
+    manager: &Arc<DownloadManager>,
+    show: &ShowSummary,
+    ep: &str,
+    mode: Mode,
+    quality: &str,
+    dir: PathBuf,
+    retry_id: Option<String>,
+) {
+    if let Some(id) = retry_id
+        && manager.retry(&id).is_ok()
+    {
+        return;
+    }
+    let provider = lock(db).get_provider_title(&show.id).ok().flatten();
+    let req = anicli::build_request(show, provider.as_deref(), ep, mode, quality);
+    manager.start(show, req, &dir);
+}

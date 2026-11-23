@@ -65,6 +65,7 @@ name = "ani-gui"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "futures",
  "gpui",
  "libloading",
  "nix 0.31.4",
@@ -72,6 +73,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "unicode-segmentation",
  "ureq",
 ]
 

@@ -1,0 +1,642 @@
+use std::collections::HashSet;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+use serde::{Deserialize, Serialize};
+
+use crate::anicli::normalize_title;
+use crate::db::{self, Db};
+use crate::history::HistoryEntry;
+use crate::model::{AniListMedia, Mode, Progress, ShowRecord, ShowSummary};
+use crate::progress;
+
+/// How many shows Continue Watching considers from each source.
+const PROGRESS_SHOWS: usize = 20;
+const HISTORY_ENTRIES: usize = 12;
+const MAX_ITEMS: usize = 20;
+
+/// One Continue Watching card.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ContinueItem {
+    pub show_id: String,
+    pub title: String,
+    pub mode: Mode,
+    pub ep: String,
+    pub start: f64,
+    /// How much of `ep` was watched (0 when it starts fresh).
+    pub fraction: f32,
+    pub cover_url: String,
+    /// Landscape art: the episode's AniList thumbnail, else the show banner.
+    pub backdrop_url: Option<String>,
+    pub media: Option<AniListMedia>,
+}
+
+/// The network lookups `continue_items` needs, injectable for tests.
+pub trait Catalog {
+    fn search(&self, title: &str, mode: Mode) -> Vec<ShowSummary>;
+    fn episodes(&self, show: &ShowSummary, mode: Mode) -> Vec<String>;
+    fn media(&self, anilist_id: i64) -> Option<AniListMedia>;
+}
+
+/// Shows to pick up again, newest first: the app's own progress, then
+/// ani-cli history entries (newest lines last in its file) for shows without
+/// app progress, matched by title. `mode` applies to history entries, which
+/// do not record one. Blocks on `catalog`; run it off the UI thread.
+pub fn continue_items(
+    db: &Mutex<Db>,
+    history: &[HistoryEntry],
+    mode: Mode,
+    catalog: &impl Catalog,
+) -> Vec<ContinueItem> {
+    let recent = lock(db)
+        .recent_progress(PROGRESS_SHOWS)
+        .unwrap_or_else(|err| {
+            eprintln!("ani-gui: reading progress: {err:#}");
+            Vec::new()
+        });
+    let mut seen: HashSet<String> = recent.iter().map(|p| p.show_id.clone()).collect();
+    let mut items = Vec::new();
+    for latest in &recent {
+        let Some(record) = stored_show(db, &latest.show_id) else {
+            continue;
+        };
+        let episodes = catalog.episodes(&record.summary, latest.mode);
+        let Some((ep, start)) = progress::continue_point(latest, &episodes) else {
+            continue;
+        };
+        let fraction = if ep == latest.ep {
+            watched_fraction(latest)
+        } else {
+            0.0
+        };
+        items.push(item_for(
+            db,
+            catalog,
+            record,
+            latest.mode,
+            ep,
+            start,
+            fraction,
+        ));
+    }
+    for entry in history.iter().rev().take(HISTORY_ENTRIES) {
+        let Some(record) = match_history(db, catalog, entry, mode) else {
+            continue;
+        };
+        if !seen.insert(record.summary.id.clone()) {
+            continue;
+        }
+        let episodes = catalog.episodes(&record.summary, mode);
+        let Some(ep) = progress::history_continue(&entry.ep, &episodes) else {
+            continue;
+        };
+        items.push(item_for(db, catalog, record, mode, ep, 0.0, 0.0));
+    }
+    items.truncate(MAX_ITEMS);
+    items
+}
+
+fn item_for(
+    db: &Mutex<Db>,
+    catalog: &impl Catalog,
+    mut record: ShowRecord,
+    mode: Mode,
+    ep: String,
+    start: f64,
+    fraction: f32,
+) -> ContinueItem {
+    if record.media.is_none()
+        && let Some(media) = record.summary.anilist_id.and_then(|id| catalog.media(id))
+    {
+        record.media = Some(media);
+        record.updated_at = db::now();
+        if let Err(err) = lock(db).upsert_show(&record) {
+            eprintln!("ani-gui: saving show {}: {err:#}", record.summary.id);
+        }
+    }
+    let backdrop_url = record.media.as_ref().and_then(|m| {
+        episode_meta(m, &ep)
+            .map(|(_, thumb)| thumb.to_string())
+            .or_else(|| m.banner_url.clone())
+    });
+    ContinueItem {
+        show_id: record.summary.id.clone(),
+        title: record.summary.display_title().to_string(),
+        mode,
+        ep,
+        start,
+        fraction,
+        cover_url: record.summary.cover_url.clone(),
+        backdrop_url,
+        media: record.media,
+    }
+}
+
+/// The show a history entry is about: one whose remembered provider title
+/// matches, else an AllAnime search result with an equal (normalized) title,
+/// which is then remembered with the entry's title as its provider title.
+fn match_history(
+    db: &Mutex<Db>,
+    catalog: &impl Catalog,
+    entry: &HistoryEntry,
+    mode: Mode,
+) -> Option<ShowRecord> {
+    let title = history_title(&entry.title);
+    let wanted = normalize_title(title);
+    if wanted.is_empty() {
+        return None;
+    }
+    let known = lock(db).provider_titles().unwrap_or_else(|err| {
+        eprintln!("ani-gui: reading provider titles: {err:#}");
+        Vec::new()
+    });
+    if let Some(record) = known
+        .iter()
+        .filter(|(_, t)| normalize_title(t) == wanted)
+        .find_map(|(id, _)| stored_show(db, id))
+    {
+        return Some(record);
+    }
+    let found = catalog.search(title, mode).into_iter().find(|s| {
+        normalize_title(&s.title) == wanted
+            || s.english_title
+                .as_deref()
+                .is_some_and(|t| normalize_title(t) == wanted)
+    })?;
+    let db = lock(db);
+    let record = match db.get_show(&found.id) {
+        Ok(Some(record)) => record,
+        _ => {
+            let record = ShowRecord {
+                summary: found,
+                media: None,
+                updated_at: db::now(),
+            };
+            if let Err(err) = db.upsert_show(&record) {
+                eprintln!("ani-gui: saving show {}: {err:#}", record.summary.id);
+            }
+            record
+        }
+    };
+    if let Err(err) = db.set_provider_title(&record.summary.id, title) {
+        eprintln!("ani-gui: saving provider title: {err:#}");
+    }
+    Some(record)
+}
+
+/// Older ani-cli versions wrote "<title> (<n> episodes)".
+fn history_title(title: &str) -> &str {
+    title
+        .rsplit_once(" (")
+        .filter(|(_, tail)| {
+            tail.strip_suffix(" episodes)")
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map_or(title, |(head, _)| head)
+        .trim()
+}
+
+fn stored_show(db: &Mutex<Db>, id: &str) -> Option<ShowRecord> {
+    lock(db)
+        .get_show(id)
+        .inspect_err(|err| eprintln!("ani-gui: reading show {id}: {err:#}"))
+        .ok()
+        .flatten()
+}
+
+fn watched_fraction(p: &Progress) -> f32 {
+    if p.duration > 0.0 {
+        (p.position / p.duration).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    }
+}
+
+/// AniList's (title, thumbnail) for episode `ep`, from its
+/// "Episode <n> - <title>" streaming entries; the title has the prefix removed.
+pub fn episode_meta<'a>(media: &'a AniListMedia, ep: &str) -> Option<(Option<&'a str>, &'a str)> {
+    let want: f64 = ep.parse().ok()?;
+    media.episode_thumbs.iter().find_map(|(title, thumb)| {
+        let rest = title.strip_prefix("Episode ")?;
+        let (num, name) = match rest.split_once(" - ") {
+            Some((num, name)) => (num, Some(name.trim()).filter(|n| !n.is_empty())),
+            None => (rest, None),
+        };
+        (num.trim().parse::<f64>().ok()? == want).then_some((name, thumb.as_str()))
+    })
+}
+
+fn lock(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
+    db.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum HeroSource {
+    Continue(ContinueItem),
+    Trending(AniListMedia),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeroModel {
+    pub title: String,
+    pub banner_url: Option<String>,
+    pub cover_url: String,
+    pub synopsis: Option<String>,
+    pub genres: Vec<String>,
+    pub year: Option<u16>,
+    pub score: Option<u8>,
+    pub play_label: String,
+    pub source: HeroSource,
+}
+
+/// The first Continue Watching show, else the top trending one.
+pub fn hero_pick(continue_items: &[ContinueItem], trending: &[AniListMedia]) -> Option<HeroModel> {
+    if let Some(item) = continue_items.first() {
+        let media = item.media.as_ref();
+        return Some(HeroModel {
+            title: item.title.clone(),
+            banner_url: media.and_then(|m| m.banner_url.clone()),
+            cover_url: item.cover_url.clone(),
+            synopsis: media.and_then(|m| m.synopsis.clone()),
+            genres: media.map(|m| m.genres.clone()).unwrap_or_default(),
+            year: media.and_then(|m| m.year),
+            score: media.and_then(|m| m.score),
+            play_label: play_label(&item.ep, item.start),
+            source: HeroSource::Continue(item.clone()),
+        });
+    }
+    let media = trending.first()?;
+    Some(HeroModel {
+        title: media_title(media).to_string(),
+        banner_url: media.banner_url.clone(),
+        cover_url: media.cover_url.clone(),
+        synopsis: media.synopsis.clone(),
+        genres: media.genres.clone(),
+        year: media.year,
+        score: media.score,
+        play_label: "Play E1".into(),
+        source: HeroSource::Trending(media.clone()),
+    })
+}
+
+pub fn media_title(media: &AniListMedia) -> &str {
+    media
+        .title_english
+        .as_deref()
+        .filter(|t| !t.is_empty())
+        .unwrap_or(&media.title_romaji)
+}
+
+/// A synopsis as one paragraph for clamped previews, without AniList's
+/// trailing "(Source: …)" credit.
+pub fn blurb(synopsis: &str) -> String {
+    synopsis
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("(Source:"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn play_label(ep: &str, start: f64) -> String {
+    if start > 0.0 {
+        format!("Resume E{ep}")
+    } else {
+        format!("Play E{ep}")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EpisodeRow {
+    pub ep: String,
+    pub title: Option<String>,
+    pub thumb: Option<String>,
+    pub fraction: f32,
+    pub completed: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShowPageModel {
+    pub play_label: String,
+    /// Episode and start position for the Play/Resume button.
+    pub play_target: Option<(String, f64)>,
+    /// With no episodes in the chosen mode: the other mode, if it has some.
+    pub other_mode: Option<Mode>,
+    pub episodes: Vec<EpisodeRow>,
+}
+
+impl ShowPageModel {
+    /// `progress` is this show's progress in `mode`.
+    pub fn build(
+        show: &ShowSummary,
+        media: Option<&AniListMedia>,
+        episodes: &[String],
+        progress: &[Progress],
+        mode: Mode,
+    ) -> ShowPageModel {
+        if episodes.is_empty() {
+            let other = match mode {
+                Mode::Sub => Mode::Dub,
+                Mode::Dub => Mode::Sub,
+            };
+            return ShowPageModel {
+                play_label: format!("No {mode} episodes"),
+                play_target: None,
+                other_mode: (show.count(other) > 0).then_some(other),
+                episodes: Vec::new(),
+            };
+        }
+        let latest = progress.iter().max_by_key(|p| p.updated_at);
+        let play_target = match latest {
+            Some(latest) => progress::continue_point(latest, episodes)
+                .or_else(|| Some((episodes[0].clone(), 0.0))),
+            None => Some((episodes[0].clone(), 0.0)),
+        };
+        let play_label = play_target
+            .as_ref()
+            .map(|(ep, start)| play_label(ep, *start))
+            .unwrap_or_default();
+        let rows = episodes
+            .iter()
+            .map(|ep| {
+                let watched = progress.iter().find(|p| p.ep == *ep);
+                let meta = media.and_then(|m| episode_meta(m, ep));
+                EpisodeRow {
+                    ep: ep.clone(),
+                    title: meta.and_then(|(title, _)| title).map(str::to_string),
+                    thumb: meta.map(|(_, thumb)| thumb.to_string()),
+                    fraction: watched.map_or(0.0, watched_fraction),
+                    completed: watched.is_some_and(progress::is_completed),
+                }
+            })
+            .collect();
+        ShowPageModel {
+            play_label,
+            play_target,
+            other_mode: None,
+            episodes: rows,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+    use crate::model::ShowRecord;
+
+    fn eps(n: u32) -> Vec<String> {
+        (1..=n).map(|e| e.to_string()).collect()
+    }
+
+    fn show(id: &str, title: &str, english: Option<&str>) -> ShowSummary {
+        ShowSummary {
+            id: id.into(),
+            title: title.into(),
+            english_title: english.map(str::to_string),
+            cover_url: format!("https://img/{id}.jpg"),
+            anilist_id: None,
+            sub_count: 5,
+            dub_count: 0,
+        }
+    }
+
+    fn progress(show_id: &str, ep: &str, position: f64, duration: f64, at: i64) -> Progress {
+        Progress {
+            show_id: show_id.into(),
+            mode: Mode::Sub,
+            ep: ep.into(),
+            position,
+            duration,
+            updated_at: at,
+        }
+    }
+
+    fn item(title: &str, ep: &str, start: f64) -> ContinueItem {
+        ContinueItem {
+            show_id: "s1".into(),
+            title: title.into(),
+            mode: Mode::Sub,
+            ep: ep.into(),
+            start,
+            fraction: 0.4,
+            cover_url: "https://img/s1.jpg".into(),
+            backdrop_url: None,
+            media: Some(AniListMedia {
+                id: 1,
+                title_romaji: title.into(),
+                banner_url: Some("https://img/banner.jpg".into()),
+                synopsis: Some("An elf mage.".into()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn trending(title: &str) -> AniListMedia {
+        AniListMedia {
+            id: 9,
+            title_romaji: format!("{title} (romaji)"),
+            title_english: Some(title.into()),
+            cover_url: "https://img/t.jpg".into(),
+            ..Default::default()
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeCatalog {
+        results: Vec<ShowSummary>,
+        searches: RefCell<Vec<String>>,
+    }
+
+    impl Catalog for FakeCatalog {
+        fn search(&self, title: &str, _: Mode) -> Vec<ShowSummary> {
+            self.searches.borrow_mut().push(title.to_string());
+            self.results.clone()
+        }
+        fn episodes(&self, _: &ShowSummary, _: Mode) -> Vec<String> {
+            eps(5)
+        }
+        fn media(&self, _: i64) -> Option<AniListMedia> {
+            None
+        }
+    }
+
+    fn history(ep: &str, title: &str) -> HistoryEntry {
+        HistoryEntry {
+            ep: ep.into(),
+            id: "frieren-beyond-journeys-end-481".into(),
+            title: title.into(),
+        }
+    }
+
+    fn store(db: &Mutex<Db>, summary: &ShowSummary) {
+        let record = ShowRecord {
+            summary: summary.clone(),
+            media: None,
+            updated_at: 1,
+        };
+        db.lock().unwrap().upsert_show(&record).unwrap();
+    }
+
+    #[test]
+    fn hero_prefers_continue_watching() {
+        let hero = hero_pick(&[item("Frieren", "5", 480.0)], &[trending("Dandadan")]).unwrap();
+        assert_eq!(hero.title, "Frieren");
+        assert_eq!(hero.play_label, "Resume E5");
+        assert_eq!(hero.banner_url.as_deref(), Some("https://img/banner.jpg"));
+        assert!(matches!(hero.source, HeroSource::Continue(ref i) if i.ep == "5"));
+
+        let fresh = hero_pick(&[item("Frieren", "6", 0.0)], &[]).unwrap();
+        assert_eq!(fresh.play_label, "Play E6");
+    }
+
+    #[test]
+    fn hero_falls_back_to_trending() {
+        let hero = hero_pick(&[], &[trending("Dandadan"), trending("Other")]).unwrap();
+        assert_eq!(hero.title, "Dandadan");
+        assert!(matches!(hero.source, HeroSource::Trending(ref m) if m.id == 9));
+        assert_eq!(hero_pick(&[], &[]), None);
+    }
+
+    #[test]
+    fn blurb_flattens_paragraphs_and_drops_source_note() {
+        assert_eq!(
+            blurb("The adventure is over.\n\nA new one begins…\n\n(Source: Crunchyroll)"),
+            "The adventure is over. A new one begins…"
+        );
+        assert_eq!(blurb("One line"), "One line");
+    }
+
+    #[test]
+    fn show_page_model_resume_label() {
+        let s = show("s1", "Frieren", None);
+        let watched = [
+            progress("s1", "4", 1400.0, 1400.0, 10),
+            progress("s1", "5", 560.0, 1400.0, 20),
+        ];
+        let model = ShowPageModel::build(&s, None, &eps(10), &watched, Mode::Sub);
+        assert_eq!(model.play_label, "Resume E5");
+        assert_eq!(model.play_target, Some(("5".into(), 560.0)));
+        assert_eq!(model.episodes.len(), 10);
+        assert!(model.episodes[3].completed);
+        assert!((model.episodes[4].fraction - 0.4).abs() < 1e-6);
+        assert!(!model.episodes[4].completed);
+        assert_eq!(model.episodes[5].fraction, 0.0);
+    }
+
+    #[test]
+    fn show_page_model_play_first() {
+        let s = show("s1", "Frieren", None);
+        let media = AniListMedia {
+            episode_thumbs: vec![(
+                "Episode 2 - It Didn't Have to Be Magic...".into(),
+                "https://img/e2.jpg".into(),
+            )],
+            ..Default::default()
+        };
+        let model = ShowPageModel::build(&s, Some(&media), &eps(3), &[], Mode::Sub);
+        assert_eq!(model.play_label, "Play E1");
+        assert_eq!(model.play_target, Some(("1".into(), 0.0)));
+        assert_eq!(model.episodes[0].thumb, None);
+        assert_eq!(
+            model.episodes[1].title.as_deref(),
+            Some("It Didn't Have to Be Magic...")
+        );
+        assert_eq!(
+            model.episodes[1].thumb.as_deref(),
+            Some("https://img/e2.jpg")
+        );
+    }
+
+    #[test]
+    fn show_page_model_no_episodes_in_mode() {
+        let s = show("s1", "Frieren", None);
+        let model = ShowPageModel::build(&s, None, &[], &[], Mode::Dub);
+        assert_eq!(model.play_label, "No dub episodes");
+        assert_eq!(model.play_target, None);
+        assert_eq!(model.other_mode, Some(Mode::Sub));
+        assert!(model.episodes.is_empty());
+    }
+
+    #[test]
+    fn continue_items_merges_history_without_progress() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        let catalog = FakeCatalog {
+            results: vec![
+                show("other", "Frieren Movie", None),
+                show(
+                    "aa1",
+                    "Sousou no Frieren",
+                    Some("Frieren: Beyond Journey\u{2019}s End"),
+                ),
+            ],
+            ..Default::default()
+        };
+        let items = continue_items(
+            &db,
+            &[history("3", "Frieren: Beyond Journey's End")],
+            Mode::Sub,
+            &catalog,
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].show_id, "aa1");
+        assert_eq!(items[0].ep, "4");
+        assert_eq!(items[0].start, 0.0);
+        assert_eq!(items[0].fraction, 0.0);
+        // The history title becomes the show's provider title.
+        let db = db.lock().unwrap();
+        assert_eq!(
+            db.get_provider_title("aa1").unwrap().as_deref(),
+            Some("Frieren: Beyond Journey's End")
+        );
+        assert!(db.get_show("aa1").unwrap().is_some());
+    }
+
+    #[test]
+    fn continue_items_matches_provider_title_first() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        store(&db, &show("known", "Sousou no Frieren", None));
+        db.lock()
+            .unwrap()
+            .set_provider_title("known", "Frieren: Beyond Journey's End")
+            .unwrap();
+        let catalog = FakeCatalog {
+            results: vec![show("wrong", "Frieren: Beyond Journey's End", None)],
+            ..Default::default()
+        };
+        let items = continue_items(
+            &db,
+            &[history("1", "Frieren: Beyond Journey's End")],
+            Mode::Sub,
+            &catalog,
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].show_id, "known");
+        assert_eq!(items[0].ep, "2");
+        assert!(catalog.searches.borrow().is_empty());
+    }
+
+    #[test]
+    fn continue_items_prefers_app_progress_and_skips_unmatched() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        store(&db, &show("aa1", "Sousou no Frieren", Some("Frieren")));
+        db.lock()
+            .unwrap()
+            .save_progress(&progress("aa1", "2", 300.0, 1200.0, 50))
+            .unwrap();
+        let catalog = FakeCatalog {
+            results: vec![show("aa1", "Sousou no Frieren", Some("Frieren"))],
+            ..Default::default()
+        };
+        let items = continue_items(
+            &db,
+            &[history("4", "Frieren"), history("1", "Nothing Like It")],
+            Mode::Sub,
+            &catalog,
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].ep, "2");
+        assert_eq!(items[0].start, 300.0);
+        assert!((items[0].fraction - 0.25).abs() < 1e-6);
+    }
+}

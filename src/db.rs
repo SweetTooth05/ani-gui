@@ -419,6 +419,15 @@ impl Db {
         Ok(title)
     }
 
+    /// Every remembered (show_id, provider title) pair.
+    pub fn provider_titles(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT show_id, title FROM provider_titles ORDER BY rowid")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn set_provider_title(&self, show_id: &str, title: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO provider_titles (show_id, title) VALUES (?1, ?2)
@@ -584,6 +593,16 @@ mod tests {
         assert_eq!(
             db.get_provider_title("other").unwrap().as_deref(),
             Some("Other")
+        );
+        assert_eq!(
+            db.provider_titles().unwrap(),
+            [
+                (
+                    "ReHMC7TQnch3C6z8j".to_string(),
+                    "Frieren: Beyond Journey's End Season 2".to_string()
+                ),
+                ("other".to_string(), "Other".to_string()),
+            ]
         );
     }
 

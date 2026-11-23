@@ -1,10 +1,11 @@
-// Most of the model/store API has no caller until the UI views exist.
+// Parts of the model/store API have no caller until the remaining pages exist.
 #[allow(dead_code)]
 mod allanime;
 #[allow(dead_code)]
 mod anicli;
 #[allow(dead_code)]
 mod anilist;
+mod app;
 #[allow(dead_code)]
 mod catalog;
 #[allow(dead_code)]
@@ -25,49 +26,20 @@ mod paths;
 mod player;
 #[allow(dead_code)]
 mod progress;
+#[allow(dead_code)]
+mod ui;
 
 use gpui::{
-    App, Application, Bounds, Context, IntoElement, ParentElement, Render, SharedString, Styled,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px, rgb, size,
+    App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size,
 };
 
 use std::env;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
-use db::Db;
+use ui::components::text_input;
 
 const APP_ID: &str = "io.github.sweettooth05.AniGui";
-
-struct Root {
-    _db: Option<Db>,
-    db_error: Option<SharedString>,
-}
-
-impl Render for Root {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .bg(rgb(0x0e0e12))
-            .text_color(rgb(0xf2f2f5))
-            .child(div().text_2xl().child("ani-gui"))
-            .child(
-                div()
-                    .text_color(rgb(0x8a8a96))
-                    .child("Native client for ani-cli"),
-            )
-            .children(
-                self.db_error
-                    .clone()
-                    .map(|err| div().text_color(rgb(0xff6b6b)).child(err)),
-            )
-    }
-}
 
 /// ani-cli's menu program (see `anicli::ensure_shims`): answers one menu on
 /// stdout and exits without starting the UI.
@@ -109,19 +81,11 @@ fn main() {
         return;
     }
 
-    let (db, db_error) = match Db::open(&paths::db_path()) {
-        Ok(db) => (Some(db), None),
-        Err(err) => {
-            eprintln!("ani-gui: could not open database: {err:#}");
-            (
-                None,
-                Some(format!("Could not open database: {err:#}").into()),
-            )
-        }
-    };
-
-    Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+    Application::new().run(|cx: &mut App| {
+        ui::theme::register_fonts(cx);
+        text_input::bind_keys(cx);
+        app::bind_keys(cx);
+        let bounds = Bounds::centered(None, size(px(1360.), px(860.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
@@ -129,9 +93,18 @@ fn main() {
                 ..Default::default()
             }),
             app_id: Some(APP_ID.into()),
+            window_min_size: Some(size(px(960.), px(600.))),
             ..Default::default()
         };
-        let opened = cx.open_window(options, |_, cx| cx.new(|_| Root { _db: db, db_error }));
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+        let opened = cx.open_window(options, |window, cx| {
+            cx.new(|cx| app::Root::new(window, cx))
+        });
         if let Err(err) = opened {
             eprintln!("ani-gui: could not open window: {err:#}");
             cx.quit();
