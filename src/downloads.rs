@@ -1,17 +1,21 @@
 use std::collections::VecDeque;
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
-use nix::pty::{Winsize, openpty};
+use nix::fcntl::OFlag;
+use nix::libc;
+use nix::pty::{Winsize, grantpt, posix_openpt, ptsname_r, unlockpt};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, setsid};
 use regex::Regex;
@@ -23,6 +27,11 @@ use crate::{anicli, paths};
 const STALL_AFTER: Duration = Duration::from_secs(60);
 /// Time a killed download gets to exit on SIGTERM before SIGKILL.
 const KILL_GRACE: Duration = Duration::from_secs(5);
+/// How long output is still read after ani-cli exits, in case something it
+/// left behind holds the terminal open.
+const EXIT_GRACE: Duration = Duration::from_secs(2);
+/// Time `shutdown` gives downloads to exit on SIGTERM before SIGKILL.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 /// Non-progress output lines kept for the error message.
 const TAIL_LINES: usize = 40;
 /// When ani-cli's results had no title matching the show.
@@ -108,6 +117,8 @@ struct Inner {
     stall_after: Duration,
     items: Mutex<Vec<Item>>,
     on_change: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Set by `shutdown`; workers then leave records as it saved them.
+    closing: AtomicBool,
 }
 
 /// One download, newest first in `Inner::items`.
@@ -157,6 +168,7 @@ impl DownloadManager {
             stall_after,
             items: Mutex::new(Vec::new()),
             on_change: Mutex::new(None),
+            closing: AtomicBool::new(false),
         };
         let items = records
             .into_iter()
@@ -281,6 +293,40 @@ impl DownloadManager {
             .collect()
     }
 
+    /// For app exit: records every active download as failed ("app closed")
+    /// and stops its process group, SIGTERM first and SIGKILL if it outlives
+    /// a short grace.
+    pub fn shutdown(&self) {
+        let ids: Vec<String> = {
+            let mut items = lock(&self.inner.items);
+            self.inner.closing.store(true, Ordering::SeqCst);
+            items
+                .iter_mut()
+                .filter(|i| matches!(i.record.status, DlStatus::Queued | DlStatus::Running))
+                .map(|item| {
+                    item.cancel = true;
+                    item.progress = None;
+                    item.record.status = DlStatus::Failed;
+                    item.record.error = Some("app closed".into());
+                    self.inner.persist(&item.record);
+                    item.record.id.clone()
+                })
+                .collect()
+        };
+        self.inner.notify();
+        if !self.inner.signal_groups(&ids, Some(Signal::SIGTERM)) {
+            return;
+        }
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+            if !self.inner.signal_groups(&ids, None) {
+                return;
+            }
+        }
+        self.inner.signal_groups(&ids, Some(Signal::SIGKILL));
+    }
+
     /// Called (from a worker thread) after every change to the snapshot.
     pub fn set_on_change(&self, f: Box<dyn Fn() + Send + Sync>) {
         *lock(&self.inner.on_change) = Some(Arc::from(f));
@@ -329,6 +375,10 @@ impl Inner {
                 Err(err) => return Outcome::Failed(format!("writing ani-cli shims: {err}")),
             };
         let menu_out = anicli::menu_out_path(&shims);
+        // Coarse filesystem timestamps can trail the clock a little.
+        let started = SystemTime::now()
+            .checked_sub(Duration::from_secs(2))
+            .unwrap_or(UNIX_EPOCH);
         let (mut child, master) = match spawn_in_pty(&program, &req, &dir, &shims, &menu_out) {
             Ok(spawned) => spawned,
             Err(err) => return Outcome::Failed(format!("starting ani-cli: {err}")),
@@ -337,7 +387,10 @@ impl Inner {
         let pgid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
         {
             let mut items = lock(&self.items);
-            if let Some(item) = items.iter_mut().find(|i| i.record.id == id) {
+            if self.closing.load(Ordering::SeqCst) {
+                // shutdown() already settled this record but couldn't see the group.
+                let _ = killpg(pgid, Signal::SIGKILL);
+            } else if let Some(item) = items.iter_mut().find(|i| i.record.id == id) {
                 item.record.status = DlStatus::Running;
                 item.pgid = Some(pgid);
                 self.persist(&item.record);
@@ -345,7 +398,7 @@ impl Inner {
         }
         self.notify();
 
-        let tail = self.watch(id, pgid, master);
+        let tail = self.watch(id, pgid, master, &mut child);
         let status = child.wait();
         let needs_pick = anicli::take_menu_out(&menu_out).is_some();
         let (cancelled, title) = {
@@ -363,7 +416,7 @@ impl Inner {
             _ if needs_pick => Outcome::Failed(NEEDS_PICK.into()),
             (Watched::Stalled, _) => Outcome::Failed("stalled".into()),
             (Watched::Exited(_), Ok(status)) if status.success() => {
-                match find_download(&dir, &title, &req.ep) {
+                match find_download(&dir, &title, &req.ep, started) {
                     Some(path) => Outcome::Done(path),
                     None => Outcome::Failed(format!(
                         "ani-cli finished, but no file for episode {} is in {}",
@@ -377,9 +430,10 @@ impl Inner {
         }
     }
 
-    /// Reads the download's terminal until every process holding it is gone,
-    /// updating progress, and kills the group on cancel or stall.
-    fn watch(&self, id: &str, pgid: Pid, master: File) -> Watched {
+    /// Reads the download's terminal until every process holding it is gone
+    /// (or shortly after `child` exits), updating progress, and kills the
+    /// group on cancel or stall.
+    fn watch(&self, id: &str, pgid: Pid, master: File, child: &mut Child) -> Watched {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         thread::spawn(move || {
             let mut master = master;
@@ -406,6 +460,7 @@ impl Inner {
         let mut stalled = false;
         let mut term_sent: Option<Instant> = None;
         let mut kill_sent = false;
+        let mut exited_at: Option<Instant> = None;
         let mut handle = |line: &[u8], last: &mut DlProgress, advanced_at: &mut Instant| {
             let line = String::from_utf8_lossy(line);
             if let Some(p) = parse_progress_line(&line) {
@@ -441,6 +496,17 @@ impl Inner {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
+            if exited_at.is_none() && self.reap(id, child) {
+                exited_at = Some(Instant::now());
+            }
+            // Once reaped the group id may be reused, so no more signals; a
+            // straggler still holding the terminal gets a moment to flush.
+            if let Some(at) = exited_at {
+                if at.elapsed() >= EXIT_GRACE {
+                    break;
+                }
+                continue;
+            }
             match term_sent {
                 None => {
                     stalled = advanced_at.elapsed() >= self.stall_after;
@@ -466,6 +532,30 @@ impl Inner {
         }
     }
 
+    /// Whether `child` has exited. Reaps it and forgets its group under the
+    /// items lock, so nobody signals a group id that may have been reused.
+    fn reap(&self, id: &str, child: &mut Child) -> bool {
+        let mut items = lock(&self.items);
+        let exited = matches!(child.try_wait(), Ok(Some(_)));
+        if exited && let Some(item) = items.iter_mut().find(|i| i.record.id == id) {
+            item.pgid = None;
+        }
+        exited
+    }
+
+    /// Sends `signal` (None only probes) to the groups of `ids` not yet
+    /// reaped; true if any of them still exists.
+    fn signal_groups(&self, ids: &[String], signal: Option<Signal>) -> bool {
+        let items = lock(&self.items);
+        let mut any = false;
+        for item in items.iter().filter(|i| ids.contains(&i.record.id)) {
+            if let Some(pgid) = item.pgid {
+                any |= killpg(pgid, signal).is_ok();
+            }
+        }
+        any
+    }
+
     fn cancel_requested(&self, id: &str) -> bool {
         lock(&self.items)
             .iter()
@@ -476,6 +566,9 @@ impl Inner {
     fn set_progress(&self, id: &str, p: DlProgress) {
         {
             let mut items = lock(&self.items);
+            if self.closing.load(Ordering::SeqCst) {
+                return;
+            }
             let Some(item) = items.iter_mut().find(|i| i.record.id == id) else {
                 return;
             };
@@ -490,6 +583,9 @@ impl Inner {
     fn finish(&self, id: &str, outcome: Outcome) {
         {
             let mut items = lock(&self.items);
+            if self.closing.load(Ordering::SeqCst) {
+                return;
+            }
             let Some(item) = items.iter_mut().find(|i| i.record.id == id) else {
                 return;
             };
@@ -542,22 +638,16 @@ fn spawn_in_pty(
     dir: &Path,
     shims: &Path,
     menu_out: &Path,
-) -> io::Result<(std::process::Child, File)> {
-    let size = Winsize {
-        ws_row: 24,
-        ws_col: 100,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let pty = openpty(&size, None).map_err(io::Error::from)?;
+) -> io::Result<(Child, File)> {
+    let (master, slave) = open_pty()?;
     let mut cmd = Command::new(program);
     cmd.arg("-d")
         .args(anicli::episode_args(req))
         .envs(anicli::shim_env(req, shims, menu_out))
         .env("ANI_CLI_DOWNLOAD_DIR", dir)
         .stdin(Stdio::null())
-        .stdout(pty.slave.try_clone()?)
-        .stderr(pty.slave.try_clone()?);
+        .stdout(slave.try_clone()?)
+        .stderr(slave.try_clone()?);
     // SAFETY: setsid is async-signal-safe and touches no parent state.
     unsafe {
         cmd.pre_exec(|| setsid().map(drop).map_err(io::Error::from));
@@ -565,8 +655,33 @@ fn spawn_in_pty(
     let child = anicli::spawn(&mut cmd)?;
     // The master only reports EOF once no process holds a slave fd, ours included.
     drop(cmd);
-    drop(pty.slave);
-    Ok((child, File::from(pty.master)))
+    drop(slave);
+    Ok((child, File::from(master)))
+}
+
+/// A 24x100 pseudo-terminal whose two fds are close-on-exec from the start,
+/// so children spawned by other threads never inherit them.
+fn open_pty() -> io::Result<(OwnedFd, File)> {
+    let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC)?;
+    grantpt(&master)?;
+    unlockpt(&master)?;
+    // std opens files with O_CLOEXEC.
+    let slave = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOCTTY)
+        .open(ptsname_r(&master)?)?;
+    let size = Winsize {
+        ws_row: 24,
+        ws_col: 100,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCSWINSZ only reads the winsize behind the valid pointer.
+    if unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCSWINSZ, &size) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((master.into(), slave))
 }
 
 fn failure_detail(tail: &str, status: ExitStatus) -> String {
@@ -592,14 +707,15 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// The newest video file in `dir` for episode `ep`. ani-cli names downloads
 /// "<its own title> Episode <ep>.mp4", and its title can differ from ours, so
-/// a file whose name also contains `title` wins, else any for the episode.
-fn find_download(dir: &Path, title: &str, ep: &str) -> Option<PathBuf> {
+/// a file whose name also contains `title` wins, else any for the episode
+/// written at or after `since` (so never an older file of another show).
+fn find_download(dir: &Path, title: &str, ep: &str, since: SystemTime) -> Option<PathBuf> {
     let episode = Regex::new(&format!(
         r"episode\s*0*{}(?:\D|$)",
         regex::escape(&ep.to_lowercase())
     ))
     .ok()?;
-    let mut files: Vec<(SystemTime, PathBuf, String)> = fs::read_dir(dir)
+    let mut files: Vec<(SystemTime, SystemTime, PathBuf, String)> = fs::read_dir(dir)
         .ok()?
         .filter_map(|entry| {
             let entry = entry.ok()?;
@@ -612,17 +728,25 @@ fn find_download(dir: &Path, title: &str, ep: &str) -> Option<PathBuf> {
             if !episode.is_match(&name.to_lowercase()) {
                 return None;
             }
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            Some((modified, path, name))
+            let meta = entry.metadata().ok()?;
+            let modified = meta.modified().ok()?;
+            // A downloader may backdate mtime to the server's; ctime it can't.
+            let changed = u64::try_from(meta.ctime())
+                .map_or(UNIX_EPOCH, |secs| UNIX_EPOCH + Duration::from_secs(secs));
+            Some((modified, modified.max(changed), path, name))
         })
         .collect();
     files.sort_by_key(|f| std::cmp::Reverse(f.0));
     let title = norm_name(title);
     let titled = files
         .iter()
-        .position(|(_, _, name)| !title.is_empty() && norm_name(name).contains(&title));
-    let pick = titled.unwrap_or(0);
-    (pick < files.len()).then(|| files.swap_remove(pick).1)
+        .position(|(_, _, _, name)| !title.is_empty() && norm_name(name).contains(&title));
+    let pick = titled.or_else(|| {
+        files
+            .iter()
+            .position(|(_, changed, _, _)| *changed >= since)
+    })?;
+    Some(files.swap_remove(pick).2)
 }
 
 /// Mirrors how ani-cli sanitises titles into filenames: text before the
@@ -746,17 +870,24 @@ mod tests {
         ] {
             fs::write(dir.join(name), b"x").unwrap();
         }
+        let later = SystemTime::now() + Duration::from_secs(60);
+        // A title match counts whenever the file was written.
         assert_eq!(
-            find_download(&dir, "Frieren: Beyond Journey's End", "1"),
+            find_download(&dir, "Frieren: Beyond Journey's End", "1", later),
             Some(dir.join("Frieren Beyond Journeys End Episode 1.mp4"))
         );
-        // Title differs from ani-cli's naming: the episode token alone decides.
+        // Without a title match only a file written since the download began
+        // counts, never an older one from another show.
+        assert_eq!(find_download(&dir, "Sousou no Frieren", "2", later), None);
         assert_eq!(
-            find_download(&dir, "Sousou no Frieren", "2"),
+            find_download(&dir, "Sousou no Frieren", "2", UNIX_EPOCH),
             Some(dir.join("Other Show Episode 2.mkv"))
         );
-        assert_eq!(find_download(&dir, "Frieren", "3"), None);
-        assert_eq!(find_download(&dir.join("missing"), "Frieren", "1"), None);
+        assert_eq!(find_download(&dir, "Frieren", "3", UNIX_EPOCH), None);
+        assert_eq!(
+            find_download(&dir.join("missing"), "Frieren", "1", UNIX_EPOCH),
+            None
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1024,6 +1155,126 @@ sleep 30"#,
         assert_eq!(rec.error.as_deref(), Some("stalled"));
         assert_eq!(rec.progress, 40.0);
         assert!(begun.elapsed() < Duration::from_secs(8));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pty_fds_are_cloexec() {
+        use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+        use std::os::fd::AsFd;
+
+        let (master, slave) = open_pty().unwrap();
+        for fd in [master.as_fd(), slave.as_fd()] {
+            let flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD).unwrap());
+            assert!(flags.contains(FdFlag::FD_CLOEXEC));
+        }
+        assert!(nix::unistd::isatty(&slave).unwrap());
+    }
+
+    #[test]
+    fn concurrent_downloads_all_finish() {
+        let dir = temp_dir("concurrent");
+        let script = fake_ani_cli(
+            &dir.join("bin"),
+            r#"while [ $# -gt 0 ]; do [ "$1" = -e ] && ep=$2; shift; done
+case "$ep" in
+  1|3|5) ;;
+  *) for p in 10 20 30 40 50 60 70 80; do
+       printf '[download]  %s.0%% of ~10.00MiB at  1.00MiB/s ETA 00:01\n' "$p"
+       sleep 0.25
+     done ;;
+esac
+echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode $ep.mp4""#,
+        );
+        let (m, _db) = manager(script, Duration::from_secs(1));
+        let ids: Vec<String> = (1..=6)
+            .map(|ep| {
+                let req = EpisodeRequest {
+                    ep: ep.to_string(),
+                    ..req()
+                };
+                m.start(&show(), req, &dir.join(format!("out{ep}")))
+            })
+            .collect();
+        for (ep, id) in (1..=6).zip(&ids) {
+            let rec = wait_for(&m, id, finished);
+            assert_eq!(rec.status, DlStatus::Done, "episode {ep}: {rec:?}");
+            assert_eq!(
+                rec.path.as_deref(),
+                dir.join(format!("out{ep}/Frieren Episode {ep}.mp4"))
+                    .to_str()
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn exited_download_does_not_wait_for_lingering_pty_holder() {
+        let dir = temp_dir("linger");
+        // The background sleep keeps the pty open long after ani-cli exits 0.
+        let script = fake_ani_cli(
+            &dir.join("bin"),
+            r#"echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode 3.mp4"
+sleep 8 &
+exit 0"#,
+        );
+        let (m, _db) = manager(script, Duration::from_secs(1));
+        let begun = Instant::now();
+        let id = m.start(&show(), req(), &dir.join("out"));
+        let rec = wait_for(&m, &id, finished);
+        assert_eq!(rec.status, DlStatus::Done, "{rec:?}");
+        assert!(
+            begun.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            begun.elapsed()
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shutdown_stops_active_downloads() {
+        let dir = temp_dir("shutdown");
+        let script = fake_ani_cli(
+            &dir.join("bin"),
+            r#"trap '' TERM
+sleep 30 &
+echo $! > "$ANI_CLI_DOWNLOAD_DIR/child.pid"
+printf '[download]   5.0%% of ~100.00MiB at  1.00MiB/s ETA 09:00\n'
+wait"#,
+        );
+        let (m, db) = manager(script, Duration::from_secs(60));
+        let out = dir.join("out");
+        let id = m.start(&show(), req(), &out);
+        wait_for(&m, &id, |r| {
+            r.status == DlStatus::Running && r.progress == 5.0
+        });
+
+        let begun = Instant::now();
+        m.shutdown();
+        assert!(
+            begun.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            begun.elapsed()
+        );
+        let child: i32 = fs::read_to_string(out.join("child.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(child), None).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "grandchild {child} survived shutdown"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The worker winding down afterwards must not overwrite the record.
+        std::thread::sleep(Duration::from_millis(500));
+        let saved = db.lock().unwrap().list_downloads().unwrap().remove(0);
+        assert_eq!(saved.status, DlStatus::Failed);
+        assert_eq!(saved.error.as_deref(), Some("app closed"));
+        assert_eq!(m.snapshot()[0].0, saved);
         fs::remove_dir_all(&dir).unwrap();
     }
 

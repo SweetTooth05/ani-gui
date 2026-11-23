@@ -305,7 +305,9 @@ fn resolve_once(
     cmd.extend(episode_args(req));
     let menu_out = menu_out_path(shims);
     let mut env = shim_env(req, shims, &menu_out);
-    env.push(("ANI_CLI_PLAYER", shims.join(CAPTURE_NAME).into_os_string()));
+    // ani-cli runs the player unquoted, so a full path breaks on spaces; the
+    // shim dir leads PATH and the bare name still matches its `*mpv*` case.
+    env.push(("ANI_CLI_PLAYER", CAPTURE_NAME.into()));
     env.extend(extra_env.iter().cloned());
     let run = run_capture(&cmd, &env, timeout);
     let picks = take_menu_out(&menu_out);
@@ -323,7 +325,30 @@ fn resolve_once(
     }
     let stream =
         parse_capture(&out.stdout).map_err(|err| anyhow!("{err}: {}", error_detail(&output)))?;
+    // A lone search result is played without asking the menu, so check it.
+    if req.select_index.is_none()
+        && let Some(found) = stream.title.as_deref().map(|t| show_title(t, &req.ep))
+    {
+        let found_norm = normalize_title(found);
+        if !req
+            .want_titles
+            .iter()
+            .any(|w| normalize_title(w) == found_norm)
+        {
+            return Ok(Attempt::Done(ResolveOutcome::NeedsPick(vec![
+                found.to_string(),
+            ])));
+        }
+    }
     Ok(Attempt::Done(ResolveOutcome::Stream(stream)))
+}
+
+/// The show part of ani-cli's "<title> Episode <ep>" media title.
+fn show_title<'a>(media_title: &'a str, ep: &str) -> &'a str {
+    media_title
+        .strip_suffix(&format!(" Episode {ep}"))
+        .or_else(|| media_title.rfind(" Episode ").map(|i| &media_title[..i]))
+        .unwrap_or(media_title)
 }
 
 /// Environment shared by resolve and download runs: the shim dir first on
@@ -912,8 +937,7 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
         assert_eq!(stream.referrer.as_deref(), Some("https://zokoanime.video/"));
 
         let env_line = format!(
-            "{}|{}|Frieren: Beyond Journey’s End\nSousou no Frieren|{}",
-            shims.join("capture-mpv").display(),
+            "capture-mpv|{}|Frieren: Beyond Journey’s End\nSousou no Frieren|{}",
             shims.join("menu").display(),
             shims.display()
         );
@@ -949,6 +973,69 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
                 .count(),
             2
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A fake ani-cli that, like the real one, runs `$ANI_CLI_PLAYER` unquoted
+    /// with the stream's arguments.
+    fn fake_player_run(path: &Path, title: &str) -> PathBuf {
+        script(
+            path,
+            &format!(
+                r#"$ANI_CLI_PLAYER --referrer="https://zokoanime.video/" --force-media-title="{title} Episode 1" "https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8""#
+            ),
+        )
+    }
+
+    #[test]
+    fn resolve_works_with_space_in_cache_dir() {
+        let dir = temp_dir("space");
+        let shims = ensure_shims(
+            &dir.join("cache dir with spaces"),
+            &std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        let fake = fake_player_run(&dir.join("bin/ani-cli"), "Frieren: Beyond Journey's End");
+        let req = build_request(&frieren(), None, "1", Mode::Sub, "best");
+        let outcome = resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10)).unwrap();
+        let ResolveOutcome::Stream(stream) = outcome else {
+            panic!("expected a stream, got {outcome:?}");
+        };
+        assert_eq!(
+            stream.url,
+            "https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8"
+        );
+        assert_eq!(
+            stream.title.as_deref(),
+            Some("Frieren: Beyond Journey's End Episode 1")
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_needs_pick_when_single_result_mismatches() {
+        // With one search result ani-cli plays it without asking the menu.
+        let dir = temp_dir("single");
+        let shims = ensure_shims(&dir, &std::env::current_exe().unwrap()).unwrap();
+        let fake = fake_player_run(
+            &dir.join("bin/ani-cli"),
+            "Frieren: Beyond Journey's End Season 2",
+        );
+        let req = build_request(&frieren(), None, "1", Mode::Sub, "best");
+        assert_eq!(
+            resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10)).unwrap(),
+            ResolveOutcome::NeedsPick(strings(&["Frieren: Beyond Journey's End Season 2"]))
+        );
+
+        // A result the user picked by index is trusted.
+        let picked = EpisodeRequest {
+            select_index: Some(1),
+            ..req
+        };
+        assert!(matches!(
+            resolve_with(&fake, &picked, &shims, &[], Duration::from_secs(10)).unwrap(),
+            ResolveOutcome::Stream(_)
+        ));
         fs::remove_dir_all(&dir).unwrap();
     }
 
