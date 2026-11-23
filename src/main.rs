@@ -1,8 +1,18 @@
 // Most of the model/store API has no caller until the UI views exist.
 #[allow(dead_code)]
+mod allanime;
+#[allow(dead_code)]
+mod anilist;
+#[allow(dead_code)]
+mod catalog;
+#[allow(dead_code)]
 mod db;
 #[allow(dead_code)]
+mod images;
+#[allow(dead_code)]
 mod model;
+#[allow(dead_code)]
+mod net;
 #[allow(dead_code)]
 mod paths;
 

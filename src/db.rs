@@ -95,6 +95,8 @@ impl Db {
         Ok(Db { conn })
     }
 
+    /// A record without `media` keeps the stored AniList data (`media_json` and
+    /// the columns derived from it); a record with `media` replaces all of it.
     pub fn upsert_show(&self, show: &ShowRecord) -> Result<()> {
         let s = &show.summary;
         let m = show.media.as_ref();
@@ -108,11 +110,16 @@ impl Db {
              ON CONFLICT(id) DO UPDATE SET
                  anilist_id = excluded.anilist_id, title = excluded.title,
                  english_title = excluded.english_title, cover_url = excluded.cover_url,
-                 banner_url = excluded.banner_url, synopsis = excluded.synopsis,
-                 genres_json = excluded.genres_json, score = excluded.score,
-                 year = excluded.year, format = excluded.format, status = excluded.status,
                  sub_count = excluded.sub_count, dub_count = excluded.dub_count,
-                 media_json = excluded.media_json, updated_at = excluded.updated_at",
+                 updated_at = excluded.updated_at,
+                 banner_url = IIF(excluded.media_json IS NULL, shows.banner_url, excluded.banner_url),
+                 synopsis = IIF(excluded.media_json IS NULL, shows.synopsis, excluded.synopsis),
+                 genres_json = IIF(excluded.media_json IS NULL, shows.genres_json, excluded.genres_json),
+                 score = IIF(excluded.media_json IS NULL, shows.score, excluded.score),
+                 year = IIF(excluded.media_json IS NULL, shows.year, excluded.year),
+                 format = IIF(excluded.media_json IS NULL, shows.format, excluded.format),
+                 status = IIF(excluded.media_json IS NULL, shows.status, excluded.status),
+                 media_json = COALESCE(excluded.media_json, shows.media_json)",
             params![
                 s.id,
                 s.anilist_id,
@@ -202,11 +209,16 @@ impl Db {
     }
 
     pub fn recent_progress(&self, limit: usize) -> Result<Vec<Progress>> {
-        // SQLite takes bare columns from the row holding MAX(updated_at).
+        // Ties on updated_at go to the most recently inserted row.
         let mut stmt = self.conn.prepare(
-            "SELECT show_id, mode, ep, position, duration, MAX(updated_at) AS latest
-             FROM progress GROUP BY show_id
-             ORDER BY latest DESC LIMIT ?1",
+            "SELECT show_id, mode, ep, position, duration, updated_at FROM (
+                 SELECT *, rowid AS rid, ROW_NUMBER() OVER (
+                     PARTITION BY show_id ORDER BY updated_at DESC, rowid DESC
+                 ) AS rn
+                 FROM progress
+             )
+             WHERE rn = 1
+             ORDER BY updated_at DESC, rid DESC LIMIT ?1",
         )?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = stmt.query_map([limit], progress_from_row)?;
@@ -562,7 +574,111 @@ mod tests {
             updated_at: 1_700_000_100,
         };
         db.upsert_show(&updated).unwrap();
-        assert_eq!(db.get_show("ReooPAxPMsHM4KPMY").unwrap(), Some(updated));
+        assert_eq!(
+            db.get_show("ReooPAxPMsHM4KPMY").unwrap(),
+            Some(ShowRecord {
+                media: record.media,
+                ..updated
+            })
+        );
+    }
+
+    #[test]
+    fn upsert_show_without_media_keeps_existing_media() {
+        let db = db();
+        let media = AniListMedia {
+            id: 154587,
+            title_romaji: "Sousou no Frieren".into(),
+            banner_url: Some("https://example.com/banner.jpg".into()),
+            synopsis: Some("An elf mage outlives her party.".into()),
+            genres: vec!["Fantasy".into()],
+            score: Some(91),
+            year: Some(2023),
+            format: Some("TV".into()),
+            status: Some("FINISHED".into()),
+            ..Default::default()
+        };
+        let summary = ShowSummary {
+            id: "s1".into(),
+            title: "Sousou no Frieren".into(),
+            sub_count: 28,
+            ..Default::default()
+        };
+        db.upsert_show(&ShowRecord {
+            summary: summary.clone(),
+            media: Some(media.clone()),
+            updated_at: 1,
+        })
+        .unwrap();
+
+        let refreshed = ShowSummary {
+            dub_count: 12,
+            ..summary.clone()
+        };
+        db.upsert_show(&ShowRecord {
+            summary: refreshed.clone(),
+            media: None,
+            updated_at: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            db.get_show("s1").unwrap(),
+            Some(ShowRecord {
+                summary: refreshed.clone(),
+                media: Some(media.clone()),
+                updated_at: 2,
+            })
+        );
+        let columns = |db: &Db| {
+            db.conn
+                .query_row(
+                    "SELECT banner_url, synopsis, genres_json, score, year, format, status
+                     FROM shows WHERE id = 's1'",
+                    [],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<String>>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<u8>>(3)?,
+                            r.get::<_, Option<u16>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            columns(&db),
+            (
+                media.banner_url.clone(),
+                media.synopsis.clone(),
+                Some(r#"["Fantasy"]"#.to_string()),
+                Some(91),
+                Some(2023),
+                Some("TV".to_string()),
+                Some("FINISHED".to_string()),
+            )
+        );
+
+        // New media replaces the old columns wholesale, including cleared fields.
+        let sparse = AniListMedia {
+            id: 154587,
+            title_romaji: "Sousou no Frieren".into(),
+            ..Default::default()
+        };
+        db.upsert_show(&ShowRecord {
+            summary: refreshed,
+            media: Some(sparse.clone()),
+            updated_at: 3,
+        })
+        .unwrap();
+        assert_eq!(db.get_show("s1").unwrap().unwrap().media, Some(sparse));
+        assert_eq!(
+            columns(&db),
+            (None, None, Some("[]".to_string()), None, None, None, None)
+        );
     }
 
     #[test]
@@ -605,6 +721,23 @@ mod tests {
             db.recent_progress(1).unwrap(),
             vec![progress("a", "2", 20.0, 300)]
         );
+    }
+
+    #[test]
+    fn recent_progress_tie_break_is_deterministic() {
+        let db = db();
+        db.save_progress(&progress("a", "1", 10.0, 100)).unwrap();
+        db.save_progress(&progress("a", "2", 20.0, 100)).unwrap();
+        db.save_progress(&progress("b", "1", 30.0, 100)).unwrap();
+        db.save_progress(&progress("c", "1", 40.0, 50)).unwrap();
+
+        let expected = vec![
+            progress("b", "1", 30.0, 100),
+            progress("a", "2", 20.0, 100),
+            progress("c", "1", 40.0, 50),
+        ];
+        assert_eq!(db.recent_progress(10).unwrap(), expected);
+        assert_eq!(db.recent_progress(2).unwrap(), expected[..2]);
     }
 
     #[test]

@@ -1,0 +1,44 @@
+{
+  "data": {
+    "shows": {
+      "edges": [
+        {
+          "_id": "qpeexkeTa7DzLjRnp",
+          "name": "Sousou no Frieren 2nd Season",
+          "englishName": "Frieren: Beyond Journey’s End Season 2",
+          "thumbnail": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx182255-butzrqd4I0aC.jpg",
+          "aniListId": "182255",
+          "availableEpisodes": {
+            "sub": 10,
+            "dub": 10,
+            "raw": 0
+          }
+        },
+        {
+          "_id": "sG52nbcFo3PfLg6PD",
+          "name": "Sousou no Frieren: ●● no Mahou",
+          "englishName": "Frieren: Beyond Journey's End Mini Anime",
+          "thumbnail": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx170068-ijY3tCP8KoWP.jpg",
+          "aniListId": "170068",
+          "availableEpisodes": {
+            "sub": 12,
+            "dub": 0,
+            "raw": 0
+          }
+        },
+        {
+          "_id": "ReHMC7TQnch3C6z8j",
+          "name": "Sousou no Frieren",
+          "englishName": "Frieren: Beyond Journey’s End",
+          "thumbnail": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx154587-qQTzQnEJJ3oB.jpg",
+          "aniListId": "154587",
+          "availableEpisodes": {
+            "sub": 28,
+            "dub": 28,
+            "raw": 0
+          }
+        }
+      ]
+    }
+  }
+}
