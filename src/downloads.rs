@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::env;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
@@ -15,15 +16,17 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, setsid};
 use regex::Regex;
 
-use crate::anicli;
 use crate::db::{self, Db};
 use crate::model::{DlStatus, DownloadRecord, EpisodeRequest, ShowSummary};
+use crate::{anicli, paths};
 
 const STALL_AFTER: Duration = Duration::from_secs(60);
 /// Time a killed download gets to exit on SIGTERM before SIGKILL.
 const KILL_GRACE: Duration = Duration::from_secs(5);
 /// Non-progress output lines kept for the error message.
 const TAIL_LINES: usize = 40;
+/// When ani-cli's results had no title matching the show.
+const NEEDS_PICK: &str = "Pick the matching title on the show page first";
 const VIDEO_EXTS: [&str; 7] = ["mp4", "mkv", "webm", "avi", "mov", "flv", "m4v"];
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -100,6 +103,8 @@ struct Inner {
     db: Arc<Mutex<Db>>,
     /// ani-cli to run; None looks it up per download.
     program: Option<PathBuf>,
+    /// Where `anicli::ensure_shims` puts the menu shim.
+    shim_cache: PathBuf,
     stall_after: Duration,
     items: Mutex<Vec<Item>>,
     on_change: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -132,10 +137,15 @@ impl DownloadManager {
     /// Loads saved downloads; ones a previous session left queued or running
     /// are marked failed.
     pub fn new(db: Arc<Mutex<Db>>) -> Self {
-        Self::with_runner(db, None, STALL_AFTER)
+        Self::with_runner(db, None, paths::cache_dir(), STALL_AFTER)
     }
 
-    fn with_runner(db: Arc<Mutex<Db>>, program: Option<PathBuf>, stall_after: Duration) -> Self {
+    fn with_runner(
+        db: Arc<Mutex<Db>>,
+        program: Option<PathBuf>,
+        shim_cache: PathBuf,
+        stall_after: Duration,
+    ) -> Self {
         let records = lock(&db).list_downloads().unwrap_or_else(|err| {
             eprintln!("ani-gui: loading downloads: {err:#}");
             Vec::new()
@@ -143,6 +153,7 @@ impl DownloadManager {
         let inner = Inner {
             db,
             program,
+            shim_cache,
             stall_after,
             items: Mutex::new(Vec::new()),
             on_change: Mutex::new(None),
@@ -312,7 +323,13 @@ impl Inner {
         if let Err(err) = fs::create_dir_all(&dir) {
             return Outcome::Failed(format!("creating {}: {err}", dir.display()));
         }
-        let (mut child, master) = match spawn_in_pty(&program, &req, &dir) {
+        let shims =
+            match env::current_exe().and_then(|exe| anicli::ensure_shims(&self.shim_cache, &exe)) {
+                Ok(shims) => shims,
+                Err(err) => return Outcome::Failed(format!("writing ani-cli shims: {err}")),
+            };
+        let menu_out = anicli::menu_out_path(&shims);
+        let (mut child, master) = match spawn_in_pty(&program, &req, &dir, &shims, &menu_out) {
             Ok(spawned) => spawned,
             Err(err) => return Outcome::Failed(format!("starting ani-cli: {err}")),
         };
@@ -330,6 +347,7 @@ impl Inner {
 
         let tail = self.watch(id, pgid, master);
         let status = child.wait();
+        let needs_pick = anicli::take_menu_out(&menu_out).is_some();
         let (cancelled, title) = {
             let mut items = lock(&self.items);
             match items.iter_mut().find(|i| i.record.id == id) {
@@ -342,6 +360,7 @@ impl Inner {
         };
         match (tail, status) {
             _ if cancelled => Outcome::Cancelled,
+            _ if needs_pick => Outcome::Failed(NEEDS_PICK.into()),
             (Watched::Stalled, _) => Outcome::Failed("stalled".into()),
             (Watched::Exited(_), Ok(status)) if status.success() => {
                 match find_download(&dir, &title, &req.ep) {
@@ -521,6 +540,8 @@ fn spawn_in_pty(
     program: &Path,
     req: &EpisodeRequest,
     dir: &Path,
+    shims: &Path,
+    menu_out: &Path,
 ) -> io::Result<(std::process::Child, File)> {
     let size = Winsize {
         ws_row: 24,
@@ -532,8 +553,8 @@ fn spawn_in_pty(
     let mut cmd = Command::new(program);
     cmd.arg("-d")
         .args(anicli::episode_args(req))
+        .envs(anicli::shim_env(req, shims, menu_out))
         .env("ANI_CLI_DOWNLOAD_DIR", dir)
-        .env("PATH", anicli::child_path())
         .stdin(Stdio::null())
         .stdout(pty.slave.try_clone()?)
         .stderr(pty.slave.try_clone()?);
@@ -541,7 +562,7 @@ fn spawn_in_pty(
     unsafe {
         cmd.pre_exec(|| setsid().map(drop).map_err(io::Error::from));
     }
-    let child = cmd.spawn()?;
+    let child = anicli::spawn(&mut cmd)?;
     // The master only reports EOF once no process holds a slave fd, ours included.
     drop(cmd);
     drop(pty.slave);
@@ -771,17 +792,23 @@ mod tests {
 
     fn req() -> EpisodeRequest {
         EpisodeRequest {
-            query: "frieren".into(),
-            nth: 1,
+            query: "Frieren: Beyond Journey's End".into(),
+            want_titles: vec![
+                "Frieren: Beyond Journey's End".into(),
+                "Sousou no Frieren".into(),
+            ],
+            select_index: Some(1),
             ep: "3".into(),
             mode: Mode::Dub,
             quality: "720".into(),
         }
     }
 
+    /// The fake ani-cli lives in `<dir>/bin`; shims go under `<dir>/cache`.
     fn manager(program: PathBuf, stall_after: Duration) -> (DownloadManager, Arc<Mutex<Db>>) {
         let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
-        let m = DownloadManager::with_runner(db.clone(), Some(program), stall_after);
+        let cache = program.parent().unwrap().parent().unwrap().join("cache");
+        let m = DownloadManager::with_runner(db.clone(), Some(program), cache, stall_after);
         (m, db)
     }
 
@@ -822,6 +849,7 @@ mod tests {
         let script = fake_ani_cli(
             &dir.join("bin"),
             r#"printf '%s\n' "$@" > "$ANI_CLI_DOWNLOAD_DIR/args.txt"
+printf '%s|%s|%s\n' "$ANI_CLI_MENU" "$ANI_GUI_WANT_TITLES" "${PATH%%:*}" > "$ANI_CLI_DOWNLOAD_DIR/env.txt"
 test -t 1 && echo yes > "$ANI_CLI_DOWNLOAD_DIR/tty.txt"
 printf '[download]  10.0%% of ~100.00MiB at  1.00MiB/s ETA 01:30\r'
 printf '[download]  55.5%% of ~100.00MiB at  2.00MiB/s ETA 00:20\r'
@@ -852,7 +880,16 @@ printf '[download] 100%% of  100.00MiB in 00:00:40 at 2.50MiB/s\n'"#,
         assert_eq!(rec.quality, "720");
         assert_eq!(
             fs::read_to_string(out.join("args.txt")).unwrap(),
-            "-d\n-S\n1\n-e\n3\n-q\n720\n--dub\nfrieren\n"
+            "-d\n-S\n1\n-e\n3\n-q\n720\n--dub\nFrieren: Beyond Journey's End\n"
+        );
+        let shims = dir.join("cache").join("shims");
+        assert_eq!(
+            fs::read_to_string(out.join("env.txt")).unwrap(),
+            format!(
+                "{}|Frieren: Beyond Journey's End\nSousou no Frieren|{}\n",
+                shims.join("menu").display(),
+                shims.display()
+            )
         );
         assert_eq!(fs::read_to_string(out.join("tty.txt")).unwrap(), "yes\n");
         assert!(changes.load(Ordering::Relaxed) >= 2);
@@ -948,6 +985,26 @@ wait"#,
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn download_needs_pick_fails_with_hint() {
+        let dir = temp_dir("pick");
+        let script = fake_ani_cli(
+            &dir.join("bin"),
+            r#"printf '["A","B"]' > "$ANI_GUI_MENU_OUT"
+printf 'Invalid anime selection\n' >&2
+exit 1"#,
+        );
+        let (m, _db) = manager(script, Duration::from_secs(60));
+        let id = m.start(&show(), req(), &dir.join("out"));
+        let rec = wait_for(&m, &id, finished);
+        assert_eq!(rec.status, DlStatus::Failed);
+        assert_eq!(
+            rec.error.as_deref(),
+            Some("Pick the matching title on the show page first")
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

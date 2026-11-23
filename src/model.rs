@@ -105,9 +105,12 @@ pub struct Stream {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EpisodeRequest {
+    /// What ani-cli searches its provider for.
     pub query: String,
-    /// 1-based position of the show in ani-cli's search results.
-    pub nth: usize,
+    /// Titles the menu shim accepts in ani-cli's "Select anime" menu.
+    pub want_titles: Vec<String>,
+    /// 1-based `-S` pick, once the user chose among ani-cli's results.
+    pub select_index: Option<usize>,
     pub ep: String,
     pub mode: Mode,
     pub quality: String,

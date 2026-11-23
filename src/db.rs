@@ -64,6 +64,14 @@ CREATE TABLE api_cache (
 );
 ";
 
+/// ani-cli's own (provider) title per show, for its "Select anime" menu.
+const SCHEMA_V2: &str = "
+CREATE TABLE provider_titles (
+    show_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL
+);
+";
+
 pub struct Db {
     conn: Connection,
 }
@@ -86,11 +94,13 @@ impl Db {
 
     fn init(mut conn: Connection) -> Result<Db> {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version < 1 {
-            let tx = conn.transaction()?;
-            tx.execute_batch(SCHEMA_V1)?;
-            tx.pragma_update(None, "user_version", 1)?;
-            tx.commit()?;
+        for (target, schema) in [(1, SCHEMA_V1), (2, SCHEMA_V2)] {
+            if version < target {
+                let tx = conn.transaction()?;
+                tx.execute_batch(schema)?;
+                tx.pragma_update(None, "user_version", target)?;
+                tx.commit()?;
+            }
         }
         Ok(Db { conn })
     }
@@ -397,6 +407,27 @@ impl Db {
         self.cache_put_at(key, json, now())
     }
 
+    pub fn get_provider_title(&self, show_id: &str) -> Result<Option<String>> {
+        let title = self
+            .conn
+            .query_row(
+                "SELECT title FROM provider_titles WHERE show_id = ?1",
+                [show_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(title)
+    }
+
+    pub fn set_provider_title(&self, show_id: &str, title: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO provider_titles (show_id, title) VALUES (?1, ?2)
+             ON CONFLICT(show_id) DO UPDATE SET title = excluded.title",
+            [show_id, title],
+        )?;
+        Ok(())
+    }
+
     fn cache_put_at(&self, key: &str, json: &str, fetched_at: i64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO api_cache (key, json, fetched_at) VALUES (?1, ?2, ?3)
@@ -480,13 +511,13 @@ mod tests {
     }
 
     #[test]
-    fn migrate_sets_user_version_1() {
+    fn migrate_sets_latest_user_version() {
         let db = db();
         let version: i64 = db
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         for table in [
             "shows",
             "progress",
@@ -494,6 +525,7 @@ mod tests {
             "downloads",
             "settings",
             "api_cache",
+            "provider_titles",
         ] {
             let n: i64 = db
                 .conn
@@ -505,6 +537,54 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "missing table {table}");
         }
+    }
+
+    #[test]
+    fn migrate_v1_to_v2_keeps_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO my_list (show_id, added_at) VALUES ('a', 1)",
+            [],
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(db.my_list().unwrap(), ["a"]);
+        db.set_provider_title("a", "Frieren").unwrap();
+        assert_eq!(
+            db.get_provider_title("a").unwrap().as_deref(),
+            Some("Frieren")
+        );
+    }
+
+    #[test]
+    fn provider_title_roundtrip() {
+        let db = db();
+        assert_eq!(db.get_provider_title("ReHMC7TQnch3C6z8j").unwrap(), None);
+        db.set_provider_title("ReHMC7TQnch3C6z8j", "Frieren: Beyond Journey's End")
+            .unwrap();
+        db.set_provider_title("other", "Other").unwrap();
+        db.set_provider_title(
+            "ReHMC7TQnch3C6z8j",
+            "Frieren: Beyond Journey's End Season 2",
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_provider_title("ReHMC7TQnch3C6z8j")
+                .unwrap()
+                .as_deref(),
+            Some("Frieren: Beyond Journey's End Season 2")
+        );
+        assert_eq!(
+            db.get_provider_title("other").unwrap().as_deref(),
+            Some("Other")
+        );
     }
 
     #[test]
