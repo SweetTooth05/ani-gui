@@ -82,28 +82,55 @@ a plugin system; theming options (dark only); in-app ani-cli installer.
 - AniList item → playable AllAnime show: search AllAnime with the romaji title,
   pick the edge whose `aniListId` matches (fallback: first result).
 
-### Stream resolution (verified)
-Run ani-cli with a capture shim instead of a real player:
+### Stream resolution (verified 2026-11-23, revised)
+ani-cli 5.1.8 searches **hianime.at**, not AllAnime, so result positions and ids
+differ from our AllAnime catalog. We therefore never compute `-S` ourselves:
+ani-cli's own "Select anime" menu is answered by our menu shim, and ani-cli's
+own history write keeps `ani-cli -c` working with its ids.
+
+Shims live in `<cache>/shims/`: `capture-mpv` (player; path must contain
+"mpv"; `#!/bin/sh` + `for a in "$@"; do printf '%s\n' "$a"; done`),
+`menu` (`#!/bin/sh` + `exec "<abs path of ani-gui exe>" --ani-cli-menu "$@"`),
+and symlinks `rofi` and `dmenu` → `menu` (ani-cli forces rofi/dmenu when stdin
+is not a tty, so the shim dir must come first on PATH).
 
 ```
-ANI_CLI_PLAYER=<cache>/capture-mpv  ANI_CLI_EXTERNAL_MENU=off \
-  ani-cli --exit-after-play -S <nth> -e <ep> -q <quality> [--dub] "<query>"
+PATH=<cache>/shims:/usr/local/bin:~/.local/bin:$PATH
+ANI_CLI_PLAYER=<cache>/shims/capture-mpv  ANI_CLI_MENU=<cache>/shims/menu
+ANI_GUI_WANT_TITLES="<title1>\n<title2>…"  ANI_GUI_MENU_OUT=<tmp file>
+  ani-cli --no-detach [-S <n>] -e <ep> -q <quality> [--dub] "<query>"   </dev/null
 ```
-`capture-mpv` (path must contain "mpv"; written by the app at startup) is
-`#!/bin/sh` + `for a in "$@"; do printf '%s\n' "$a"; done`. ani-cli invokes it
-in the foreground and its stdout yields lines: `--referrer=…`,
-optional `--audio-file=…`, optional `--sub-file=…`, `--force-media-title=…`,
-and the final video URL. `nth` = 1-based position of the show in an AllAnime
-search for `query` filtered to shows having episodes in that mode (port
-`find_nth`/`search_anime` from server.py). stdin must be `/dev/null`; prepend
-`/usr/local/bin:~/.local/bin` to PATH. ani-cli does **not** write history in
-this mode, so the app writes it.
+- `query` = remembered provider title for this show, else AllAnime English
+  title, else romaji title. `-S` is passed only after the user picked from a
+  candidate list in the same session.
+- Menu mode (`ani-gui --ani-cli-menu <args…>`, handled in `main` before GPUI
+  starts): prompt = last argv item; stdin = `N title` lines.
+  - Prompt contains "Select anime": pick the first line whose normalized title
+    (lowercase, `’`→`'`, punctuation stripped, whitespace collapsed) equals a
+    normalized want-title; print that line verbatim. No match → write the
+    candidate titles (ani-cli order) as JSON array to `ANI_GUI_MENU_OUT`,
+    print nothing, exit 0 (ani-cli then dies "Invalid anime selection").
+  - Any other prompt (post-play "Playing episode…" menu): print nothing → ani-cli
+    exits 0.
+- stdout of the run yields `--referrer=…`, optional `--audio-file=…`, optional
+  `--sub-file=…`, `--force-media-title=…`, final URL (verified).
+- Outcomes: `Stream`; or `NeedsPick(candidates)` when the menu-out file is
+  non-empty → UI shows "Which one is it?" with the candidates; choosing index i
+  re-runs with `-S i` and stores the chosen title as the show's provider title
+  (`provider_titles` table) so later plays match automatically; or failure
+  (detail = last 240 chars of ANSI-stripped output). If ani-cli reports
+  "No results found" for the English query, retry once with the romaji title.
+- Timeout 60 s → kill process group.
 
 ### ani-cli history sync
-File: `$ANI_CLI_HIST_DIR` or `$XDG_STATE_HOME/ani-cli` or
-`~/.local/state/ani-cli`, file `ani-hsts`, lines `ep\tid\ttitle`. On startup
-import into Continue Watching. When an episode starts playing, replace (or
-append) the line for that show id, written atomically (tmp + rename).
+ani-cli writes `ani-hsts` itself during the run above (verified: line
+`3\tfrieren-beyond-journeys-end-481\tFrieren: Beyond Journey's End`). The app
+never writes it. File: `$ANI_CLI_HIST_DIR` or `$XDG_STATE_HOME/ani-cli` or
+`~/.local/state/ani-cli`, file `ani-hsts`, lines `ep\tid\ttitle` (ids are the
+provider's, e.g. hianime slugs). On startup the app reads it for Continue
+Watching: entries without app progress are matched to the catalog by title
+(AllAnime search, normalized-title equality, else first result) and the
+history title is stored as that show's provider title.
 
 ### Player
 - `mpv_create`, options: `vo=libmpv`, `hwdec=auto-copy`, `referrer`,
@@ -126,8 +153,8 @@ append) the line for that show id, written atomically (tmp + rename).
   Auto-play next episode at EOF (setting, default on) with a 5 s countdown card.
 
 ### Downloads
-Run `ani-cli -d -S <nth> -e <ep> -q <quality> [--dub] "<query>"` with
-`ANI_CLI_DOWNLOAD_DIR` set, under a pseudo-terminal so yt-dlp/ffmpeg emit
+Run the same command as resolution but with `-d` instead of the player shim
+(menu shim and want-titles still apply), with `ANI_CLI_DOWNLOAD_DIR` set, under a pseudo-terminal so yt-dlp/ffmpeg emit
 progress; port `_parse_progress_line` / stall detection from server.py.
 States: queued, running, done, failed, cancelled; cancel kills the process
 group; retry re-issues. Completed files play in the in-app player
@@ -142,6 +169,7 @@ group; retry re-issues. Completed files play in the in-app player
 - `my_list(show_id TEXT PK, added_at INT)`
 - `downloads(id TEXT PK, show_id, title, ep, mode, quality, path, status,
   progress REAL, error, created_at INT)`
+- `provider_titles(show_id TEXT PK, title TEXT)` (schema v2)
 - `settings(key TEXT PK, value TEXT)` — mode (sub/dub), quality, download_dir,
   autoplay_next.
 - `api_cache(key TEXT PK, json TEXT, fetched_at INT)`

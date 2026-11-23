@@ -204,3 +204,22 @@
 - [ ] **Step 3:** `git grep -nE "python|pipx|PyPI|brew" -- . ':!CHANGELOG.md' ':!docs/superpowers'` → no matches.
 - [ ] **Step 4:** Full check passes.
 - [ ] **Step 5:** Commit `chore: native packaging, remove python app, rewrite docs`.
+
+---
+
+## Revision R1 (2026-11-23): ani-cli provider switch — supersedes conflicting text above
+
+ani-cli 5.1.8 searches hianime.at, not AllAnime (spec "Stream resolution", revised). Changes:
+
+- `model::EpisodeRequest` becomes `{ query: String, want_titles: Vec<String>, select_index: Option<usize>, ep: String, mode: Mode, quality: String }` (no `nth`).
+- `db`: schema v2 adds `provider_titles(show_id TEXT PRIMARY KEY, title TEXT NOT NULL)`; `Db::get_provider_title(show_id) -> Result<Option<String>>`, `Db::set_provider_title(show_id, title) -> Result<()>`.
+- `anicli`:
+  - `ensure_shims(cache_dir: &Path, exe: &Path) -> io::Result<PathBuf /*shim dir*/>` replaces `ensure_capture_shim` (writes `capture-mpv`, `menu`, symlinks `rofi`, `dmenu`).
+  - `build_request(show: &ShowSummary, provider_title: Option<&str>, ep: &str, mode: Mode, quality: &str) -> EpisodeRequest` — pure, no network. query = provider_title, else english_title, else title; want_titles = [provider_title?, english_title?, title] de-duplicated.
+  - `enum ResolveOutcome { Stream(Stream), NeedsPick(Vec<String>) }`; `resolve(req: &EpisodeRequest, shims: &Path) -> anyhow::Result<ResolveOutcome>` (retry once with romaji `title` when output contains "No results found" and query was the English title).
+  - `menu_main(args: &[String], stdin: &str, want_titles: &[String], out_file: Option<&Path>) -> String /*stdout to print*/` + `normalize_title(s) -> String`. `main.rs` dispatches `--ani-cli-menu` to it (reading env `ANI_GUI_WANT_TITLES`, `ANI_GUI_MENU_OUT`, stdin) before starting GPUI.
+  - Tests: `menu_picks_exact_normalized_title` (stdin `1 Frieren: Beyond Journey's End\n2 Frieren: Beyond Journey's End Season 2`, want `Frieren: Beyond Journey’s End` → prints line 1), `menu_no_match_writes_candidates` (JSON array of the 2 titles in order; prints ""), `menu_postplay_prompt_prints_nothing`, `build_request_prefers_provider_title`, `resolve_needs_pick_when_menu_out_written` (fake ani-cli script writes the out file and exits 1), `resolve_retries_romaji_on_no_results`. Live `#[ignore]` `live_resolve_frieren` now resolves `{english: "Frieren: Beyond Journey's End", ep "1"}` with no `-S`.
+- `history`: keep `read`; **remove `record`** (ani-cli writes history itself with its own ids).
+- `downloads::DownloadManager::start(show: &ShowSummary, req: EpisodeRequest, dir: &Path)` uses the same shims/env with `-d`; a `NeedsPick` result marks the download Failed with error "Pick the matching title on the show page first".
+- Task 5: `view_models::continue_items` matches history entries to shows by title (provider title table first, then normalized equality); Show page handles `NeedsPick` with a "Which one is it?" chooser that calls `set_provider_title` and re-resolves with `select_index`.
+- Task 6: drop `playback::history_entry` and the `history::record` call; ani-cli records history during resolve.
