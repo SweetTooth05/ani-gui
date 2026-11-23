@@ -20,3 +20,6 @@ build/
 .ruff_cache/
 config.bat
 node_modules
+
+# Rust
+/target

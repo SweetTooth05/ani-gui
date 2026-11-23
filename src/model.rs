@@ -1,0 +1,246 @@
+use std::fmt;
+use std::path::PathBuf;
+use std::str::FromStr;
+
+use anyhow::anyhow;
+use serde::{Deserialize, Serialize};
+
+use crate::paths;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    #[default]
+    Sub,
+    Dub,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Sub => "sub",
+            Mode::Dub => "dub",
+        }
+    }
+}
+
+impl FromStr for Mode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "sub" => Ok(Mode::Sub),
+            "dub" => Ok(Mode::Dub),
+            other => Err(anyhow!("unknown mode: {other:?}")),
+        }
+    }
+}
+
+impl fmt::Display for Mode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ShowSummary {
+    pub id: String,
+    pub title: String,
+    pub english_title: Option<String>,
+    pub cover_url: String,
+    pub anilist_id: Option<i64>,
+    pub sub_count: u32,
+    pub dub_count: u32,
+}
+
+impl ShowSummary {
+    pub fn count(&self, mode: Mode) -> u32 {
+        match mode {
+            Mode::Sub => self.sub_count,
+            Mode::Dub => self.dub_count,
+        }
+    }
+
+    pub fn display_title(&self) -> &str {
+        self.english_title.as_deref().unwrap_or(&self.title)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct AniListMedia {
+    pub id: i64,
+    pub title_romaji: String,
+    pub title_english: Option<String>,
+    pub cover_url: String,
+    pub banner_url: Option<String>,
+    /// Plain text; HTML tags are stripped when parsing.
+    pub synopsis: Option<String>,
+    pub genres: Vec<String>,
+    pub score: Option<u8>,
+    pub year: Option<u16>,
+    pub format: Option<String>,
+    pub status: Option<String>,
+    pub episodes: Option<u32>,
+    /// (episode, airing_at unix seconds)
+    pub next_airing: Option<(u32, i64)>,
+    /// (title, thumbnail url)
+    pub episode_thumbs: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Airing {
+    pub media: AniListMedia,
+    pub episode: u32,
+    pub airing_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Stream {
+    pub url: String,
+    pub referrer: Option<String>,
+    pub audio_file: Option<String>,
+    pub sub_file: Option<String>,
+    pub title: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EpisodeRequest {
+    pub query: String,
+    /// 1-based position of the show in ani-cli's search results.
+    pub nth: usize,
+    pub ep: String,
+    pub mode: Mode,
+    pub quality: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Progress {
+    pub show_id: String,
+    pub mode: Mode,
+    pub ep: String,
+    pub position: f64,
+    pub duration: f64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShowRecord {
+    pub summary: ShowSummary,
+    pub media: Option<AniListMedia>,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DlStatus {
+    Queued,
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl DlStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DlStatus::Queued => "queued",
+            DlStatus::Running => "running",
+            DlStatus::Done => "done",
+            DlStatus::Failed => "failed",
+            DlStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+impl FromStr for DlStatus {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        match s {
+            "queued" => Ok(DlStatus::Queued),
+            "running" => Ok(DlStatus::Running),
+            "done" => Ok(DlStatus::Done),
+            "failed" => Ok(DlStatus::Failed),
+            "cancelled" => Ok(DlStatus::Cancelled),
+            other => Err(anyhow!("unknown download status: {other:?}")),
+        }
+    }
+}
+
+impl fmt::Display for DlStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DownloadRecord {
+    pub id: String,
+    pub show_id: String,
+    pub title: String,
+    pub ep: String,
+    pub mode: Mode,
+    pub quality: String,
+    pub path: Option<String>,
+    pub status: DlStatus,
+    pub progress: f32,
+    pub error: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Settings {
+    pub mode: Mode,
+    pub quality: String,
+    pub download_dir: PathBuf,
+    pub autoplay_next: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            mode: Mode::Sub,
+            quality: "best".to_string(),
+            download_dir: paths::default_download_dir(),
+            autoplay_next: true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_and_status_roundtrip_strings() {
+        for mode in [Mode::Sub, Mode::Dub] {
+            assert_eq!(mode.as_str().parse::<Mode>().ok(), Some(mode));
+        }
+        for status in [
+            DlStatus::Queued,
+            DlStatus::Running,
+            DlStatus::Done,
+            DlStatus::Failed,
+            DlStatus::Cancelled,
+        ] {
+            assert_eq!(status.as_str().parse::<DlStatus>().ok(), Some(status));
+        }
+        assert!("SUB".parse::<Mode>().is_err());
+        assert_eq!(Mode::default(), Mode::Sub);
+    }
+
+    #[test]
+    fn summary_count_and_display_title() {
+        let mut show = ShowSummary {
+            title: "Sousou no Frieren".into(),
+            sub_count: 28,
+            dub_count: 10,
+            ..Default::default()
+        };
+        assert_eq!(show.count(Mode::Sub), 28);
+        assert_eq!(show.count(Mode::Dub), 10);
+        assert_eq!(show.display_title(), "Sousou no Frieren");
+        show.english_title = Some("Frieren: Beyond Journey's End".into());
+        assert_eq!(show.display_title(), "Frieren: Beyond Journey's End");
+    }
+}
