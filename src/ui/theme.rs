@@ -102,22 +102,88 @@ pub fn register_fonts(cx: &App) {
 pub const LOGO: &str = "brand/ani-gui-compact-reversed.svg";
 const LOGO_SVG: &[u8] = include_bytes!("../../assets/brand/svg/ani-gui-compact-reversed.svg");
 
+/// UI icons (Lucide, ISC: `assets/icons/ui/LICENSE`), embedded under
+/// `icons/<name>.svg`. Render with `components::icon::icon(name)`. To add one,
+/// drop the SVG into `assets/icons/ui/` and add its name to `ui_icons!`.
+macro_rules! ui_icons {
+    ($($name:literal),* $(,)?) => {
+        pub const UI_ICONS: &[(&str, &[u8])] = &[
+            $((concat!("icons/", $name, ".svg"),
+               include_bytes!(concat!("../../assets/icons/ui/", $name, ".svg"))),)*
+        ];
+    };
+}
+
+ui_icons!(
+    "arrow-left",
+    "bookmark",
+    "calendar",
+    "captions",
+    "captions-off",
+    "check",
+    "chevron-down",
+    "chevron-left",
+    "chevron-right",
+    "chevron-up",
+    "circle-alert",
+    "clock",
+    "download",
+    "external-link",
+    "film",
+    "folder",
+    "gauge",
+    "heart",
+    "house",
+    "info",
+    "list",
+    "loader-circle",
+    "log-in",
+    "log-out",
+    "maximize",
+    "minimize",
+    "pause",
+    "play",
+    "plus",
+    "refresh-cw",
+    "rotate-ccw",
+    "rotate-cw",
+    "search",
+    "settings",
+    "skip-back",
+    "skip-forward",
+    "star",
+    "trash-2",
+    "tv",
+    "volume-1",
+    "volume-2",
+    "volume-x",
+    "x",
+);
+
 /// Images embedded in the binary, so an installed `ani-gui` needs no asset
 /// directory. `img(LOGO)` goes through GPUI's resource loader, which
-/// rasterises SVG in full colour.
+/// rasterises SVG in full colour; `svg().path(..)` renders an icon as a
+/// tintable mask.
 pub struct Assets;
+
+impl Assets {
+    fn all() -> impl Iterator<Item = (&'static str, &'static [u8])> {
+        std::iter::once((LOGO, LOGO_SVG)).chain(UI_ICONS.iter().copied())
+    }
+}
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
-        Ok((path == LOGO).then_some(Cow::Borrowed(LOGO_SVG)))
+        Ok(Assets::all()
+            .find(|(p, _)| *p == path)
+            .map(|(_, bytes)| Cow::Borrowed(bytes)))
     }
 
     fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
-        Ok(if LOGO.starts_with(path) {
-            vec![LOGO.into()]
-        } else {
-            Vec::new()
-        })
+        Ok(Assets::all()
+            .filter(|(p, _)| p.starts_with(path))
+            .map(|(p, _)| p.into())
+            .collect())
     }
 }
 
@@ -136,5 +202,18 @@ mod tests {
     fn assets_list_logo_and_miss_unknown_paths() {
         assert!(Assets.load("nope.svg").expect("load").is_none());
         assert!(Assets.list("").expect("list").contains(&LOGO.into()));
+    }
+
+    #[test]
+    fn assets_serve_every_ui_icon() {
+        for (path, _) in UI_ICONS {
+            let svg = Assets.load(path).expect("load").expect("icon present");
+            assert!(
+                std::str::from_utf8(&svg).expect("utf8").contains("<svg"),
+                "{path}"
+            );
+        }
+        assert!(Assets.load("icons/play.svg").expect("load").is_some());
+        assert_eq!(Assets.list("icons/").expect("list").len(), UI_ICONS.len());
     }
 }
