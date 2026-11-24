@@ -37,6 +37,9 @@ $(BIN):
 install: $(BIN)
 	install -Dm755 $(BIN) $(BINDIR)/ani-gui
 	install -Dm644 assets/ani-gui.desktop $(APPSDIR)/$(APP_ID).desktop
+	@# An absolute Exec (never with DESTDIR): ~/.local/bin is often not on
+	@# the desktop session's PATH.
+	sed -i 's|^Exec=ani-gui$$|Exec=$(PREFIX)/bin/ani-gui|' $(APPSDIR)/$(APP_ID).desktop
 	@for icon in $(ICONS); do \
 		echo "install -Dm644 assets/icons/hicolor/$$icon $(ICONDIR)/$$icon"; \
 		install -Dm644 assets/icons/hicolor/$$icon $(ICONDIR)/$$icon || exit 1; \

@@ -200,6 +200,7 @@ impl Root {
         // gpui waits only 100 ms for quit futures, too short for shutdown()'s
         // grace period before it kills stuck ani-cli processes.
         cx.on_app_quit(move |_, _| {
+            anicli::cancel_all_resolves();
             downloads.shutdown();
             async {}
         })
@@ -217,8 +218,14 @@ impl Root {
     }
 
     /// Opens `route`. Sidebar destinations start a fresh back stack; Show and
-    /// Player pages stack on top of the current one.
+    /// Player pages stack on top of the current one, but never a player on
+    /// a player.
     pub fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        if matches!(route, Route::Player(_))
+            && matches!(self.stack.last().map(|e| &e.page), Some(Page::Player(_)))
+        {
+            return;
+        }
         let root = cx.entity().downgrade();
         let page = match &route {
             Route::Home => match &self.home {
@@ -291,6 +298,14 @@ impl Root {
                 _ => {}
             }
             cx.notify();
+        }
+    }
+
+    /// Opens the player for `req` if page `from` is still the one showing:
+    /// a play that took a while must not cover wherever the user went since.
+    pub fn play_from(&mut self, from: EntityId, req: PlayRequest, cx: &mut Context<Self>) {
+        if self.is_current(from) {
+            self.navigate(Route::Player(req), cx);
         }
     }
 

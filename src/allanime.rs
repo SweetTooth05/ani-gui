@@ -105,11 +105,6 @@ pub fn episodes(show_id: &str, mode: Mode) -> Result<Vec<String>> {
     Ok(parse_episodes(&post(&body)?, mode))
 }
 
-/// 1-based position of `show_id` in `results`.
-pub fn nth_of(results: &[ShowSummary], show_id: &str) -> Option<usize> {
-    results.iter().position(|s| s.id == show_id).map(|i| i + 1)
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -224,14 +219,6 @@ mod tests {
         let v = fixture("allanime_show.json");
         assert_eq!(parse_episodes(&v, Mode::Sub), ten);
         assert_eq!(parse_episodes(&v, Mode::Dub), ten);
-    }
-
-    #[test]
-    fn nth_of_is_one_based() {
-        let shows = parse_search(&fixture("allanime_search.json"), Mode::Dub);
-        assert_eq!(nth_of(&shows, "qpeexkeTa7DzLjRnp"), Some(1));
-        assert_eq!(nth_of(&shows, "ReHMC7TQnch3C6z8j"), Some(2));
-        assert_eq!(nth_of(&shows, "sG52nbcFo3PfLg6PD"), None);
     }
 
     #[test]

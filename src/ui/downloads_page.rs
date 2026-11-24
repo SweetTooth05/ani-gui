@@ -211,8 +211,9 @@ impl DownloadsPage {
                 page.busy.remove(&id);
                 match req {
                     Ok(req) => {
+                        let from = cx.entity_id();
                         page.root
-                            .update(cx, |root, cx| root.navigate(Route::Player(req), cx))
+                            .update(cx, |root, cx| root.play_from(from, req, cx))
                             .ok();
                     }
                     Err(err) => {

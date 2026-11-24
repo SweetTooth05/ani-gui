@@ -25,6 +25,10 @@ use crate::model::{DlStatus, DownloadRecord, EpisodeRequest, ShowSummary};
 use crate::{anicli, paths};
 
 const STALL_AFTER: Duration = Duration::from_secs(60);
+/// Downloads that run at once; the rest wait queued. Each runs ani-cli and
+/// a downloader against the provider, and ani-cli rewrites its history
+/// file on every run, which concurrent runs can clobber.
+const MAX_RUNNING: usize = 2;
 /// Time a killed download gets to exit on SIGTERM before SIGKILL.
 const KILL_GRACE: Duration = Duration::from_secs(5);
 /// How long output is still read after ani-cli exits, in case something it
@@ -116,9 +120,18 @@ struct Inner {
     shim_cache: PathBuf,
     stall_after: Duration,
     items: Mutex<Vec<Item>>,
+    /// Lock after `items` when both are needed, never before.
+    queue: Mutex<Queue>,
     on_change: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Set by `shutdown`; workers then leave records as it saved them.
     closing: AtomicBool,
+}
+
+/// Downloads waiting for a worker, oldest first, and how many workers run.
+#[derive(Default)]
+struct Queue {
+    waiting: VecDeque<String>,
+    running: usize,
 }
 
 /// One download, newest first in `Inner::items`.
@@ -167,6 +180,7 @@ impl DownloadManager {
             shim_cache,
             stall_after,
             items: Mutex::new(Vec::new()),
+            queue: Mutex::new(Queue::default()),
             on_change: Mutex::new(None),
             closing: AtomicBool::new(false),
         };
@@ -193,8 +207,9 @@ impl DownloadManager {
         }
     }
 
-    /// Queues `req` for `show` into `dir` and starts it right away. Refuses
-    /// an episode that is not a plain number (see `anicli::check_episode`).
+    /// Queues `req` for `show` into `dir`; it starts once fewer than
+    /// `MAX_RUNNING` downloads run. Refuses an episode that is not a plain
+    /// number (see `anicli::check_episode`).
     pub fn start(&self, show: &ShowSummary, req: EpisodeRequest, dir: &Path) -> Result<String> {
         anicli::check_episode(&req.ep)?;
         let id = new_id();
@@ -229,17 +244,27 @@ impl DownloadManager {
             );
         }
         self.inner.notify();
-        self.inner.clone().spawn_worker(id.clone());
+        self.inner.clone().enqueue(id.clone());
         Ok(id)
     }
 
     /// Stops a queued or running download (its whole process group); the
-    /// partial file stays on disk.
+    /// partial file stays on disk. One still waiting is just marked cancelled.
     pub fn cancel(&self, id: &str) {
-        let mut items = lock(&self.inner.items);
-        if let Some(item) = items.iter_mut().find(|i| i.record.id == id) {
-            request_stop(item);
+        {
+            let mut items = lock(&self.inner.items);
+            let Some(item) = items.iter_mut().find(|i| i.record.id == id) else {
+                return;
+            };
+            if !self.inner.dequeue(id) {
+                request_stop(item);
+                return;
+            }
+            item.record.status = DlStatus::Cancelled;
+            item.progress = None;
+            self.inner.persist(&item.record);
         }
+        self.inner.notify();
     }
 
     /// Runs a failed or cancelled download again under the same id.
@@ -267,7 +292,7 @@ impl DownloadManager {
             self.inner.persist(&item.record);
         }
         self.inner.notify();
-        self.inner.clone().spawn_worker(id.to_string());
+        self.inner.clone().enqueue(id.to_string());
         Ok(())
     }
 
@@ -278,7 +303,9 @@ impl DownloadManager {
             let Some(pos) = items.iter().position(|i| i.record.id == id) else {
                 return;
             };
-            request_stop(&mut items[pos]);
+            if !self.inner.dequeue(id) {
+                request_stop(&mut items[pos]);
+            }
             items.remove(pos);
             if let Err(err) = lock(&self.inner.db).delete_download(id) {
                 eprintln!("ani-gui: deleting download {id}: {err:#}");
@@ -302,6 +329,7 @@ impl DownloadManager {
         let ids: Vec<String> = {
             let mut items = lock(&self.inner.items);
             self.inner.closing.store(true, Ordering::SeqCst);
+            lock(&self.inner.queue).waiting.clear();
             items
                 .iter_mut()
                 .filter(|i| matches!(i.record.status, DlStatus::Queued | DlStatus::Running))
@@ -347,11 +375,45 @@ fn request_stop(item: &mut Item) {
 }
 
 impl Inner {
-    fn spawn_worker(self: Arc<Self>, id: String) {
-        thread::spawn(move || {
-            let outcome = self.run(&id);
-            self.finish(&id, outcome);
-        });
+    fn enqueue(self: Arc<Self>, id: String) {
+        lock(&self.queue).waiting.push_back(id);
+        self.pump();
+    }
+
+    /// Removes `id` from the waiting downloads; false if it wasn't waiting.
+    fn dequeue(&self, id: &str) -> bool {
+        let mut queue = lock(&self.queue);
+        let before = queue.waiting.len();
+        queue.waiting.retain(|w| w != id);
+        queue.waiting.len() != before
+    }
+
+    /// Starts waiting downloads while fewer than `MAX_RUNNING` run.
+    fn pump(self: Arc<Self>) {
+        loop {
+            let id = {
+                let mut queue = lock(&self.queue);
+                if self.closing.load(Ordering::SeqCst) {
+                    queue.waiting.clear();
+                    return;
+                }
+                if queue.running >= MAX_RUNNING {
+                    return;
+                }
+                let Some(id) = queue.waiting.pop_front() else {
+                    return;
+                };
+                queue.running += 1;
+                id
+            };
+            let inner = self.clone();
+            thread::spawn(move || {
+                let outcome = inner.run(&id);
+                inner.finish(&id, outcome);
+                lock(&inner.queue).running -= 1;
+                inner.pump();
+            });
+        }
     }
 
     fn run(&self, id: &str) -> Outcome {
@@ -1138,6 +1200,113 @@ wait"#,
         assert!(!ran.exists(), "ani-cli ran for an invalid episode");
         assert!(m.snapshot().is_empty());
         assert!(db.lock().unwrap().list_downloads().unwrap().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A fake ani-cli that logs its episode to `<dir>/started.log`, then
+    /// waits for `<dir>/release` before finishing the download.
+    fn gated_ani_cli(dir: &Path) -> PathBuf {
+        fake_ani_cli(
+            &dir.join("bin"),
+            &format!(
+                r#"while [ $# -gt 0 ]; do [ "$1" = -e ] && ep=$2; shift; done
+echo "$ep" >> '{log}'
+while [ ! -e '{release}' ]; do sleep 0.05; done
+echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode $ep.mp4""#,
+                log = dir.join("started.log").display(),
+                release = dir.join("release").display(),
+            ),
+        )
+    }
+
+    fn started_eps(dir: &Path) -> Vec<String> {
+        let mut eps: Vec<String> = fs::read_to_string(dir.join("started.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        eps.sort();
+        eps
+    }
+
+    fn start_ep(m: &DownloadManager, dir: &Path, ep: u32) -> String {
+        let req = EpisodeRequest {
+            ep: ep.to_string(),
+            ..req()
+        };
+        m.start(&show(), req, &dir.join(format!("out{ep}")))
+            .unwrap()
+    }
+
+    fn status_of(m: &DownloadManager, id: &str) -> DlStatus {
+        m.snapshot()
+            .into_iter()
+            .find(|(r, _)| r.id == id)
+            .map(|(r, _)| r.status)
+            .unwrap()
+    }
+
+    #[test]
+    fn downloads_run_two_at_a_time() {
+        let dir = temp_dir("queue");
+        let (m, _db) = manager(gated_ani_cli(&dir), Duration::from_secs(60));
+        let ids: Vec<String> = (1..=4).map(|ep| start_ep(&m, &dir, ep)).collect();
+        wait_for(&m, &ids[1], |r| r.status == DlStatus::Running);
+        wait_for(&m, &ids[0], |r| r.status == DlStatus::Running);
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(started_eps(&dir), ["1", "2"]);
+        assert_eq!(status_of(&m, &ids[2]), DlStatus::Queued);
+        assert_eq!(status_of(&m, &ids[3]), DlStatus::Queued);
+
+        fs::write(dir.join("release"), b"").unwrap();
+        for id in &ids {
+            assert_eq!(wait_for(&m, id, finished).status, DlStatus::Done);
+        }
+        assert_eq!(started_eps(&dir), ["1", "2", "3", "4"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cancel_while_queued_never_runs_then_retry_requeues() {
+        let dir = temp_dir("queue-cancel");
+        let (m, db) = manager(gated_ani_cli(&dir), Duration::from_secs(60));
+        let ids: Vec<String> = (1..=3).map(|ep| start_ep(&m, &dir, ep)).collect();
+        wait_for(&m, &ids[0], |r| r.status == DlStatus::Running);
+        wait_for(&m, &ids[1], |r| r.status == DlStatus::Running);
+        m.cancel(&ids[2]);
+        assert_eq!(status_of(&m, &ids[2]), DlStatus::Cancelled);
+        let saved = db.lock().unwrap().list_downloads().unwrap();
+        let saved = saved.iter().find(|r| r.id == ids[2]).unwrap();
+        assert_eq!(saved.status, DlStatus::Cancelled);
+
+        fs::write(dir.join("release"), b"").unwrap();
+        for id in &ids[..2] {
+            assert_eq!(wait_for(&m, id, finished).status, DlStatus::Done);
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(started_eps(&dir), ["1", "2"]);
+        assert_eq!(status_of(&m, &ids[2]), DlStatus::Cancelled);
+
+        m.retry(&ids[2]).unwrap();
+        assert_eq!(wait_for(&m, &ids[2], finished).status, DlStatus::Done);
+        assert_eq!(started_eps(&dir), ["1", "2", "3"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shutdown_drops_queued_downloads() {
+        let dir = temp_dir("queue-shutdown");
+        let (m, _db) = manager(gated_ani_cli(&dir), Duration::from_secs(60));
+        let ids: Vec<String> = (1..=3).map(|ep| start_ep(&m, &dir, ep)).collect();
+        wait_for(&m, &ids[0], |r| r.status == DlStatus::Running);
+        wait_for(&m, &ids[1], |r| r.status == DlStatus::Running);
+        m.shutdown();
+        fs::write(dir.join("release"), b"").unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(started_eps(&dir), ["1", "2"]);
+        for id in &ids {
+            assert_eq!(status_of(&m, id), DlStatus::Failed);
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 

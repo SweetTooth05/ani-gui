@@ -18,9 +18,9 @@ pub struct Report {
 }
 
 /// Runs every check. Starts processes and loads libmpv: call it off the UI
-/// thread.
+/// thread. ani-cli's tools are looked up on the PATH ani-cli runs with.
 pub fn run() -> Report {
-    let path_var = env::var_os("PATH").unwrap_or_default();
+    let path_var = anicli::tool_path();
     Report {
         ani_cli: anicli::find().map(|path| {
             let version = anicli::version(&path);

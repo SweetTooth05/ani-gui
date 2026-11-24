@@ -19,7 +19,7 @@ use gpui::{
 };
 use image::RgbaImage;
 
-use crate::anicli::ResolveOutcome;
+use crate::anicli::{ResolveOutcome, ResolveScope};
 use crate::app::{AppState, Back, PlayRequest, Root};
 use crate::db::{self, Db};
 use crate::downloads::DownloadManager;
@@ -127,6 +127,8 @@ pub struct PlayerView {
     unmute_volume: Option<f64>,
     create_task: Option<Task<()>>,
     resolve_task: Option<Task<()>>,
+    /// Kills this view's ani-cli runs when it goes away.
+    resolves: ResolveScope,
     leaving: bool,
     _wake_task: Task<()>,
 }
@@ -189,6 +191,7 @@ impl PlayerView {
             unmute_volume: None,
             create_task: None,
             resolve_task: None,
+            resolves: ResolveScope::default(),
             leaving: false,
             _wake_task: wake_task,
         };
@@ -207,7 +210,7 @@ impl PlayerView {
             })
             .ok();
             if let Some(Ok(player)) = created {
-                discard(player, None);
+                discard(player);
             }
         }));
     }
@@ -234,6 +237,8 @@ impl PlayerView {
         cx.notify();
     }
 
+    /// Plays the request's file or stream; without either, the episode's
+    /// download if there is one, else what ani-cli resolves.
     fn start_episode(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = &self.req.local_file {
             let stream = Stream {
@@ -247,8 +252,40 @@ impl PlayerView {
         } else if let Some(stream) = self.req.stream.take() {
             self.load(stream, cx);
         } else {
-            self.resolve(None, cx);
+            self.find_download(cx);
         }
+    }
+
+    /// Looks for the current episode's download off the UI thread, then
+    /// plays it or resolves the stream.
+    fn find_download(&mut self, cx: &mut Context<Self>) {
+        self.phase = Phase::Resolving { pick: None };
+        let downloads = self.downloads.clone();
+        let (show_id, mode, ep) = (self.req.show.id.clone(), self.req.mode, self.req.ep.clone());
+        let found = cx.background_spawn(async move {
+            let records: Vec<DownloadRecord> = downloads
+                .map(|d| d.snapshot().into_iter().map(|(record, _)| record).collect())
+                .unwrap_or_default();
+            playback::downloaded_file(&records, &show_id, mode, &ep)
+        });
+        self.resolve_task = Some(cx.spawn(async move |this, cx| {
+            let file = found.await;
+            this.update(cx, |view, cx| {
+                if view.leaving {
+                    return;
+                }
+                match file {
+                    Some(file) => {
+                        view.req.local_file = Some(file);
+                        view.start_episode(cx);
+                    }
+                    None => view.resolve(None, cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     /// Asks ani-cli for the current episode's stream. With `chosen` (a title
@@ -269,8 +306,18 @@ impl PlayerView {
         self.phase = Phase::Resolving { pick: None };
         let (show, ep) = (self.req.show.clone(), self.req.ep.clone());
         let (mode, quality) = (self.req.mode, self.req.quality.clone());
+        let owner = self.resolves.handle();
         let resolved = cx.background_spawn(async move {
-            playback::resolve(&db, &shims, &show, &ep, mode, &quality, chosen.as_deref())
+            playback::resolve(
+                &db,
+                &shims,
+                &show,
+                &ep,
+                mode,
+                &quality,
+                chosen.as_deref(),
+                &owner,
+            )
         });
         self.resolve_task = Some(cx.spawn(async move |this, cx| {
             let outcome = resolved.await;
@@ -428,7 +475,8 @@ impl PlayerView {
 
     /// Saves the current episode, then plays `ep` in the same quality: from
     /// its saved position unless finished, and from its download if there
-    /// is one (otherwise ani-cli finds it and records it in its history).
+    /// is one (otherwise ani-cli finds it and records it in its history; see
+    /// `start_episode`).
     fn advance(&mut self, ep: String, cx: &mut Context<Self>) {
         if self.leaving {
             return;
@@ -446,7 +494,7 @@ impl PlayerView {
         self.req.stream = None;
         self.req.local_file = None;
         self.phase = Phase::Resolving { pick: None };
-        let (db, downloads) = (self.db.clone(), self.downloads.clone());
+        let db = self.db.clone();
         let (show_id, mode, ep) = (self.req.show.id.clone(), self.req.mode, self.req.ep.clone());
         let found = cx.background_spawn(async move {
             let saved = db
@@ -455,20 +503,15 @@ impl PlayerView {
                     db.progress_for_show(&show_id, mode).ok()
                 })
                 .unwrap_or_default();
-            let records: Vec<DownloadRecord> = downloads
-                .map(|d| d.snapshot().into_iter().map(|(record, _)| record).collect())
-                .unwrap_or_default();
-            let file = playback::downloaded_file(&records, &show_id, mode, &ep);
-            (playback::resume_point(&saved, &ep), file)
+            playback::resume_point(&saved, &ep)
         });
         self.resolve_task = Some(cx.spawn(async move |this, cx| {
-            let (start, file) = found.await;
+            let start = found.await;
             this.update(cx, |view, cx| {
                 if view.leaving {
                     return;
                 }
                 view.req.start = start;
-                view.req.local_file = file;
                 view.start_episode(cx);
                 cx.notify();
             })
@@ -497,19 +540,20 @@ impl PlayerView {
         .detach();
     }
 
-    /// The view is gone: frees the last frame's texture and tears the player
-    /// down off the UI thread (mpv waits for its network threads).
+    /// The view is gone: frees the last frame's texture, saves progress
+    /// right here (the app may be quitting, and one upsert is quick) and
+    /// tears the player down off the UI thread (mpv waits for its network
+    /// threads).
     fn release(&mut self, cx: &mut App) {
         if let Some(image) = self.image.take() {
             cx.defer(move |cx| cx.drop_image(image, None));
         }
         let last = if self.leaving { None } else { self.snapshot() };
-        let last = last.zip(self.db.clone());
+        if let (Some(progress), Some(db)) = (last, &self.db) {
+            save_progress(db, &progress);
+        }
         if let Some(player) = self.player.take() {
-            discard(player, last);
-        } else if let Some((progress, db)) = last {
-            cx.background_spawn(async move { save_progress(&db, &progress) })
-                .detach();
+            discard(player);
         }
     }
 
@@ -1243,16 +1287,11 @@ impl Render for PlayerView {
     }
 }
 
-/// Tears `player` down on its own thread, saving `last` first.
-fn discard(player: MpvPlayer, last: Option<(Progress, Arc<Mutex<Db>>)>) {
+/// Tears `player` down on its own thread.
+fn discard(player: MpvPlayer) {
     let spawned = thread::Builder::new()
         .name("player-teardown".into())
-        .spawn(move || {
-            if let Some((progress, db)) = last {
-                save_progress(&db, &progress);
-            }
-            drop(player);
-        });
+        .spawn(move || drop(player));
     if let Err(err) = spawned {
         eprintln!("ani-gui: tearing the player down: {err}");
     }

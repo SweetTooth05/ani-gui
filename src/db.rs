@@ -89,6 +89,7 @@ impl Db {
         Db::init(conn)
     }
 
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Db> {
         Db::init(Connection::open_in_memory()?)
     }
@@ -438,6 +439,12 @@ impl Db {
         Ok(())
     }
 
+    pub fn clear_provider_title(&self, show_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM provider_titles WHERE show_id = ?1", [show_id])?;
+        Ok(())
+    }
+
     fn cache_put_at(&self, key: &str, json: &str, fetched_at: i64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO api_cache (key, json, fetched_at) VALUES (?1, ?2, ?3)
@@ -576,6 +583,27 @@ mod tests {
         assert_eq!(
             db.get_provider_title("a").unwrap().as_deref(),
             Some("Frieren")
+        );
+    }
+
+    #[test]
+    fn clear_provider_title_forgets_one_show() {
+        let db = db();
+        db.set_provider_title("a", "Wrong Show").unwrap();
+        db.set_provider_title("b", "Other").unwrap();
+        db.clear_provider_title("a").unwrap();
+        assert_eq!(db.get_provider_title("a").unwrap(), None);
+        assert_eq!(
+            db.get_provider_title("b").unwrap().as_deref(),
+            Some("Other")
+        );
+        // Clearing again, or a show without one, is fine.
+        db.clear_provider_title("a").unwrap();
+        db.clear_provider_title("missing").unwrap();
+        db.set_provider_title("a", "Right Show").unwrap();
+        assert_eq!(
+            db.get_provider_title("a").unwrap().as_deref(),
+            Some("Right Show")
         );
     }
 

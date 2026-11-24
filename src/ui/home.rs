@@ -170,7 +170,12 @@ impl HomePage {
                 page.action = None;
                 cx.notify();
                 match found {
-                    Ok(req) => page.navigate(Route::Player(req), cx),
+                    Ok(req) => {
+                        let from = cx.entity_id();
+                        page.root
+                            .update(cx, |root, cx| root.play_from(from, req, cx))
+                            .ok();
+                    }
                     Err(err) => toast::error(cx, format!("Couldn't start playback: {err:#}")),
                 }
             })

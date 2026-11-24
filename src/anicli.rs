@@ -8,7 +8,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -47,7 +47,7 @@ pub fn find() -> Option<PathBuf> {
 
 /// `ani-cli -V`, e.g. "5.1.8".
 pub fn version(path: &Path) -> Option<String> {
-    let out = run_capture(&[path.into(), "-V".into()], &[], VERSION_TIMEOUT).ok()?;
+    let out = run_capture(&[path.into(), "-V".into()], &[], VERSION_TIMEOUT, None).ok()?;
     let version = out.stdout.lines().next()?.trim();
     (out.status.success() && !version.is_empty()).then(|| version.to_string())
 }
@@ -249,13 +249,84 @@ pub fn parse_capture(stdout: &str) -> Result<Stream> {
     })
 }
 
+/// Whoever asked for resolves (a page or the player). Dropping it, or
+/// [`cancel_all_resolves`] at quit, kills the ani-cli runs it started, so
+/// ani-cli doesn't record an episode nobody is going to watch.
+pub struct ResolveScope {
+    owner: Arc<Mutex<Owner>>,
+}
+
+/// What a resolve run is handed to register its ani-cli process group.
+#[derive(Clone)]
+pub struct ResolveHandle {
+    owner: Arc<Mutex<Owner>>,
+}
+
+#[derive(Default)]
+struct Owner {
+    cancelled: bool,
+    /// Process groups of its running ani-cli, removed once reaped.
+    groups: Vec<Pid>,
+}
+
+/// Every live scope, for [`cancel_all_resolves`].
+static SCOPES: Mutex<Vec<Weak<Mutex<Owner>>>> = Mutex::new(Vec::new());
+
+impl Default for ResolveScope {
+    fn default() -> Self {
+        let owner = Arc::new(Mutex::new(Owner::default()));
+        let mut scopes = lock(&SCOPES);
+        scopes.retain(|w| w.strong_count() > 0);
+        scopes.push(Arc::downgrade(&owner));
+        ResolveScope { owner }
+    }
+}
+
+impl ResolveScope {
+    pub fn handle(&self) -> ResolveHandle {
+        ResolveHandle {
+            owner: self.owner.clone(),
+        }
+    }
+}
+
+impl Drop for ResolveScope {
+    fn drop(&mut self) {
+        cancel(&self.owner);
+    }
+}
+
+fn cancel(owner: &Mutex<Owner>) {
+    let mut owner = lock(owner);
+    owner.cancelled = true;
+    for pgid in owner.groups.drain(..) {
+        let _ = killpg(pgid, Signal::SIGKILL);
+    }
+}
+
+/// For app exit: kills every resolve still running.
+pub fn cancel_all_resolves() {
+    let owners: Vec<_> = lock(&SCOPES).iter().filter_map(Weak::upgrade).collect();
+    for owner in owners {
+        cancel(&owner);
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Resolves the stream for one episode by running ani-cli with the shims in
 /// `shims` (see [`ensure_shims`]) as its player and menu. ani-cli records the
-/// episode in its own history as it goes.
-pub fn resolve(req: &EpisodeRequest, shims: &Path) -> Result<ResolveOutcome> {
+/// episode in its own history as it goes, unless `owner` is cancelled first.
+pub fn resolve(
+    req: &EpisodeRequest,
+    shims: &Path,
+    owner: &ResolveHandle,
+) -> Result<ResolveOutcome> {
     let program = find()
         .context("ani-cli is not installed (looked on PATH, in ~/.local/bin and /usr/local/bin)")?;
-    resolve_with(&program, req, shims, &[], RESOLVE_TIMEOUT)
+    resolve_with(&program, req, shims, &[], RESOLVE_TIMEOUT, Some(owner))
 }
 
 /// [`resolve`] with a given ani-cli and extra environment. When the search
@@ -267,8 +338,9 @@ fn resolve_with(
     shims: &Path,
     extra_env: &[(&str, OsString)],
     timeout: Duration,
+    owner: Option<&ResolveHandle>,
 ) -> Result<ResolveOutcome> {
-    match resolve_once(program, req, shims, extra_env, timeout)? {
+    match resolve_once(program, req, shims, extra_env, timeout, owner)? {
         Attempt::Done(outcome) => Ok(outcome),
         Attempt::NoResults(err) => {
             let romaji = req.want_titles.last().filter(|t| **t != req.query);
@@ -278,7 +350,7 @@ fn resolve_with(
                         query: title.clone(),
                         ..req.clone()
                     };
-                    match resolve_once(program, &retry, shims, extra_env, timeout)? {
+                    match resolve_once(program, &retry, shims, extra_env, timeout, owner)? {
                         Attempt::Done(outcome) => Ok(outcome),
                         Attempt::NoResults(err) => Err(err),
                     }
@@ -300,6 +372,7 @@ fn resolve_once(
     shims: &Path,
     extra_env: &[(&str, OsString)],
     timeout: Duration,
+    owner: Option<&ResolveHandle>,
 ) -> Result<Attempt> {
     let mut cmd = vec![program.as_os_str().to_owned(), "--no-detach".into()];
     cmd.extend(episode_args(req)?);
@@ -309,7 +382,7 @@ fn resolve_once(
     // shim dir leads PATH and the bare name still matches its `*mpv*` case.
     env.push(("ANI_CLI_PLAYER", CAPTURE_NAME.into()));
     env.extend(extra_env.iter().cloned());
-    let run = run_capture(&cmd, &env, timeout);
+    let run = run_capture(&cmd, &env, timeout, owner);
     let picks = take_menu_out(&menu_out);
     let out = run?;
     if let Some(titles) = picks {
@@ -352,25 +425,40 @@ fn show_title<'a>(media_title: &'a str, ep: &str) -> &'a str {
 }
 
 /// Environment shared by resolve and download runs: the shim dir first on
-/// PATH (then `/usr/local/bin` and `~/.local/bin`, for sessions started from a
-/// desktop launcher), the menu shim, and what it should pick or report.
+/// PATH (see [`tool_path`]), the menu shim, and what it should pick or
+/// report. ani-cli settings a user may export are pinned to what the request
+/// needs: there is no `--sub` flag to undo an exported `ANI_CLI_MODE=dub`.
 pub(crate) fn shim_env(
     req: &EpisodeRequest,
     shims: &Path,
     menu_out: &Path,
 ) -> Vec<(&'static str, OsString)> {
-    let current = env::var_os("PATH").unwrap_or_default();
-    let dirs = [shims.to_path_buf(), PathBuf::from("/usr/local/bin")]
-        .into_iter()
-        .chain(env::home_dir().map(|home| home.join(".local/bin")))
-        .chain(env::split_paths(&current));
-    let path = env::join_paths(dirs).unwrap_or(current);
+    let mut path = OsString::from(shims.as_os_str());
+    path.push(":");
+    path.push(tool_path());
     vec![
         ("PATH", path),
         ("ANI_CLI_MENU", shims.join(MENU_NAME).into_os_string()),
+        ("ANI_CLI_MENU_FLAGS", "".into()),
+        ("ANI_CLI_MODE", req.mode.as_str().into()),
+        ("ANI_CLI_DEFAULT_SOURCE", "search".into()),
+        ("ANI_CLI_EXACT", "0".into()),
+        ("ANI_CLI_PLAYER_FLAGS", "".into()),
+        ("ANI_CLI_SKIP_INTRO", "0".into()),
         ("ANI_GUI_WANT_TITLES", req.want_titles.join("\n").into()),
         ("ANI_GUI_MENU_OUT", menu_out.as_os_str().to_owned()),
     ]
+}
+
+/// The PATH ani-cli finds its tools on: `/usr/local/bin` and `~/.local/bin`
+/// (for sessions started from a desktop launcher), then the app's own PATH.
+pub fn tool_path() -> OsString {
+    let current = env::var_os("PATH").unwrap_or_default();
+    let dirs = [PathBuf::from("/usr/local/bin")]
+        .into_iter()
+        .chain(env::home_dir().map(|home| home.join(".local/bin")))
+        .chain(env::split_paths(&current));
+    env::join_paths(dirs).unwrap_or(current)
 }
 
 /// A fresh path for one run's menu-out file.
@@ -489,8 +577,17 @@ struct Captured {
 
 /// Runs `cmd` in its own process group with stdin from /dev/null, collecting
 /// stdout and stderr. Past `timeout` the whole group is killed and the error
-/// carries the output so far.
-fn run_capture(cmd: &[OsString], env: &[(&str, OsString)], timeout: Duration) -> Result<Captured> {
+/// carries the output so far. While it runs, cancelling `owner` kills it.
+fn run_capture(
+    cmd: &[OsString],
+    env: &[(&str, OsString)],
+    timeout: Duration,
+    owner: Option<&ResolveHandle>,
+) -> Result<Captured> {
+    let cancelled = || owner.is_some_and(|o| lock(&o.owner).cancelled);
+    if cancelled() {
+        bail!("cancelled");
+    }
     let (program, args) = cmd.split_first().context("empty command")?;
     let mut command = Command::new(program);
     command
@@ -504,24 +601,53 @@ fn run_capture(cmd: &[OsString], env: &[(&str, OsString)], timeout: Duration) ->
         spawn(&mut command).with_context(|| format!("starting {}", program.to_string_lossy()))?;
     let stdout = OutputReader::spawn(child.stdout.take());
     let stderr = OutputReader::spawn(child.stderr.take());
+    // process_group(0) made the child the leader of its own group.
+    let pgid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
+    if let Some(owner) = owner {
+        let mut owner = lock(&owner.owner);
+        if owner.cancelled {
+            let _ = killpg(pgid, Signal::SIGKILL);
+        } else {
+            owner.groups.push(pgid);
+        }
+    }
+    // Reaps under the owner's lock and forgets the group, so a cancel never
+    // signals a group id that may have been reused.
+    let forget = |child: &mut Child, kill: bool| -> io::Result<Option<ExitStatus>> {
+        let mut owner = owner.map(|o| lock(&o.owner));
+        if kill {
+            // Killed before reaping, so the group id cannot have been reused.
+            let _ = killpg(pgid, Signal::SIGKILL);
+        }
+        let status = if kill {
+            child.wait().map(Some)
+        } else {
+            child.try_wait()
+        };
+        if !matches!(status, Ok(None))
+            && let Some(owner) = owner.as_mut()
+        {
+            owner.groups.retain(|g| *g != pgid);
+        }
+        status
+    };
 
     let deadline = Instant::now() + timeout;
     let status = loop {
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = forget(&mut child, false)? {
             break Some(status);
         }
         if Instant::now() >= deadline {
-            // Killed before reaping, so the group id cannot have been reused.
-            if let Ok(pgid) = i32::try_from(child.id()) {
-                let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
-            }
-            let _ = child.wait();
+            let _ = forget(&mut child, true);
             break None;
         }
         thread::sleep(Duration::from_millis(25));
     };
     let stdout = stdout.finish();
     let stderr = stderr.finish();
+    if cancelled() {
+        bail!("cancelled");
+    }
     match status {
         Some(status) => Ok(Captured {
             status,
@@ -654,7 +780,7 @@ mod tests {
             .map(OsString::from)
             .to_vec();
         let begun = Instant::now();
-        let err = run_capture(&cmd, &[], Duration::from_secs(1))
+        let err = run_capture(&cmd, &[], Duration::from_secs(1), None)
             .err()
             .expect("sleeping script must time out")
             .to_string();
@@ -670,11 +796,87 @@ mod tests {
             &["sh", "-c", "echo \"$X\"; echo oops >&2; exit 3"].map(OsString::from),
             &[("X", "from-env".into())],
             Duration::from_secs(5),
+            None,
         )
         .unwrap();
         assert_eq!(ok.stdout, "from-env\n");
         assert_eq!(ok.stderr, "oops\n");
         assert_eq!(ok.status.code(), Some(3));
+    }
+
+    #[test]
+    fn dropping_scope_kills_running_resolve() {
+        let dir = temp_dir("cancel");
+        let shims = ensure_shims(&dir, &std::env::current_exe().unwrap()).unwrap();
+        let pid_file = dir.join("child.pid");
+        let ran = dir.join("ran");
+        let fake = script(
+            &dir.join("bin/ani-cli"),
+            &format!(
+                "touch '{}'\nsleep 30 &\necho $! > '{}'\nwait",
+                ran.display(),
+                pid_file.display()
+            ),
+        );
+        let req = build_request(&frieren(), None, "1", Mode::Sub, "best");
+
+        let scope = ResolveScope::default();
+        let handle = scope.handle();
+        let (fake2, req2, shims2) = (fake.clone(), req.clone(), shims.clone());
+        let begun = Instant::now();
+        let run = thread::spawn(move || {
+            resolve_with(
+                &fake2,
+                &req2,
+                &shims2,
+                &[],
+                Duration::from_secs(20),
+                Some(&handle),
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::read_to_string(&pid_file).map_or(true, |p| p.trim().is_empty()) {
+            assert!(Instant::now() < deadline, "fake ani-cli never started");
+            thread::sleep(Duration::from_millis(20));
+        }
+        drop(scope);
+        let err = run.join().unwrap().unwrap_err().to_string();
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(
+            begun.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            begun.elapsed()
+        );
+        let child: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while nix::sys::signal::kill(Pid::from_raw(child), None).is_ok() {
+            assert!(Instant::now() < deadline, "grandchild {child} survived");
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // A cancelled scope never starts ani-cli again.
+        fs::remove_file(&ran).unwrap();
+        let scope = ResolveScope::default();
+        let handle = scope.handle();
+        cancel_all_resolves();
+        let err = resolve_with(
+            &fake,
+            &req,
+            &shims,
+            &[],
+            Duration::from_secs(5),
+            Some(&handle),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cancelled"), "{err}");
+        assert!(!ran.exists(), "ani-cli ran for a cancelled scope");
+        drop(scope);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -774,6 +976,30 @@ mod tests {
     }
 
     #[test]
+    fn shim_env_pins_ani_cli_settings() {
+        let dir = Path::new("/tmp/shims");
+        let value = |env: &[(&str, OsString)], key: &str| {
+            let found: Vec<_> = env.iter().filter(|(k, _)| *k == key).collect();
+            assert_eq!(found.len(), 1, "{key}");
+            found[0].1.to_string_lossy().into_owned()
+        };
+        for (mode, expect) in [(Mode::Sub, "sub"), (Mode::Dub, "dub")] {
+            let req = build_request(&frieren(), None, "1", mode, "best");
+            let env = shim_env(&req, dir, &dir.join("out"));
+            // Set explicitly, so they override whatever the user exported.
+            assert_eq!(value(&env, "ANI_CLI_MODE"), expect);
+            assert_eq!(value(&env, "ANI_CLI_DEFAULT_SOURCE"), "search");
+            assert_eq!(value(&env, "ANI_CLI_EXACT"), "0");
+            assert_eq!(value(&env, "ANI_CLI_PLAYER_FLAGS"), "");
+            assert_eq!(value(&env, "ANI_CLI_SKIP_INTRO"), "0");
+            assert_eq!(value(&env, "ANI_CLI_MENU_FLAGS"), "");
+            let path = value(&env, "PATH");
+            assert!(path.starts_with("/tmp/shims:/usr/local/bin:"), "{path}");
+            assert!(path.ends_with(&*tool_path().to_string_lossy()), "{path}");
+        }
+    }
+
+    #[test]
     fn episode_args_reject_non_numeric_episode() {
         let mut req = build_request(&frieren(), None, "1", Mode::Sub, "best");
         req.ep = "1\\|x$|touch FILE|e;#".into();
@@ -794,7 +1020,7 @@ mod tests {
         );
         let mut req = build_request(&frieren(), None, "1", Mode::Sub, "best");
         req.ep = "1\\|x$|touch FILE|e;#".into();
-        assert!(resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10)).is_err());
+        assert!(resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10), None).is_err());
         assert!(!ran.exists(), "ani-cli ran for an invalid episode");
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -950,7 +1176,8 @@ printf '\033[1;31mInvalid anime selection\033[0m\n' >&2
 exit 1"#,
         );
         let req = build_request(&frieren(), None, "1", Mode::Sub, "best");
-        let outcome = resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10)).unwrap();
+        let outcome =
+            resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10), None).unwrap();
         assert_eq!(
             outcome,
             ResolveOutcome::NeedsPick(strings(&[
@@ -969,7 +1196,7 @@ exit 1"#,
             &dir.join("bin/failing"),
             r#"printf '\033[1;31mEpisode not released!\033[0m\n' >&2; exit 1"#,
         );
-        let err = resolve_with(&failing, &req, &shims, &[], Duration::from_secs(10))
+        let err = resolve_with(&failing, &req, &shims, &[], Duration::from_secs(10), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("Episode not released!"), "{err}");
@@ -986,7 +1213,7 @@ exit 1"#,
             &format!(
                 r#"log='{}'
 printf '%s|' "$@" >> "$log"
-printf '%s|%s|%s|%s\n' "$ANI_CLI_PLAYER" "$ANI_CLI_MENU" "$ANI_GUI_WANT_TITLES" "${{PATH%%:*}}" >> "$log"
+printf '%s|%s|%s|%s|%s\n' "$ANI_CLI_PLAYER" "$ANI_CLI_MENU" "$ANI_GUI_WANT_TITLES" "${{PATH%%:*}}" "$ANI_CLI_MODE" >> "$log"
 for a; do last=$a; done
 if [ "$last" != "Sousou no Frieren" ]; then
   printf '\033[1;31mNo results found!\033[0m\n' >&2
@@ -999,7 +1226,8 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
             ),
         );
         let req = build_request(&frieren(), None, "1", Mode::Dub, "best");
-        let outcome = resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10)).unwrap();
+        let outcome =
+            resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10), None).unwrap();
         let ResolveOutcome::Stream(stream) = outcome else {
             panic!("expected a stream, got {outcome:?}");
         };
@@ -1010,7 +1238,7 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
         assert_eq!(stream.referrer.as_deref(), Some("https://zokoanime.video/"));
 
         let env_line = format!(
-            "capture-mpv|{}|Frieren: Beyond Journey’s End\nSousou no Frieren|{}",
+            "capture-mpv|{}|Frieren: Beyond Journey’s End\nSousou no Frieren|{}|dub",
             shims.join("menu").display(),
             shims.display()
         );
@@ -1030,7 +1258,7 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
             ..frieren()
         };
         let req = build_request(&romaji, None, "1", Mode::Sub, "best");
-        let err = resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10))
+        let err = resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("No results found"), "{err}");
@@ -1038,7 +1266,7 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
             select_index: Some(2),
             ..build_request(&frieren(), None, "1", Mode::Sub, "best")
         };
-        assert!(resolve_with(&fake, &picked, &shims, &[], Duration::from_secs(10)).is_err());
+        assert!(resolve_with(&fake, &picked, &shims, &[], Duration::from_secs(10), None).is_err());
         assert_eq!(
             fs::read_to_string(&log)
                 .unwrap()
@@ -1070,7 +1298,8 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
         .unwrap();
         let fake = fake_player_run(&dir.join("bin/ani-cli"), "Frieren: Beyond Journey's End");
         let req = build_request(&frieren(), None, "1", Mode::Sub, "best");
-        let outcome = resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10)).unwrap();
+        let outcome =
+            resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10), None).unwrap();
         let ResolveOutcome::Stream(stream) = outcome else {
             panic!("expected a stream, got {outcome:?}");
         };
@@ -1096,7 +1325,7 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
         );
         let req = build_request(&frieren(), None, "1", Mode::Sub, "best");
         assert_eq!(
-            resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10)).unwrap(),
+            resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10), None).unwrap(),
             ResolveOutcome::NeedsPick(strings(&["Frieren: Beyond Journey's End Season 2"]))
         );
 
@@ -1106,7 +1335,7 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
             ..req
         };
         assert!(matches!(
-            resolve_with(&fake, &picked, &shims, &[], Duration::from_secs(10)).unwrap(),
+            resolve_with(&fake, &picked, &shims, &[], Duration::from_secs(10), None).unwrap(),
             ResolveOutcome::Stream(_)
         ));
         fs::remove_dir_all(&dir).unwrap();
@@ -1139,6 +1368,7 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
             &shims,
             &[("ANI_CLI_HIST_DIR", hist.clone().into())],
             RESOLVE_TIMEOUT,
+            None,
         )
         .unwrap();
         let ResolveOutcome::Stream(stream) = outcome else {

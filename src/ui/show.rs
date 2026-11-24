@@ -9,8 +9,8 @@ use gpui::{
     px, relative,
 };
 
-use crate::anicli::ResolveOutcome;
-use crate::app::{AppState, PlayRequest, Root, Route, ShowRef};
+use crate::anicli::{ResolveOutcome, ResolveScope};
+use crate::app::{AppState, PlayRequest, Root, ShowRef};
 use crate::db::{self, Db, lock};
 use crate::downloads::DownloadManager;
 use crate::model::{AniListMedia, DlStatus, Mode, Progress, ShowRecord, ShowSummary};
@@ -46,6 +46,8 @@ struct Loaded {
     in_list: bool,
     /// Why the episode list could not be fetched.
     episodes_error: Option<String>,
+    /// The ani-cli title this show was matched to, if one is remembered.
+    provider_title: Option<String>,
 }
 
 /// Where an episode to play was found.
@@ -86,6 +88,8 @@ pub struct ShowPage {
     queuing: HashSet<(Mode, String)>,
     /// Episode being resolved for playback.
     resolving: Option<String>,
+    /// Kills this page's ani-cli runs when it goes away.
+    resolves: ResolveScope,
     play_error: Option<String>,
     pick: Option<Pick>,
     load_task: Option<Task<()>>,
@@ -121,6 +125,7 @@ impl ShowPage {
             downloads: HashMap::new(),
             queuing: HashSet::new(),
             resolving: None,
+            resolves: ResolveScope::default(),
             play_error: None,
             pick: None,
             load_task: None,
@@ -295,6 +300,7 @@ impl ShowPage {
         let show = loaded.show.clone();
         let episodes = loaded.episodes.clone();
         let (mode, quality) = (self.mode, self.quality.clone());
+        let owner = self.resolves.handle();
         self.resolving = Some(ep.clone());
         self.play_error = None;
         self.pick = None;
@@ -315,12 +321,14 @@ impl ShowPage {
                         mode,
                         &quality_bg,
                         chosen.as_deref(),
+                        &owner,
                     )
                     .map(Found::Resolved)
                 })
                 .await;
             this.update(cx, |page, cx| {
                 page.resolving = None;
+                let from = cx.entity_id();
                 let play = |local_file, stream| PlayRequest {
                     show,
                     mode,
@@ -335,13 +343,13 @@ impl ShowPage {
                     Ok(Found::File(file)) => {
                         let req = play(Some(file), None);
                         page.root
-                            .update(cx, |root, cx| root.navigate(Route::Player(req), cx))
+                            .update(cx, |root, cx| root.play_from(from, req, cx))
                             .ok();
                     }
                     Ok(Found::Resolved(ResolveOutcome::Stream(stream))) => {
                         let req = play(None, Some(stream));
                         page.root
-                            .update(cx, |root, cx| root.navigate(Route::Player(req), cx))
+                            .update(cx, |root, cx| root.play_from(from, req, cx))
                             .ok();
                     }
                     Ok(Found::Resolved(ResolveOutcome::NeedsPick(candidates))) => {
@@ -364,8 +372,46 @@ impl ShowPage {
 
     fn choose(&mut self, title: String, cx: &mut Context<Self>) {
         if let Some(pick) = self.pick.take() {
+            if let Some(loaded) = self.loaded.as_mut() {
+                loaded.provider_title = Some(title.clone());
+            }
             self.play(pick.ep, pick.start, Some(title), cx);
         }
+    }
+
+    /// "Wrong show?": forgets the remembered ani-cli title, so the next
+    /// play asks which of ani-cli's results this show is.
+    fn choose_again(&mut self, cx: &mut Context<Self>) {
+        let Some(db) = self.state(cx).map(|s| s.db.clone()) else {
+            return;
+        };
+        let Some(loaded) = self.loaded.as_mut() else {
+            return;
+        };
+        let Some(previous) = loaded.provider_title.take() else {
+            return;
+        };
+        let id = loaded.show.id.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let cleared = cx
+                .background_spawn(async move { playback::forget_provider_title(&db, &id) })
+                .await;
+            this.update(cx, |page, cx| {
+                match cleared {
+                    Ok(()) => toast::info(cx, "You'll choose the right show next time you play"),
+                    Err(err) => {
+                        if let Some(loaded) = page.loaded.as_mut() {
+                            loaded.provider_title = Some(previous);
+                        }
+                        toast::error(cx, format!("Couldn't forget the match: {err:#}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn download(&mut self, ep: String, cx: &mut Context<Self>) {
@@ -682,6 +728,28 @@ impl ShowPage {
                     .text_color(theme::danger())
                     .child(err)
             }))
+            .children(
+                self.loaded
+                    .as_ref()
+                    .and_then(|l| l.provider_title.clone())
+                    .map(|title| {
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(10.))
+                            .text_size(px(theme::SMALL))
+                            .text_color(theme::text_muted())
+                            .child(format!("Plays as “{title}”"))
+                            .child(
+                                button("show-choose-again", "Wrong show? Choose again")
+                                    .kind(ButtonKind::Ghost)
+                                    .compact()
+                                    .disabled(resolving)
+                                    .on_click(cx.listener(|page, _, _, cx| page.choose_again(cx))),
+                            )
+                    }),
+            )
             .into_any_element()
     }
 
@@ -1093,6 +1161,7 @@ fn load(db: &Mutex<Db>, target: &ShowRef, mode: Mode) -> Result<Loaded> {
     let db = lock(db);
     let progress = db.progress_for_show(&show.id, mode)?;
     let in_list = db.my_list_contains(&show.id)?;
+    let provider_title = db.get_provider_title(&show.id)?;
     Ok(Loaded {
         show,
         media,
@@ -1100,6 +1169,7 @@ fn load(db: &Mutex<Db>, target: &ShowRef, mode: Mode) -> Result<Loaded> {
         progress,
         in_list,
         episodes_error,
+        provider_title,
     })
 }
 

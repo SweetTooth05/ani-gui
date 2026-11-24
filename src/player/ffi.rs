@@ -15,13 +15,11 @@ pub struct MpvRenderContext {
     _private: [u8; 0],
 }
 
-pub const MPV_FORMAT_NONE: c_int = 0;
 pub const MPV_FORMAT_FLAG: c_int = 3;
 pub const MPV_FORMAT_DOUBLE: c_int = 5;
 
 pub const MPV_ERROR_INVALID_PARAMETER: c_int = -4;
 
-pub const MPV_EVENT_NONE: c_int = 0;
 pub const MPV_EVENT_SHUTDOWN: c_int = 1;
 pub const MPV_EVENT_START_FILE: c_int = 6;
 pub const MPV_EVENT_END_FILE: c_int = 7;

@@ -1,14 +1,15 @@
 //! Playback flow rules shared by the player view and the Show page.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use anyhow::Result;
 
-use crate::anicli::{self, ResolveOutcome};
+use crate::anicli::{self, ResolveHandle, ResolveOutcome};
 use crate::db::{Db, lock};
 use crate::downloads::DownloadManager;
-use crate::model::{DlStatus, DownloadRecord, Mode, Progress, ShowSummary};
+use crate::model::{DlStatus, DownloadRecord, EpisodeRequest, Mode, Progress, ShowSummary};
 use crate::player::PlaybackState;
 use crate::progress;
 
@@ -121,10 +122,55 @@ pub fn start_download(
     manager.start(show, req, dir)
 }
 
-/// Resolves `ep` of `show` with ani-cli (which records it in its history).
-/// With `chosen`, that title (picked from ani-cli's results) becomes the
-/// show's provider title first, so this and later runs search for it.
+/// Shows whose provider title the user rejected this session: until they
+/// choose one, ani-cli's results always go to the picker.
+static REPICK: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+fn repick() -> MutexGuard<'static, BTreeSet<String>> {
+    REPICK.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Forgets the show's provider title ("Wrong show?") and makes its next
+/// play ask which of ani-cli's results it is.
+pub fn forget_provider_title(db: &Mutex<Db>, show_id: &str) -> Result<()> {
+    lock(db).clear_provider_title(show_id)?;
+    repick().insert(show_id.to_string());
+    Ok(())
+}
+
+/// The ani-cli request for `ep`. With `chosen`, that title (picked from
+/// ani-cli's results) becomes the show's provider title first, so this and
+/// later runs search for it.
+fn title_request(
+    db: &Mutex<Db>,
+    show: &ShowSummary,
+    ep: &str,
+    mode: Mode,
+    quality: &str,
+    chosen: Option<&str>,
+) -> Result<EpisodeRequest> {
+    let provider = {
+        let db = lock(db);
+        match chosen {
+            Some(title) => {
+                db.set_provider_title(&show.id, title)?;
+                repick().remove(&show.id);
+                Some(title.to_string())
+            }
+            None => db.get_provider_title(&show.id)?,
+        }
+    };
+    let mut req = anicli::build_request(show, provider.as_deref(), ep, mode, quality);
+    if chosen.is_none() && repick().contains(&show.id) {
+        req.want_titles.clear();
+    }
+    Ok(req)
+}
+
+/// Resolves `ep` of `show` with ani-cli (which records it in its history);
+/// see [`title_request`] for `chosen`. Killed if `owner` is cancelled.
 /// Blocks on ani-cli: call it off the UI thread.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve(
     db: &Mutex<Db>,
     shims: &Path,
@@ -133,19 +179,10 @@ pub fn resolve(
     mode: Mode,
     quality: &str,
     chosen: Option<&str>,
+    owner: &ResolveHandle,
 ) -> Result<ResolveOutcome> {
-    let provider = {
-        let db = lock(db);
-        match chosen {
-            Some(title) => {
-                db.set_provider_title(&show.id, title)?;
-                Some(title.to_string())
-            }
-            None => db.get_provider_title(&show.id)?,
-        }
-    };
-    let req = anicli::build_request(show, provider.as_deref(), ep, mode, quality);
-    anicli::resolve(&req, shims)
+    let req = title_request(db, show, ep, mode, quality, chosen)?;
+    anicli::resolve(&req, shims, owner)
 }
 
 #[cfg(test)]
@@ -154,6 +191,38 @@ mod tests {
 
     fn eps(list: &[&str]) -> Vec<String> {
         list.iter().map(|e| e.to_string()).collect()
+    }
+
+    #[test]
+    fn forgotten_provider_title_asks_on_next_resolve() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        let show = ShowSummary {
+            id: "repick-test".into(),
+            title: "Sousou no Frieren".into(),
+            english_title: Some("Frieren: Beyond Journey's End".into()),
+            ..Default::default()
+        };
+        lock(&db)
+            .set_provider_title(&show.id, "Frieren Season 2")
+            .unwrap();
+        let req = |chosen| title_request(&db, &show, "1", Mode::Sub, "best", chosen).unwrap();
+        assert_eq!(req(None).query, "Frieren Season 2");
+
+        forget_provider_title(&db, &show.id).unwrap();
+        assert_eq!(lock(&db).get_provider_title(&show.id).unwrap(), None);
+        // No title is accepted, so ani-cli's results always go to the picker.
+        let ask = req(None);
+        assert_eq!(ask.query, "Frieren: Beyond Journey's End");
+        assert!(ask.want_titles.is_empty());
+        assert!(req(None).want_titles.is_empty(), "until a title is chosen");
+
+        let chosen = req(Some("Frieren: Beyond Journey's End"));
+        assert_eq!(chosen.query, "Frieren: Beyond Journey's End");
+        assert!(!chosen.want_titles.is_empty());
+        assert!(
+            !req(None).want_titles.is_empty(),
+            "choosing ends the re-pick"
+        );
     }
 
     #[test]

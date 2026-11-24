@@ -307,8 +307,6 @@ impl MpvPlayer {
             slot.generation += 1;
             slot.live = true;
         }
-        // `pause` outlives the file, and keep-open sets it at the end.
-        self.set_pause(false);
         let opts = loadfile_options(s, start_secs);
         let mut rc = self
             .shared
@@ -319,7 +317,12 @@ impl MpvPlayer {
                 .shared
                 .command_rc(&loadfile_args(&s.url, &opts, false))?;
         }
-        self.shared.check(rc)
+        self.shared.check(rc)?;
+        // `pause` outlives the file, and keep-open sets it at the end. Unpaused
+        // only now: before `loadfile` replaced it, an ended file would pause
+        // again at once and the new one would inherit that.
+        self.set_pause(false);
+        Ok(())
     }
 
     /// Why the last loaded stream failed to play, until the next `load`.
