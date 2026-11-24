@@ -208,6 +208,8 @@ pub struct Settings {
     pub quality: String,
     pub download_dir: PathBuf,
     pub autoplay_next: bool,
+    /// Install signed releases in place when ani-gui can update itself.
+    pub auto_update: bool,
 }
 
 impl Default for Settings {
@@ -217,6 +219,7 @@ impl Default for Settings {
             quality: "best".to_string(),
             download_dir: paths::default_download_dir(),
             autoplay_next: true,
+            auto_update: true,
         }
     }
 }

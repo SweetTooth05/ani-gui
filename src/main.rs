@@ -15,6 +15,7 @@ mod playback;
 mod player;
 mod progress;
 mod ui;
+mod updater;
 
 use gpui::{
     App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size,

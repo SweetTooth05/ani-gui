@@ -213,6 +213,7 @@ impl Root {
             shims: started.shims,
             downloads_changed,
         });
+        crate::updater::init(cx);
         self.phase = Phase::Ready;
         self.navigate(Route::Home, cx);
     }
