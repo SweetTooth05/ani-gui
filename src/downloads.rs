@@ -408,10 +408,17 @@ impl Inner {
             };
             let inner = self.clone();
             thread::spawn(move || {
-                let outcome = inner.run(&id);
-                inner.finish(&id, outcome);
-                lock(&inner.queue).running -= 1;
-                inner.pump();
+                // Frees the slot and starts the next item even if the worker panics.
+                struct Slot(Arc<Inner>);
+                impl Drop for Slot {
+                    fn drop(&mut self) {
+                        lock(&self.0.queue).running -= 1;
+                        self.0.clone().pump();
+                    }
+                }
+                let slot = Slot(inner);
+                let outcome = slot.0.run(&id);
+                slot.0.finish(&id, outcome);
             });
         }
     }

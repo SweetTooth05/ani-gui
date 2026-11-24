@@ -514,8 +514,11 @@ pub(crate) fn check_episode(ep: &str) -> Result<()> {
 /// HTTP 400 for raw non-ASCII such as AllAnime's "Journey’s").
 fn search_query(query: &str) -> String {
     let mut out = String::with_capacity(query.len());
-    for b in query.replace(['’', '‘'], "'").bytes() {
-        if b == b' ' || b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+    for (i, b) in query.replace(['’', '‘'], "'").bytes().enumerate() {
+        // A leading `-` would make ani-cli parse the query as an option
+        // (`-D` wipes its history), so it is encoded like any other byte.
+        let keep = b == b' ' || b.is_ascii_alphanumeric() || b"-._~".contains(&b);
+        if keep && !(i == 0 && b == b'-') {
             out.push(b as char);
         } else {
             out.push_str(&format!("%{b:02X}"));
@@ -1035,6 +1038,13 @@ mod tests {
         assert_eq!(search_query("100% #1 a+b/c"), "100%25 %231 a%2Bb%2Fc");
         assert_eq!(search_query("Kaguya‘s ’Love’"), "Kaguya%27s %27Love%27");
         assert_eq!(search_query("Dr._Stone-2~x"), "Dr._Stone-2~x");
+    }
+
+    #[test]
+    fn search_query_never_starts_with_a_dash() {
+        assert_eq!(search_query("-D"), "%2DD");
+        assert_eq!(search_query("--help"), "%2D-help");
+        assert_eq!(search_query("Re-Kan"), "Re-Kan");
     }
 
     #[test]
