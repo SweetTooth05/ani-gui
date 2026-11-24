@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::model::{Mode, ShowSummary};
+use crate::model::{Mode, ShowSummary, valid_episode};
 use crate::net;
 
 // Mirrors the constants inside the ani-cli script.
@@ -82,23 +82,20 @@ pub fn search(query: &str, mode: Mode) -> Result<Vec<ShowSummary>> {
     Ok(parse_search(&post(&body)?, mode))
 }
 
-/// Numeric order; episodes that are not numbers go last in API order.
+/// Plain episode numbers (see [`valid_episode`]) in numeric order; anything
+/// else is dropped, since episodes are handed to ani-cli.
 pub fn parse_episodes(v: &Value, mode: Mode) -> Vec<String> {
     let mut eps: Vec<String> = v["data"]["show"]["availableEpisodesDetail"][mode.as_str()]
         .as_array()
         .map(|a| {
             a.iter()
                 .filter_map(Value::as_str)
+                .filter(|ep| valid_episode(ep))
                 .map(str::to_string)
                 .collect()
         })
         .unwrap_or_default();
-    let key = |ep: &str| {
-        ep.parse::<f64>()
-            .ok()
-            .filter(|n| n.is_finite())
-            .unwrap_or(f64::INFINITY)
-    };
+    let key = |ep: &str| ep.parse::<f64>().unwrap_or(f64::INFINITY);
     eps.sort_by(|a, b| key(a).total_cmp(&key(b)));
     eps
 }
@@ -205,9 +202,21 @@ mod tests {
             parse_episodes(&detail(json!(["10", "2", "1", "5.5"])), Mode::Sub),
             ["1", "2", "5.5", "10"]
         );
+        // Anything but a plain number never reaches ani-cli's `-e`.
         assert_eq!(
-            parse_episodes(&detail(json!(["special", "3", "NaN", "1"])), Mode::Sub),
-            ["1", "3", "special", "NaN"]
+            parse_episodes(
+                &detail(json!([
+                    "special",
+                    "3",
+                    "NaN",
+                    "1\\|x$|touch FILE|e;#",
+                    "1",
+                    "-2",
+                    "1e3"
+                ])),
+                Mode::Sub
+            ),
+            ["1", "3"]
         );
         assert!(parse_episodes(&detail(json!(["1"])), Mode::Dub).is_empty());
 

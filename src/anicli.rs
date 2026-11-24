@@ -16,7 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 
-use crate::model::{EpisodeRequest, Mode, ShowSummary, Stream};
+use crate::model::{EpisodeRequest, Mode, ShowSummary, Stream, valid_episode};
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -302,7 +302,7 @@ fn resolve_once(
     timeout: Duration,
 ) -> Result<Attempt> {
     let mut cmd = vec![program.as_os_str().to_owned(), "--no-detach".into()];
-    cmd.extend(episode_args(req));
+    cmd.extend(episode_args(req)?);
     let menu_out = menu_out_path(shims);
     let mut env = shim_env(req, shims, &menu_out);
     // ani-cli runs the player unquoted, so a full path breaks on spaces; the
@@ -386,8 +386,10 @@ pub(crate) fn take_menu_out(path: &Path) -> Option<Vec<String>> {
     (!titles.is_empty()).then_some(titles)
 }
 
-/// `[-S <i>] -e <ep> -q <quality> [--dub] <query>`.
-pub(crate) fn episode_args(req: &EpisodeRequest) -> Vec<OsString> {
+/// `[-S <i>] -e <ep> -q <quality> [--dub] <query>`; an error unless the
+/// episode is a plain number (see [`valid_episode`]).
+pub(crate) fn episode_args(req: &EpisodeRequest) -> Result<Vec<OsString>> {
+    check_episode(&req.ep)?;
     let quality = if req.quality.is_empty() {
         "best"
     } else {
@@ -407,7 +409,15 @@ pub(crate) fn episode_args(req: &EpisodeRequest) -> Vec<OsString> {
         args.push("--dub".into());
     }
     args.push(search_query(&req.query).into());
-    args
+    Ok(args)
+}
+
+/// Refuses an episode ani-cli must never see (see [`valid_episode`]).
+pub(crate) fn check_episode(ep: &str) -> Result<()> {
+    if !valid_episode(ep) {
+        bail!("{ep:?} is not a valid episode number");
+    }
+    Ok(())
 }
 
 /// `query` as ani-cli must receive it: ani-cli only turns spaces into `+`
@@ -758,9 +768,35 @@ mod tests {
     fn episode_args_search_with_ascii_apostrophes() {
         let req = build_request(&frieren(), None, "1", Mode::Sub, "best");
         assert_eq!(
-            episode_args(&req),
+            episode_args(&req).unwrap(),
             ["-e", "1", "-q", "best", "Frieren%3A Beyond Journey%27s End"]
         );
+    }
+
+    #[test]
+    fn episode_args_reject_non_numeric_episode() {
+        let mut req = build_request(&frieren(), None, "1", Mode::Sub, "best");
+        req.ep = "1\\|x$|touch FILE|e;#".into();
+        let err = episode_args(&req).unwrap_err().to_string();
+        assert!(err.contains("not a valid episode"), "{err}");
+        req.ep = "2.5".into();
+        assert!(episode_args(&req).is_ok());
+    }
+
+    #[test]
+    fn resolve_rejects_bad_episode_without_running_ani_cli() {
+        let dir = temp_dir("bad-ep");
+        let shims = ensure_shims(&dir, &std::env::current_exe().unwrap()).unwrap();
+        let ran = dir.join("ran");
+        let fake = script(
+            &dir.join("bin/ani-cli"),
+            &format!("touch '{}'", ran.display()),
+        );
+        let mut req = build_request(&frieren(), None, "1", Mode::Sub, "best");
+        req.ep = "1\\|x$|touch FILE|e;#".into();
+        assert!(resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10)).is_err());
+        assert!(!ran.exists(), "ani-cli ran for an invalid episode");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

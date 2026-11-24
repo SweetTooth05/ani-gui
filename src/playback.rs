@@ -118,7 +118,7 @@ pub fn start_download(
 ) -> Result<String> {
     let provider = lock(db).get_provider_title(&show.id)?;
     let req = anicli::build_request(show, provider.as_deref(), ep, mode, quality);
-    Ok(manager.start(show, req, dir))
+    manager.start(show, req, dir)
 }
 
 /// Resolves `ep` of `show` with ani-cli (which records it in its history).

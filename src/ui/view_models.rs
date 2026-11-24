@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::anicli::normalize_title;
 use crate::db::{self, Db, lock};
 use crate::history::HistoryEntry;
-use crate::model::{AniListMedia, Mode, Progress, ShowRecord, ShowSummary};
+use crate::model::{AniListMedia, Mode, Progress, ShowRecord, ShowSummary, valid_episode};
 use crate::progress;
 
 /// How many shows Continue Watching considers from each source.
@@ -484,7 +484,11 @@ pub fn default_download_range(rows: &[EpisodeRow]) -> Option<(String, String)> {
 /// The episodes numbered from `from` to `to` (either order, inclusive), in
 /// list order, or why there are none.
 pub fn download_range(episodes: &[String], from: &str, to: &str) -> Result<Vec<String>, String> {
-    let (Ok(a), Ok(b)) = (from.trim().parse::<f64>(), to.trim().parse::<f64>()) else {
+    let number = |s: &str| {
+        let s = s.trim();
+        valid_episode(s).then(|| s.parse::<f64>().ok()).flatten()
+    };
+    let (Some(a), Some(b)) = (number(from), number(to)) else {
         return Err("Enter episode numbers, like 1 and 12".into());
     };
     let (low, high) = if a <= b { (a, b) } else { (b, a) };
@@ -766,6 +770,14 @@ mod tests {
             download_range(&list, "first", "3"),
             Err("Enter episode numbers, like 1 and 12".into())
         );
+        for bad in ["inf", "1e1", "-1", "NaN", "1\\|x"] {
+            assert_eq!(
+                download_range(&list, bad, "3"),
+                Err("Enter episode numbers, like 1 and 12".into()),
+                "{bad:?}"
+            );
+            assert!(download_range(&list, "1", bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

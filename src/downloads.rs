@@ -193,8 +193,10 @@ impl DownloadManager {
         }
     }
 
-    /// Queues `req` for `show` into `dir` and starts it right away.
-    pub fn start(&self, show: &ShowSummary, req: EpisodeRequest, dir: &Path) -> String {
+    /// Queues `req` for `show` into `dir` and starts it right away. Refuses
+    /// an episode that is not a plain number (see `anicli::check_episode`).
+    pub fn start(&self, show: &ShowSummary, req: EpisodeRequest, dir: &Path) -> Result<String> {
+        anicli::check_episode(&req.ep)?;
         let id = new_id();
         let record = DownloadRecord {
             id: id.clone(),
@@ -228,7 +230,7 @@ impl DownloadManager {
         }
         self.inner.notify();
         self.inner.clone().spawn_worker(id.clone());
-        id
+        Ok(id)
     }
 
     /// Stops a queued or running download (its whole process group); the
@@ -639,10 +641,11 @@ fn spawn_in_pty(
     shims: &Path,
     menu_out: &Path,
 ) -> io::Result<(Child, File)> {
+    let args = anicli::episode_args(req).map_err(io::Error::other)?;
     let (master, slave) = open_pty()?;
     let mut cmd = Command::new(program);
     cmd.arg("-d")
-        .args(anicli::episode_args(req))
+        .args(args)
         .envs(anicli::shim_env(req, shims, menu_out))
         .env("ANI_CLI_DOWNLOAD_DIR", dir)
         .stdin(Stdio::null())
@@ -994,7 +997,7 @@ printf '[download] 100%% of  100.00MiB in 00:00:40 at 2.50MiB/s\n'"#,
             counter.fetch_add(1, Ordering::Relaxed);
         }));
         let out = dir.join("out");
-        let id = m.start(&show(), req(), &out);
+        let id = m.start(&show(), req(), &out).unwrap();
 
         let rec = wait_for(&m, &id, finished);
         assert_eq!(rec.status, DlStatus::Done, "{rec:?}");
@@ -1042,7 +1045,7 @@ echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode 3.mkv""#,
         );
         let (m, db) = manager(script, Duration::from_secs(60));
         let out = dir.join("out");
-        let id = m.start(&show(), req(), &out);
+        let id = m.start(&show(), req(), &out).unwrap();
 
         let rec = wait_for(&m, &id, finished);
         assert_eq!(rec.status, DlStatus::Failed);
@@ -1086,7 +1089,7 @@ wait"#,
         );
         let (m, _db) = manager(script, Duration::from_secs(60));
         let out = dir.join("out");
-        let id = m.start(&show(), req(), &out);
+        let id = m.start(&show(), req(), &out).unwrap();
         let (_, progress) = {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
@@ -1120,6 +1123,25 @@ wait"#,
     }
 
     #[test]
+    fn start_rejects_bad_episode_without_running_ani_cli() {
+        let dir = temp_dir("bad-ep");
+        let ran = dir.join("ran");
+        let script = fake_ani_cli(&dir.join("bin"), &format!("touch '{}'", ran.display()));
+        let (m, db) = manager(script, Duration::from_secs(60));
+        let bad = EpisodeRequest {
+            ep: "1\\|x$|touch FILE|e;#".into(),
+            ..req()
+        };
+        let err = m.start(&show(), bad, &dir.join("out")).unwrap_err();
+        assert!(err.to_string().contains("not a valid episode"), "{err}");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!ran.exists(), "ani-cli ran for an invalid episode");
+        assert!(m.snapshot().is_empty());
+        assert!(db.lock().unwrap().list_downloads().unwrap().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn download_needs_pick_fails_with_hint() {
         let dir = temp_dir("pick");
         let script = fake_ani_cli(
@@ -1129,7 +1151,7 @@ printf 'Invalid anime selection\n' >&2
 exit 1"#,
         );
         let (m, _db) = manager(script, Duration::from_secs(60));
-        let id = m.start(&show(), req(), &dir.join("out"));
+        let id = m.start(&show(), req(), &dir.join("out")).unwrap();
         let rec = wait_for(&m, &id, finished);
         assert_eq!(rec.status, DlStatus::Failed);
         assert_eq!(
@@ -1149,7 +1171,7 @@ sleep 30"#,
         );
         let (m, _db) = manager(script, Duration::from_secs(1));
         let begun = Instant::now();
-        let id = m.start(&show(), req(), &dir.join("out"));
+        let id = m.start(&show(), req(), &dir.join("out")).unwrap();
         let rec = wait_for(&m, &id, finished);
         assert_eq!(rec.status, DlStatus::Failed);
         assert_eq!(rec.error.as_deref(), Some("stalled"));
@@ -1194,6 +1216,7 @@ echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode $ep.mp4""#,
                     ..req()
                 };
                 m.start(&show(), req, &dir.join(format!("out{ep}")))
+                    .unwrap()
             })
             .collect();
         for (ep, id) in (1..=6).zip(&ids) {
@@ -1220,7 +1243,7 @@ exit 0"#,
         );
         let (m, _db) = manager(script, Duration::from_secs(1));
         let begun = Instant::now();
-        let id = m.start(&show(), req(), &dir.join("out"));
+        let id = m.start(&show(), req(), &dir.join("out")).unwrap();
         let rec = wait_for(&m, &id, finished);
         assert_eq!(rec.status, DlStatus::Done, "{rec:?}");
         assert!(
@@ -1244,7 +1267,7 @@ wait"#,
         );
         let (m, db) = manager(script, Duration::from_secs(60));
         let out = dir.join("out");
-        let id = m.start(&show(), req(), &out);
+        let id = m.start(&show(), req(), &out).unwrap();
         wait_for(&m, &id, |r| {
             r.status == DlStatus::Running && r.progress == 5.0
         });

@@ -103,6 +103,17 @@ pub struct Stream {
     pub title: Option<String>,
 }
 
+/// Whether `ep` is a plain episode number (`^[0-9]+(\.[0-9]+)?$`). Only
+/// these may reach ani-cli: it pastes the episode into a `sed` script, so
+/// anything else could run commands.
+pub fn valid_episode(ep: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    match ep.split_once('.') {
+        Some((whole, frac)) => digits(whole) && digits(frac),
+        None => digits(ep),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EpisodeRequest {
     /// What ani-cli searches its provider for.
@@ -212,6 +223,32 @@ impl Default for Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn valid_episode_accepts_only_plain_numbers() {
+        for ok in ["1", "12", "0", "5.5", "100.25", "007"] {
+            assert!(super::valid_episode(ok), "{ok:?}");
+        }
+        for bad in [
+            "",
+            " 1",
+            "1 ",
+            "1.",
+            ".5",
+            "1.2.3",
+            "-1",
+            "+1",
+            "1e3",
+            "inf",
+            "NaN",
+            "special",
+            "１",
+            "1\\|x$|touch FILE|e;#",
+            "1\n2",
+        ] {
+            assert!(!super::valid_episode(bad), "{bad:?}");
+        }
+    }
+
     use super::*;
 
     #[test]
