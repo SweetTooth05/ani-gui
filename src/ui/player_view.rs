@@ -1298,6 +1298,7 @@ fn discard(player: MpvPlayer) {
 }
 
 fn save_progress(db: &Mutex<Db>, progress: &Progress) {
+    crate::lists::progress_saved(progress);
     let db = db.lock().unwrap_or_else(PoisonError::into_inner);
     if let Err(err) = db.save_progress(progress) {
         eprintln!("ani-gui: saving progress: {err:#}");

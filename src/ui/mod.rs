@@ -1,3 +1,4 @@
+pub mod accounts;
 pub mod calendar;
 pub mod components;
 pub mod downloads_page;

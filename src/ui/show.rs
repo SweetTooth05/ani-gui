@@ -20,9 +20,10 @@ use crate::ui::components::pick_dialog::pick_dialog;
 use crate::ui::components::poster::progress_bar;
 use crate::ui::components::text_input::TextInput;
 use crate::ui::components::toast;
+use crate::ui::components::your_list::YourList;
 use crate::ui::theme;
 use crate::ui::view_models::{self, EpisodeRow, ShowPageModel, media_title, mode_label};
-use crate::{allanime, catalog, playback};
+use crate::{allanime, catalog, lists, playback};
 
 pub const QUALITIES: [(&str, &str); 4] = [
     ("best", "Best"),
@@ -48,6 +49,8 @@ struct Loaded {
     episodes_error: Option<String>,
     /// The ani-cli title this show was matched to, if one is remembered.
     provider_title: Option<String>,
+    /// Episodes watched according to the user's MyAnimeList/AniList list.
+    remote_progress: Option<u32>,
 }
 
 /// Where an episode to play was found.
@@ -99,6 +102,7 @@ pub struct ShowPage {
     range_error: Option<String>,
     scroll: ScrollHandle,
     _downloads_changed: Option<Subscription>,
+    your_list: Entity<YourList>,
 }
 
 impl ShowPage {
@@ -135,6 +139,7 @@ impl ShowPage {
             range_error: None,
             scroll: ScrollHandle::new(),
             _downloads_changed: subscription,
+            your_list: cx.new(YourList::new),
         };
         page.reload(cx);
         page
@@ -201,8 +206,17 @@ impl ShowPage {
             return;
         };
         let episodes = l.episodes_error.is_none().then_some(l.episodes.as_slice());
-        self.model =
-            ShowPageModel::build(&l.show, l.media.as_ref(), episodes, &l.progress, self.mode);
+        self.model = ShowPageModel::build(
+            &l.show,
+            l.media.as_ref(),
+            episodes,
+            &l.progress,
+            l.remote_progress,
+            self.mode,
+        );
+        let anilist_id = l.media.as_ref().map(|m| m.id).or(l.show.anilist_id);
+        self.your_list
+            .update(cx, |list, cx| list.set_show(anilist_id, cx));
         let (from, to) =
             view_models::default_download_range(&self.model.episodes).unwrap_or_default();
         self.range_from
@@ -1094,6 +1108,7 @@ impl Render for ShowPage {
                 .flex()
                 .flex_col()
                 .child(self.render_header(cx))
+                .child(self.your_list.clone())
                 .child(self.render_episodes(cx))
                 .into_any_element(),
         };
@@ -1158,6 +1173,9 @@ fn load(db: &Mutex<Db>, target: &ShowRef, mode: Mode) -> Result<Loaded> {
             Err(err) => (Vec::new(), Some(format!("{err:#}"))),
         }
     };
+    let remote_progress = (media.as_ref().map(|m| m.id).or(show.anilist_id))
+        .and_then(|id| lists::entry_for(db, id))
+        .map(|e| e.progress);
     let db = lock(db);
     let progress = db.progress_for_show(&show.id, mode)?;
     let in_list = db.my_list_contains(&show.id)?;
@@ -1170,6 +1188,7 @@ fn load(db: &Mutex<Db>, target: &ShowRef, mode: Mode) -> Result<Loaded> {
         in_list,
         episodes_error,
         provider_title,
+        remote_progress,
     })
 }
 
