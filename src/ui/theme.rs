@@ -136,6 +136,7 @@ ui_icons!(
     "house",
     "info",
     "list",
+    "list-video",
     "loader-circle",
     "log-in",
     "log-out",

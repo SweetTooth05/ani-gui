@@ -76,6 +76,7 @@ dependencies = [
  "serde_json",
  "unicode-segmentation",
  "ureq",
+ "zbus",
 ]
 
 [[package]]
