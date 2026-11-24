@@ -1471,19 +1471,23 @@ mod tests {
     }
 
     /// The release workflow signs with `openssl pkeyutl -sign -rawin`; this
-    /// proves the app accepts exactly that format. Skipped without OpenSSL:
-    /// macOS's `openssl` is LibreSSL, which has no `pkeyutl -rawin` (signing
-    /// only ever runs on the Linux release job).
+    /// proves the app accepts exactly that format. Skipped without OpenSSL
+    /// 3+, which added `-rawin`: macOS ships LibreSSL and its runners have
+    /// OpenSSL 1.1 (signing only ever runs on the Linux release job).
     #[test]
     fn openssl_signatures_verify() {
-        match Command::new("openssl").arg("version").output() {
-            Ok(out) if String::from_utf8_lossy(&out.stdout).starts_with("OpenSSL") => {
-                eprintln!("using {}", String::from_utf8_lossy(&out.stdout).trim());
-            }
-            _ => {
-                eprintln!("OpenSSL not found; skipping");
-                return;
-            }
+        let version = Command::new("openssl")
+            .arg("version")
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+        let major = version
+            .strip_prefix("OpenSSL ")
+            .and_then(|v| v.split('.').next())
+            .and_then(|m| m.parse::<u32>().ok());
+        if !major.is_some_and(|m| m >= 3) {
+            eprintln!("needs OpenSSL 3+ (found {version:?}); skipping");
+            return;
         }
         let dir = temp_dir("openssl");
         let key = dir.join("key.pem");
