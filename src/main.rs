@@ -8,6 +8,7 @@ mod diagnostics;
 mod downloads;
 mod history;
 mod images;
+mod keep_awake;
 mod model;
 mod net;
 mod paths;
