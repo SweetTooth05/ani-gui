@@ -1,5 +1,7 @@
 //! Calendar: what airs over the next seven days, a day at a time.
 
+use std::time::Duration;
+
 use gpui::{
     AnyElement, Context, FontWeight, IntoElement, ScrollHandle, Task, WeakEntity, Window, div,
     prelude::*, px, relative,
@@ -19,11 +21,27 @@ const DAYS_SHOWN: i64 = 7;
 const COVER_W: f32 = 60.;
 const COVER_H: f32 = 84.;
 
+const TICK: Duration = Duration::from_secs(60);
+
+/// One airing and its local time, worked out with the UTC offset in force
+/// at that moment (so a DST change mid-week doesn't shift it).
+struct Slot {
+    airing: Airing,
+    time: String,
+}
+
 /// One day of the week strip.
 struct Day {
     weekday: &'static str,
     date: u32,
-    airings: Vec<Airing>,
+    slots: Vec<Slot>,
+}
+
+impl Day {
+    /// The day's airings that haven't aired by `now`.
+    fn upcoming(&self, now: i64) -> impl Iterator<Item = &Slot> {
+        self.slots.iter().filter(move |s| s.airing.airing_at >= now)
+    }
 }
 
 enum State {
@@ -35,9 +53,11 @@ pub struct CalendarPage {
     root: WeakEntity<Root>,
     state: State,
     selected: usize,
-    tz_offset: i64,
     load_task: Option<Task<()>>,
     scroll: ScrollHandle,
+    /// Repaints every minute, keeping countdowns current and dropping
+    /// airings as they pass.
+    _tick: Task<()>,
 }
 
 impl CalendarPage {
@@ -46,9 +66,16 @@ impl CalendarPage {
             root,
             state: State::Loading,
             selected: 0,
-            tz_offset: 0,
             load_task: None,
             scroll: ScrollHandle::new(),
+            _tick: cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(TICK).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }),
         };
         page.reload(cx);
         page
@@ -60,19 +87,17 @@ impl CalendarPage {
         };
         self.state = State::Loading;
         self.load_task = Some(cx.spawn(async move |this, cx| {
-            let (days, tz) = cx
+            let days = cx
                 .background_spawn(async move {
                     let mut items = catalog::schedule_week(&db);
                     let now = db::now();
-                    let tz = local_offset(now);
                     // The cached week may have started a while ago.
                     items.retain(|a| a.airing_at >= now);
-                    (week(&items, now, tz), tz)
+                    week(&items, now, local_offset(now), local_offset)
                 })
                 .await;
             this.update(cx, |page, cx| {
                 page.load_task = None;
-                page.tz_offset = tz;
                 page.state = State::Ready(days);
                 cx.notify();
             })
@@ -98,13 +123,13 @@ impl CalendarPage {
             .ok();
     }
 
-    fn render_strip(&self, days: &[Day], cx: &mut Context<Self>) -> AnyElement {
+    fn render_strip(&self, days: &[Day], now: i64, cx: &mut Context<Self>) -> AnyElement {
         div()
             .flex()
             .gap(px(8.))
             .children(days.iter().enumerate().map(|(i, day)| {
                 let selected = i == self.selected;
-                let count = match day.airings.len() {
+                let count = match day.upcoming(now).count() {
                     0 => "None".to_string(),
                     1 => "1 episode".to_string(),
                     n => format!("{n} episodes"),
@@ -174,11 +199,12 @@ impl CalendarPage {
             .into_any_element()
     }
 
-    fn render_day(&self, days: &[Day], cx: &mut Context<Self>) -> AnyElement {
+    fn render_day(&self, days: &[Day], now: i64, cx: &mut Context<Self>) -> AnyElement {
         let Some(day) = days.get(self.selected) else {
             return div().into_any_element();
         };
-        if day.airings.is_empty() {
+        let slots: Vec<&Slot> = day.upcoming(now).collect();
+        if slots.is_empty() {
             let when = if self.selected == 0 {
                 "Nothing else airs today.".to_string()
             } else {
@@ -193,17 +219,17 @@ impl CalendarPage {
         // The very next airing of the week gets a countdown.
         let next_at = days
             .iter()
-            .find_map(|d| d.airings.first())
-            .map(|a| (a.media.id, a.airing_at));
-        let now = db::now();
+            .find_map(|d| d.upcoming(now).next())
+            .map(|s| (s.airing.media.id, s.airing.airing_at));
         div()
             .flex()
             .flex_col()
             .gap(px(4.))
-            .children(day.airings.iter().enumerate().map(|(i, airing)| {
+            .children(slots.into_iter().enumerate().map(|(i, slot)| {
+                let airing = &slot.airing;
                 let countdown = (next_at == Some((airing.media.id, airing.airing_at)))
                     .then(|| until_label(airing.airing_at - now));
-                self.render_airing(i, airing, countdown, cx)
+                self.render_airing(i, slot, countdown, cx)
             }))
             .into_any_element()
     }
@@ -211,10 +237,11 @@ impl CalendarPage {
     fn render_airing(
         &self,
         index: usize,
-        airing: &Airing,
+        slot: &Slot,
         countdown: Option<String>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let airing = &slot.airing;
         let media = &airing.media;
         let episode = match media.episodes {
             Some(total) => format!("Episode {} of {total}", airing.episode),
@@ -240,7 +267,7 @@ impl CalendarPage {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_size(px(theme::SECTION))
                     .text_color(theme::text())
-                    .child(time_label(airing.airing_at, self.tz_offset)),
+                    .child(slot.time.clone()),
             )
             .child(
                 div()
@@ -299,12 +326,13 @@ impl CalendarPage {
 
 impl Render for CalendarPage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let now = db::now();
         let body: AnyElement = match &self.state {
             State::Loading => div()
                 .text_color(theme::text_muted())
                 .child("Loading the schedule…")
                 .into_any_element(),
-            State::Ready(days) if days.iter().all(|d| d.airings.is_empty()) => div()
+            State::Ready(days) if days.iter().all(|d| d.upcoming(now).next().is_none()) => div()
                 .flex()
                 .flex_col()
                 .items_start()
@@ -331,8 +359,8 @@ impl Render for CalendarPage {
                 .flex()
                 .flex_col()
                 .gap(px(24.))
-                .child(self.render_strip(days, cx))
-                .child(self.render_day(days, cx))
+                .child(self.render_strip(days, now, cx))
+                .child(self.render_day(days, now, cx))
                 .into_any_element(),
         };
         div()
@@ -370,23 +398,36 @@ impl Render for CalendarPage {
     }
 }
 
-/// The seven days from `now`'s, each with its airings from `items`.
-fn week(items: &[Airing], now: i64, tz_offset_secs: i64) -> Vec<Day> {
+/// The seven days from `now`'s, each with its airings from `items`:
+/// grouped into days with `tz_offset_secs` (the offset at `now`), each time
+/// shown with `offset_at` its own moment.
+fn week(
+    items: &[Airing],
+    now: i64,
+    tz_offset_secs: i64,
+    offset_at: impl Fn(i64) -> i64,
+) -> Vec<Day> {
     let mut groups = group_by_day(items, tz_offset_secs);
     let today = local_day(now, tz_offset_secs);
     (today..today + DAYS_SHOWN)
         .map(|day| {
             let label = day_label(day);
-            let airings = groups
+            let slots = groups
                 .iter_mut()
                 .find(|(l, _)| *l == label)
                 .map(|(_, list)| std::mem::take(list))
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .into_iter()
+                .map(|airing| Slot {
+                    time: time_label(airing.airing_at, offset_at(airing.airing_at)),
+                    airing,
+                })
+                .collect();
             let (weekday, date) = day_parts(day);
             Day {
                 weekday,
                 date,
-                airings,
+                slots,
             }
         })
         .collect()
@@ -535,13 +576,26 @@ mod tests {
     #[test]
     fn week_has_seven_days_from_today() {
         let items = [airing(1, MON_NOON_UTC), airing(2, TUE_10_UTC)];
-        let days = week(&items, MON_NOON_UTC - 3600, 0);
+        let days = week(&items, MON_NOON_UTC - 3600, 0, |_| 0);
         assert_eq!(days.len(), 7);
         assert_eq!((days[0].weekday, days[0].date), ("Mon", 23));
         assert_eq!((days[6].weekday, days[6].date), ("Sun", 29));
-        assert_eq!(days[0].airings.len(), 1);
-        assert_eq!(days[1].airings[0].media.id, 2);
-        assert!(days[2..].iter().all(|d| d.airings.is_empty()));
+        assert_eq!(days[0].slots.len(), 1);
+        assert_eq!(days[1].slots[0].airing.media.id, 2);
+        assert!(days[2..].iter().all(|d| d.slots.is_empty()));
+        // Once an airing's time has passed it is no longer upcoming.
+        assert_eq!(days[0].upcoming(MON_NOON_UTC).count(), 1);
+        assert_eq!(days[0].upcoming(MON_NOON_UTC + 1).count(), 0);
+    }
+
+    #[test]
+    fn week_times_use_each_airings_own_offset() {
+        let items = [airing(1, MON_NOON_UTC), airing(2, TUE_10_UTC)];
+        // Clocks go forward an hour between the two airings.
+        let offset_at = |ts: i64| if ts < TUE_10_UTC { 3600 } else { 7200 };
+        let days = week(&items, MON_NOON_UTC - 3600, 3600, offset_at);
+        assert_eq!(days[0].slots[0].time, "13:00");
+        assert_eq!(days[1].slots[0].time, "12:00");
     }
 
     #[test]

@@ -10,7 +10,7 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 
 use crate::app::{AppState, PlayRequest, Root, Route, ShowRef};
-use crate::db::{self, Db};
+use crate::db::{self, Db, lock};
 use crate::model::{AniListMedia, Mode, Settings, ShowRecord, ShowSummary};
 use crate::ui::components::button::{ButtonKind, button};
 use crate::ui::components::image::{remote_image, shimmer};
@@ -609,10 +609,6 @@ impl Catalog for LiveCatalog<'_> {
     fn media(&self, anilist_id: i64) -> Option<AniListMedia> {
         catalog::media(self.db, anilist_id)
     }
-}
-
-fn lock(db: &Mutex<Db>) -> std::sync::MutexGuard<'_, Db> {
-    db.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn settings_quality(cx: &App) -> String {

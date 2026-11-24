@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context as _, Result, anyhow};
 use gpui::{
@@ -9,9 +9,9 @@ use gpui::{
     px, relative,
 };
 
-use crate::anicli::{self, ResolveOutcome};
+use crate::anicli::ResolveOutcome;
 use crate::app::{AppState, PlayRequest, Root, Route, ShowRef};
-use crate::db::{self, Db};
+use crate::db::{self, Db, lock};
 use crate::downloads::DownloadManager;
 use crate::model::{AniListMedia, DlStatus, Mode, Progress, ShowRecord, ShowSummary};
 use crate::ui::components::button::{ButtonKind, button, segmented};
@@ -429,12 +429,19 @@ impl ShowPage {
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
             let show_id = show.id.clone();
-            let downloads = cx
+            let (downloads, failed) = cx
                 .background_spawn(async move {
+                    let mut failed = None;
                     for (ep, retry_id) in jobs {
-                        start_download(&db, &manager, &show, &ep, mode, &quality, &dir, retry_id);
+                        let started = start_download(
+                            &db, &manager, &show, &ep, mode, &quality, &dir, retry_id,
+                        );
+                        if let Err(err) = started {
+                            failed
+                                .get_or_insert(format!("Couldn't download episode {ep}: {err:#}"));
+                        }
                     }
-                    episode_downloads(&manager, &show.id, mode)
+                    (episode_downloads(&manager, &show.id, mode), failed)
                 })
                 .await;
             this.update(cx, |page, cx| {
@@ -444,7 +451,10 @@ impl ShowPage {
                 if page.mode == mode && page.loaded.as_ref().is_some_and(|l| l.show.id == show_id) {
                     page.downloads = downloads;
                 }
-                toast::info(cx, label);
+                match failed {
+                    Some(err) => toast::error(cx, err),
+                    None => toast::info(cx, label),
+                }
                 cx.notify();
             })
             .ok();
@@ -1045,10 +1055,6 @@ fn status_label(status: &str) -> String {
     }
 }
 
-fn lock(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
-    db.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// The AllAnime show (resolved from AniList when only that is known), its
 /// AniList details, and its episodes and progress in `mode`. Saves the show.
 fn load(db: &Mutex<Db>, target: &ShowRef, mode: Mode) -> Result<Loaded> {
@@ -1107,15 +1113,13 @@ fn start_download(
     quality: &str,
     dir: &Path,
     retry_id: Option<String>,
-) {
+) -> Result<()> {
     if let Some(id) = retry_id
         && manager.retry(&id).is_ok()
     {
-        return;
+        return Ok(());
     }
-    let provider = lock(db).get_provider_title(&show.id).ok().flatten();
-    let req = anicli::build_request(show, provider.as_deref(), ep, mode, quality);
-    manager.start(show, req, dir);
+    playback::start_download(db, manager, show, ep, mode, quality, dir).map(|_| ())
 }
 
 /// The downloaded file of `ep`, if it finished and is still on disk. Reads
@@ -1127,7 +1131,7 @@ fn downloaded_file(
     ep: &str,
 ) -> Option<PathBuf> {
     let records: Vec<_> = manager.snapshot().into_iter().map(|(r, _)| r).collect();
-    playback::downloaded_file(&records, show_id, mode, ep).filter(|path| path.is_file())
+    playback::downloaded_file(&records, show_id, mode, ep)
 }
 
 /// This show's downloads in `mode`, by episode. Reads the manager's state,

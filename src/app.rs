@@ -285,10 +285,31 @@ impl Root {
                 Some(Page::Home(home)) => home.update(cx, |home, cx| home.refresh(cx)),
                 Some(Page::Show(show)) => show.update(cx, |show, cx| show.reload(cx)),
                 Some(Page::MyList(list)) => list.update(cx, |list, cx| list.reload(cx)),
+                Some(Page::Downloads(downloads)) => {
+                    downloads.update(cx, |downloads, cx| downloads.sync(cx))
+                }
                 _ => {}
             }
             cx.notify();
         }
+    }
+
+    /// Whether the page entity `id` is the one showing.
+    pub fn is_current(&self, id: EntityId) -> bool {
+        let Some(entry) = self.stack.last() else {
+            return false;
+        };
+        let current = match &entry.page {
+            Page::Home(p) => p.entity_id(),
+            Page::Search(p) => p.entity_id(),
+            Page::MyList(p) => p.entity_id(),
+            Page::Calendar(p) => p.entity_id(),
+            Page::Downloads(p) => p.entity_id(),
+            Page::Settings(p) => p.entity_id(),
+            Page::Show(p) => p.entity_id(),
+            Page::Player(p) => p.entity_id(),
+        };
+        current == id
     }
 
     fn current(&self) -> Option<&Route> {

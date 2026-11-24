@@ -1,10 +1,10 @@
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::Mutex;
 
 use anyhow::Result;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::db::{self, Db};
+use crate::db::{self, Db, lock};
 use crate::model::{Airing, AniListMedia, Mode, ShowSummary};
 use crate::{allanime, anilist};
 
@@ -77,10 +77,6 @@ fn pick_match(results: &[ShowSummary], anilist_id: i64) -> Option<ShowSummary> {
         .iter()
         .find(|s| s.anilist_id == Some(anilist_id))
         .cloned()
-}
-
-fn lock(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
-    db.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn cached<T, F>(db: &Mutex<Db>, key: &str, fetch: F) -> Option<T>

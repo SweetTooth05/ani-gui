@@ -1,12 +1,13 @@
 //! Playback flow rules shared by the player view and the Show page.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::Mutex;
 
 use anyhow::Result;
 
 use crate::anicli::{self, ResolveOutcome};
-use crate::db::Db;
+use crate::db::{Db, lock};
+use crate::downloads::DownloadManager;
 use crate::model::{DlStatus, DownloadRecord, Mode, Progress, ShowSummary};
 use crate::player::PlaybackState;
 use crate::progress;
@@ -88,7 +89,8 @@ pub fn resume_point(saved: &[Progress], ep: &str) -> f64 {
         .map_or(0.0, |p| p.position)
 }
 
-/// The finished download of `ep` (newest first in `downloads`), if any.
+/// The newest finished download of `ep` (`downloads` is newest first)
+/// whose file is still on disk. Checks the disk: call it off the UI thread.
 pub fn downloaded_file(
     downloads: &[DownloadRecord],
     show_id: &str,
@@ -99,7 +101,24 @@ pub fn downloaded_file(
         .iter()
         .filter(|d| d.show_id == show_id && d.mode == mode && d.ep == ep)
         .filter(|d| d.status == DlStatus::Done)
-        .find_map(|d| d.path.as_ref().map(PathBuf::from))
+        .filter_map(|d| d.path.as_ref().map(PathBuf::from))
+        .find(|path| path.is_file())
+}
+
+/// Starts a new download of `ep` into `dir`, searching ani-cli for the
+/// show's provider title when one is known. Returns the download's id.
+pub fn start_download(
+    db: &Mutex<Db>,
+    manager: &DownloadManager,
+    show: &ShowSummary,
+    ep: &str,
+    mode: Mode,
+    quality: &str,
+    dir: &Path,
+) -> Result<String> {
+    let provider = lock(db).get_provider_title(&show.id)?;
+    let req = anicli::build_request(show, provider.as_deref(), ep, mode, quality);
+    Ok(manager.start(show, req, dir))
 }
 
 /// Resolves `ep` of `show` with ani-cli (which records it in its history).
@@ -116,7 +135,7 @@ pub fn resolve(
     chosen: Option<&str>,
 ) -> Result<ResolveOutcome> {
     let provider = {
-        let db = db.lock().unwrap_or_else(PoisonError::into_inner);
+        let db = lock(db);
         match chosen {
             Some(title) => {
                 db.set_provider_title(&show.id, title)?;
@@ -294,20 +313,41 @@ mod tests {
 
     #[test]
     fn downloaded_file_needs_done_with_path() {
+        let dir = std::env::temp_dir().join(format!("ani-gui-dlfile-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let (s2, s3, s5, old2) = (
+            file("s-2.mp4"),
+            file("s-3.mp4"),
+            file("s-5.mp4"),
+            file("old-2.mp4"),
+        );
+        let gone = dir.join("gone.mp4").to_string_lossy().into_owned();
         let list = [
             download("a", "2", Mode::Sub, DlStatus::Failed, None),
-            download("b", "2", Mode::Sub, DlStatus::Done, Some("/v/s-2.mp4")),
-            download("c", "3", Mode::Dub, DlStatus::Done, Some("/v/s-3-dub.mp4")),
+            // Newest first: a Done record whose file was deleted is skipped
+            // for the newest one still on disk.
+            download("g", "2", Mode::Sub, DlStatus::Done, Some(&gone)),
+            download("b", "2", Mode::Sub, DlStatus::Done, Some(&s2)),
+            download("o", "2", Mode::Sub, DlStatus::Done, Some(&old2)),
+            download("c", "3", Mode::Dub, DlStatus::Done, Some(&s3)),
             download("d", "4", Mode::Sub, DlStatus::Done, None),
-            download("e", "5", Mode::Sub, DlStatus::Running, Some("/v/s-5.mp4")),
+            download("e", "5", Mode::Sub, DlStatus::Running, Some(&s5)),
+            download("h", "6", Mode::Sub, DlStatus::Done, Some(&gone)),
         ];
         assert_eq!(
             downloaded_file(&list, "s", Mode::Sub, "2"),
-            Some(PathBuf::from("/v/s-2.mp4"))
+            Some(PathBuf::from(&s2))
         );
+        assert_eq!(downloaded_file(&list, "s", Mode::Sub, "6"), None);
         assert_eq!(downloaded_file(&list, "s", Mode::Sub, "3"), None);
         assert_eq!(downloaded_file(&list, "s", Mode::Sub, "4"), None);
         assert_eq!(downloaded_file(&list, "s", Mode::Sub, "5"), None);
         assert_eq!(downloaded_file(&list, "other", Mode::Dub, "3"), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

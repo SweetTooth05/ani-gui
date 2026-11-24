@@ -16,7 +16,7 @@ use crate::model::{Mode, Settings};
 use crate::ui::components::button::{ButtonKind, button, segmented};
 use crate::ui::components::text_input::{Changed, TextInput};
 use crate::ui::components::toast;
-use crate::ui::downloads_page::{display_path, open_folder};
+use crate::ui::files::{display_path, open_folder};
 use crate::ui::show::QUALITIES;
 use crate::ui::theme;
 
@@ -145,8 +145,8 @@ impl SettingsPage {
         (Path::new(&typed) != self.settings.download_dir).then_some(typed)
     }
 
-    /// Checks the typed folder (creating it), then makes it the download
-    /// folder.
+    /// Checks the typed folder (creating it, and writing a file in it),
+    /// then makes it the download folder.
     fn save_dir(&mut self, cx: &mut Context<Self>) {
         let Some(typed) = self.typed_dir(cx) else {
             return;
@@ -165,8 +165,7 @@ impl SettingsPage {
         cx.spawn(async move |this, cx| {
             let made = {
                 let dir = dir.clone();
-                cx.background_spawn(async move { std::fs::create_dir_all(&dir) })
-                    .await
+                cx.background_spawn(async move { prepare_dir(&dir) }).await
             };
             this.update(cx, |page, cx| {
                 page.saving_dir = false;
@@ -525,9 +524,37 @@ fn parse_dir(typed: &str, home: Option<&Path>) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Creates `dir` if needed and checks a file can be written in it.
+fn prepare_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let probe = dir.join(format!(".ani-gui-write-test-{}", std::process::id()));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)?;
+    std::fs::remove_file(&probe)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepare_dir_needs_a_writable_folder() {
+        let dir = std::env::temp_dir().join(format!("ani-gui-prep-{}", std::process::id()));
+        let nested = dir.join("a/b");
+        prepare_dir(&nested).unwrap();
+        assert!(nested.is_dir());
+        // The probe file is gone afterwards.
+        assert_eq!(std::fs::read_dir(&nested).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // System folders aren't writable by a normal user.
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { nix::libc::geteuid() } != 0 {
+            assert!(prepare_dir(Path::new("/")).is_err());
+            assert!(prepare_dir(Path::new("/usr")).is_err());
+        }
+    }
 
     #[test]
     fn parse_dir_expands_home_and_needs_full_paths() {

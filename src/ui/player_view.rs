@@ -458,8 +458,7 @@ impl PlayerView {
             let records: Vec<DownloadRecord> = downloads
                 .map(|d| d.snapshot().into_iter().map(|(record, _)| record).collect())
                 .unwrap_or_default();
-            let file = playback::downloaded_file(&records, &show_id, mode, &ep)
-                .filter(|path| path.is_file());
+            let file = playback::downloaded_file(&records, &show_id, mode, &ep);
             (playback::resume_point(&saved, &ep), file)
         });
         self.resolve_task = Some(cx.spawn(async move |this, cx| {

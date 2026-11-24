@@ -1,10 +1,10 @@
 use std::collections::HashSet;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 use crate::anicli::normalize_title;
-use crate::db::{self, Db};
+use crate::db::{self, Db, lock};
 use crate::history::HistoryEntry;
 use crate::model::{AniListMedia, Mode, Progress, ShowRecord, ShowSummary};
 use crate::progress;
@@ -267,10 +267,6 @@ pub fn episode_meta<'a>(media: &'a AniListMedia, ep: &str) -> Option<(Option<&'a
     })
 }
 
-fn lock(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
-    db.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum HeroSource {
     Continue(ContinueItem),
@@ -349,8 +345,12 @@ pub fn clamp_words(text: &str, max_chars: usize) -> String {
     }
     let keep = max_chars.saturating_sub(1);
     let cut: String = text.chars().take(keep).collect();
-    // Back off to the last whole word unless the cut fell after one.
-    let mid_word = text.chars().nth(keep).is_some_and(char::is_alphanumeric);
+    // Back off to the last whole word unless the cut fell after one
+    // (apostrophes are part of a word: "Frieren's").
+    let mid_word = text
+        .chars()
+        .nth(keep)
+        .is_some_and(|c| c.is_alphanumeric() || c == '\'' || c == '’');
     let words = match cut.rfind(char::is_whitespace) {
         Some(i) if mid_word => &cut[..i],
         _ => cut.as_str(),
@@ -647,6 +647,10 @@ mod tests {
         assert_eq!(clamp_words("One, two, three", 9), "One, two…");
         // Counts characters, not bytes.
         assert_eq!(clamp_words("Ōkami ōkami ōkami", 12), "Ōkami ōkami…");
+        // An apostrophe belongs to its word: never "The Frieren…" from
+        // "The Frieren's".
+        assert_eq!(clamp_words("The Frieren's party", 12), "The…");
+        assert_eq!(clamp_words("The Frieren’s party", 12), "The…");
         // A single word longer than the limit is cut inside it.
         assert_eq!(clamp_words("Supercalifragilistic", 8), "Superca…");
     }

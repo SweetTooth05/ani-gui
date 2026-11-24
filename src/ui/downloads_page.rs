@@ -2,18 +2,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use gpui::{
-    AnyElement, App, Context, FontWeight, IntoElement, ScrollHandle, SharedString, Subscription,
-    Task, WeakEntity, Window, div, prelude::*, px, relative,
+    AnyElement, Context, FontWeight, IntoElement, ScrollHandle, SharedString, Subscription, Task,
+    WeakEntity, Window, div, prelude::*, px, relative,
 };
 
-use crate::anicli;
 use crate::app::{AppState, PlayRequest, Root, Route};
-use crate::db::Db;
+use crate::db::{Db, lock};
 use crate::downloads::{DlProgress, DownloadManager};
 use crate::model::{DlStatus, DownloadRecord, ShowSummary};
 use crate::playback;
@@ -21,6 +19,7 @@ use crate::ui::components::button::{ButtonKind, button};
 use crate::ui::components::image::rounded_image;
 use crate::ui::components::poster::progress_bar;
 use crate::ui::components::toast;
+use crate::ui::files::{display_path, open_folder};
 use crate::ui::theme;
 use crate::ui::view_models::mode_label;
 
@@ -50,6 +49,8 @@ pub struct DownloadsPage {
     /// Downloads with an action in flight.
     busy: HashSet<String>,
     sync_task: Option<Task<()>>,
+    /// The list changed while `sync_task` was reading it.
+    sync_again: bool,
     scroll: ScrollHandle,
     _downloads_changed: Option<Subscription>,
 }
@@ -59,7 +60,7 @@ impl DownloadsPage {
         let watch = cx
             .try_global::<AppState>()
             .map(|s| s.downloads_changed.clone());
-        let subscription = watch.map(|w| cx.observe(&w, |page, _, cx| page.sync(cx)));
+        let subscription = watch.map(|w| cx.observe(&w, |page, _, cx| page.changed(cx)));
         let mut page = DownloadsPage {
             root,
             rows: Vec::new(),
@@ -67,6 +68,7 @@ impl DownloadsPage {
             loaded: false,
             busy: HashSet::new(),
             sync_task: None,
+            sync_again: false,
             scroll: ScrollHandle::new(),
             _downloads_changed: subscription,
         };
@@ -74,8 +76,27 @@ impl DownloadsPage {
         page
     }
 
-    /// Re-reads the manager's list (and any covers not yet known).
-    fn sync(&mut self, cx: &mut Context<Self>) {
+    /// The download list changed. A page covered by another (the player)
+    /// skips it; `Root` syncs it when it is back on top.
+    fn changed(&mut self, cx: &mut Context<Self>) {
+        let id = cx.entity_id();
+        let on_top = self
+            .root
+            .read_with(cx, |root, _| root.is_current(id))
+            .unwrap_or(false);
+        if on_top {
+            self.sync(cx);
+        }
+    }
+
+    /// Re-reads the manager's list (and any covers not yet known). While a
+    /// read is running, asks for exactly one more after it instead of
+    /// cancelling it, so a stream of progress updates can't starve the rows.
+    pub fn sync(&mut self, cx: &mut Context<Self>) {
+        if self.sync_task.is_some() {
+            self.sync_again = true;
+            return;
+        }
         let Some(state) = cx.try_global::<AppState>() else {
             return;
         };
@@ -90,6 +111,9 @@ impl DownloadsPage {
                 page.rows = rows;
                 page.covers.extend(covers);
                 page.loaded = true;
+                if std::mem::take(&mut page.sync_again) {
+                    page.sync(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -562,38 +586,6 @@ fn quality_label(quality: &str) -> SharedString {
     }
 }
 
-/// `path` with the home directory shown as "~".
-pub fn display_path(path: &Path) -> String {
-    match std::env::home_dir().and_then(|home| path.strip_prefix(home).ok().map(PathBuf::from)) {
-        Some(rest) if rest.as_os_str().is_empty() => "~".into(),
-        Some(rest) => format!("~/{}", rest.display()),
-        None => path.display().to_string(),
-    }
-}
-
-/// Opens `dir` (created first if missing) in the file manager.
-pub fn open_folder(dir: PathBuf, cx: &mut App) {
-    let opened = cx.background_spawn(async move {
-        std::fs::create_dir_all(&dir)?;
-        let status = Command::new("xdg-open").arg(&dir).status()?;
-        if !status.success() {
-            bail!("xdg-open exited with {status}");
-        }
-        anyhow::Ok(())
-    });
-    cx.spawn(async move |cx| {
-        if let Err(err) = opened.await {
-            cx.update(|cx| toast::error(cx, format!("Couldn't open the folder: {err:#}")))
-                .ok();
-        }
-    })
-    .detach();
-}
-
-fn lock(db: &Mutex<Db>) -> std::sync::MutexGuard<'_, Db> {
-    db.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// The manager's downloads as rows, and covers for shows not in `known`.
 /// Touches the disk: call it off the UI thread.
 fn snapshot(
@@ -660,15 +652,15 @@ fn retry_or_restart(
     }
     let show =
         show_for(db, record)?.ok_or_else(|| anyhow!("start it again from the show's page"))?;
-    let provider = lock(db).get_provider_title(&show.id)?;
-    let req = anicli::build_request(
+    playback::start_download(
+        db,
+        manager,
         &show,
-        provider.as_deref(),
         &record.ep,
         record.mode,
         &record.quality,
-    );
-    manager.start(&show, req, dir);
+        dir,
+    )?;
     manager.remove(&record.id);
     Ok(())
 }

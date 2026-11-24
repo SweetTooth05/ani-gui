@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -446,6 +447,12 @@ impl Db {
         )?;
         Ok(())
     }
+}
+
+/// Locks the shared database, carrying on after a panic elsewhere left the
+/// lock poisoned (every write is a single statement or transaction).
+pub fn lock(db: &Mutex<Db>) -> MutexGuard<'_, Db> {
+    db.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Current time in unix seconds.
