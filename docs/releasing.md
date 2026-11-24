@@ -107,7 +107,7 @@ gh secret list --env release --repo SweetTooth05/ani-gui
    - **Check the tag matches Cargo.toml**
    - **Build x86_64-unknown-linux-gnu**: `cargo test`, the release build,
      then packaging (on ubuntu-22.04, for an older glibc)
-   - **Build aarch64-apple-darwin** (macos-14) and **Build
+   - **Build aarch64-apple-darwin** (macos-15) and **Build
      x86_64-apple-darwin** (macos-15-intel): the same, packaged as an
      ad hoc signed `ani-gui.app` (`make app`)
    - **Sign and publish**: waits for your approval if you set up the
@@ -162,7 +162,7 @@ Both commands must succeed: `Signature Verified Successfully`, then `OK`.
 
 ## macOS builds
 
-The build job is a matrix: Linux, `aarch64-apple-darwin` on `macos-14` and
+The build job is a matrix: Linux, `aarch64-apple-darwin` on `macos-15` and
 `x86_64-apple-darwin` on `macos-15-intel`. Each writes
 `dist/ani-gui-<version>-<target>.tar.gz`; the release job signs every archive
 it receives, and the updater picks its asset by the target triple it was

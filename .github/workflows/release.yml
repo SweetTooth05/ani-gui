@@ -60,7 +60,7 @@ jobs:
           # macOS: each built and tested natively. macos-13, the last Intel
           # image of its generation, was retired; macos-15-intel replaces it.
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-apple-darwin
             os: macos-15-intel
           # Every entry writes dist/ani-gui-<version>-<target>.tar.gz. The
