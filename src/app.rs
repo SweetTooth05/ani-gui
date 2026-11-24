@@ -12,10 +12,14 @@ use gpui::{
 use crate::db::Db;
 use crate::downloads::DownloadManager;
 use crate::model::{Mode, Settings, ShowSummary, Stream};
+use crate::ui::calendar::CalendarPage;
 use crate::ui::components::toast::{self, Toasts};
+use crate::ui::downloads_page::DownloadsPage;
 use crate::ui::home::HomePage;
+use crate::ui::my_list::MyListPage;
 use crate::ui::player_view::{self, PlayerView};
 use crate::ui::search::SearchPage;
+use crate::ui::settings_page::SettingsPage;
 use crate::ui::show::ShowPage;
 use crate::ui::{sidebar, theme};
 use crate::{anicli, paths};
@@ -81,10 +85,12 @@ pub struct PlayRequest {
 enum Page {
     Home(Entity<HomePage>),
     Search(Entity<SearchPage>),
+    MyList(Entity<MyListPage>),
+    Calendar(Entity<CalendarPage>),
+    Downloads(Entity<DownloadsPage>),
+    Settings(Entity<SettingsPage>),
     Show(Entity<ShowPage>),
     Player(Entity<PlayerView>),
-    /// Rendered by `Root` itself (pages later tasks build).
-    Static,
 }
 
 struct Entry {
@@ -242,7 +248,10 @@ impl Root {
                 let req = req.clone();
                 Page::Player(cx.new(|cx| PlayerView::new(req, root, cx)))
             }
-            Route::MyList | Route::Calendar | Route::Downloads | Route::Settings => Page::Static,
+            Route::MyList => Page::MyList(cx.new(|cx| MyListPage::new(root, cx))),
+            Route::Calendar => Page::Calendar(cx.new(|cx| CalendarPage::new(root, cx))),
+            Route::Downloads => Page::Downloads(cx.new(|cx| DownloadsPage::new(root, cx))),
+            Route::Settings => Page::Settings(cx.new(SettingsPage::new)),
         };
         if !matches!(route, Route::Show(_) | Route::Player(_)) {
             self.stack.clear();
@@ -275,6 +284,7 @@ impl Root {
             match self.stack.last().map(|e| &e.page) {
                 Some(Page::Home(home)) => home.update(cx, |home, cx| home.refresh(cx)),
                 Some(Page::Show(show)) => show.update(cx, |show, cx| show.reload(cx)),
+                Some(Page::MyList(list)) => list.update(cx, |list, cx| list.reload(cx)),
                 _ => {}
             }
             cx.notify();
@@ -289,20 +299,15 @@ impl Root {
         let Some(entry) = self.stack.last() else {
             return div().into_any_element();
         };
-        match (&entry.page, &entry.route) {
-            (Page::Home(home), _) => home.clone().into_any_element(),
-            (Page::Search(search), _) => search.clone().into_any_element(),
-            (Page::Show(show), _) => show.clone().into_any_element(),
-            (Page::Player(player), _) => player.clone().into_any_element(),
-            (Page::Static, route) => {
-                let title = match route {
-                    Route::MyList => "My List",
-                    Route::Calendar => "Calendar",
-                    Route::Downloads => "Downloads",
-                    _ => "Settings",
-                };
-                placeholder(title, "This page is coming soon.".into())
-            }
+        match &entry.page {
+            Page::Home(home) => home.clone().into_any_element(),
+            Page::Search(search) => search.clone().into_any_element(),
+            Page::MyList(list) => list.clone().into_any_element(),
+            Page::Calendar(calendar) => calendar.clone().into_any_element(),
+            Page::Downloads(downloads) => downloads.clone().into_any_element(),
+            Page::Settings(settings) => settings.clone().into_any_element(),
+            Page::Show(show) => show.clone().into_any_element(),
+            Page::Player(player) => player.clone().into_any_element(),
         }
     }
 }

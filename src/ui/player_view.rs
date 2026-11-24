@@ -23,12 +23,13 @@ use crate::anicli::ResolveOutcome;
 use crate::app::{AppState, Back, PlayRequest, Root};
 use crate::db::{self, Db};
 use crate::downloads::DownloadManager;
-use crate::model::{DownloadRecord, Mode, Progress, Stream};
+use crate::model::{DownloadRecord, Progress, Stream};
 use crate::playback;
 use crate::player::{MpvPlayer, PlaybackState, PlayerError};
 use crate::ui::components::button::{ButtonKind, button};
 use crate::ui::components::pick_dialog::pick_dialog;
 use crate::ui::theme;
+use crate::ui::view_models::mode_label;
 
 actions!(
     player,
@@ -1262,13 +1263,6 @@ fn save_progress(db: &Mutex<Db>, progress: &Progress) {
     let db = db.lock().unwrap_or_else(PoisonError::into_inner);
     if let Err(err) = db.save_progress(progress) {
         eprintln!("ani-gui: saving progress: {err:#}");
-    }
-}
-
-fn mode_label(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Sub => "Sub",
-        Mode::Dub => "Dub",
     }
 }
 

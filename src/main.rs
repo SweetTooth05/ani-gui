@@ -10,6 +10,7 @@ mod app;
 mod catalog;
 #[allow(dead_code)]
 mod db;
+mod diagnostics;
 #[allow(dead_code)]
 mod downloads;
 #[allow(dead_code)]

@@ -18,12 +18,16 @@ use crate::ui::components::poster::{episode_card, poster_card};
 use crate::ui::components::row::row;
 use crate::ui::components::toast;
 use crate::ui::theme;
-use crate::ui::view_models::{self, Catalog, ContinueItem, HeroModel, HeroSource, media_title};
+use crate::ui::view_models::{
+    self, Catalog, ContinueItem, HeroModel, HeroSource, format_label, media_title,
+};
 use crate::{allanime, catalog, history, paths};
 
 const SNAPSHOT_KEY: &str = "home:snapshot";
 const FOR_YOU_SEEDS: usize = 5;
 const HERO_H: f32 = 480.;
+/// About three lines of the hero's 560 px synopsis.
+const HERO_SYNOPSIS_CHARS: usize = 200;
 /// AllAnime episode lists are reused this long within a session.
 const EPISODES_TTL: Duration = Duration::from_secs(10 * 60);
 
@@ -357,8 +361,10 @@ impl HomePage {
                             .line_height(relative(1.5))
                             .text_color(theme::text_dim())
                             .line_clamp(3)
-                            .text_ellipsis()
-                            .child(view_models::blurb(s))
+                            .child(view_models::clamp_words(
+                                &view_models::blurb(s),
+                                HERO_SYNOPSIS_CHARS,
+                            ))
                     }))
                     .child(
                         div()
@@ -448,17 +454,6 @@ impl HomePage {
                 .into_any_element()
             });
         row("continue", "Continue watching", &self.rows[0], cards).into_any_element()
-    }
-}
-
-fn format_label(format: &str) -> String {
-    match format {
-        "TV" | "OVA" | "ONA" => format.to_string(),
-        "TV_SHORT" => "TV short".into(),
-        "MOVIE" => "Movie".into(),
-        "SPECIAL" => "Special".into(),
-        "MUSIC" => "Music".into(),
-        other => other.to_string(),
     }
 }
 

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context as _, Result, anyhow};
@@ -21,10 +21,10 @@ use crate::ui::components::poster::progress_bar;
 use crate::ui::components::text_input::TextInput;
 use crate::ui::components::toast;
 use crate::ui::theme;
-use crate::ui::view_models::{self, EpisodeRow, ShowPageModel, media_title};
+use crate::ui::view_models::{self, EpisodeRow, ShowPageModel, media_title, mode_label};
 use crate::{allanime, catalog, playback};
 
-const QUALITIES: [(&str, &str); 4] = [
+pub const QUALITIES: [(&str, &str); 4] = [
     ("best", "Best"),
     ("1080", "1080p"),
     ("720", "720p"),
@@ -35,6 +35,8 @@ const EPISODE_PAGE: usize = 100;
 const BANNER_H: f32 = 340.;
 const COVER_W: f32 = 200.;
 const COVER_H: f32 = 300.;
+/// About four lines of the 720 px synopsis.
+const SYNOPSIS_CHARS: usize = 360;
 
 struct Loaded {
     show: ShowSummary,
@@ -44,6 +46,12 @@ struct Loaded {
     in_list: bool,
     /// Why the episode list could not be fetched.
     episodes_error: Option<String>,
+}
+
+/// Where an episode to play was found.
+enum Found {
+    File(PathBuf),
+    Resolved(ResolveOutcome),
 }
 
 /// A download's state for one episode of this show.
@@ -268,9 +276,10 @@ impl ShowPage {
         task.detach();
     }
 
-    /// Resolves `ep` with ani-cli and opens the player. With `chosen`, that
-    /// title (picked from ani-cli's results) becomes the show's provider title
-    /// first, so this and later runs search for it.
+    /// Opens the player on `ep`: its downloaded file when there is one,
+    /// else the stream ani-cli resolves. With `chosen`, that title (picked
+    /// from ani-cli's results) becomes the show's provider title first, so
+    /// this and later runs search for it.
     fn play(&mut self, ep: String, start: f64, chosen: Option<String>, cx: &mut Context<Self>) {
         if self.resolving.is_some() {
             return;
@@ -281,15 +290,8 @@ impl ShowPage {
         let Some(loaded) = &self.loaded else {
             return;
         };
-        let shims = match &state.shims {
-            Ok(shims) => shims.clone(),
-            Err(err) => {
-                self.play_error = Some(err.clone());
-                cx.notify();
-                return;
-            }
-        };
-        let db = state.db.clone();
+        let shims = state.shims.clone();
+        let (db, manager) = (state.db.clone(), state.downloads.clone());
         let show = loaded.show.clone();
         let episodes = loaded.episodes.clone();
         let (mode, quality) = (self.mode, self.quality.clone());
@@ -299,8 +301,12 @@ impl ShowPage {
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
             let (show_bg, ep_bg, quality_bg) = (show.clone(), ep.clone(), quality.clone());
-            let outcome = cx
+            let found = cx
                 .background_spawn(async move {
+                    if let Some(file) = downloaded_file(&manager, &show_bg.id, mode, &ep_bg) {
+                        return Ok(Found::File(file));
+                    }
+                    let shims = shims.map_err(|err| anyhow!(err))?;
                     playback::resolve(
                         &db,
                         &shims,
@@ -310,27 +316,35 @@ impl ShowPage {
                         &quality_bg,
                         chosen.as_deref(),
                     )
+                    .map(Found::Resolved)
                 })
                 .await;
             this.update(cx, |page, cx| {
                 page.resolving = None;
-                match outcome {
-                    Ok(ResolveOutcome::Stream(stream)) => {
-                        let req = PlayRequest {
-                            show,
-                            mode,
-                            ep,
-                            start,
-                            episodes,
-                            quality,
-                            local_file: None,
-                            stream: Some(stream),
-                        };
+                let play = |local_file, stream| PlayRequest {
+                    show,
+                    mode,
+                    ep: ep.clone(),
+                    start,
+                    episodes,
+                    quality,
+                    local_file,
+                    stream,
+                };
+                match found {
+                    Ok(Found::File(file)) => {
+                        let req = play(Some(file), None);
                         page.root
                             .update(cx, |root, cx| root.navigate(Route::Player(req), cx))
                             .ok();
                     }
-                    Ok(ResolveOutcome::NeedsPick(candidates)) => {
+                    Ok(Found::Resolved(ResolveOutcome::Stream(stream))) => {
+                        let req = play(None, Some(stream));
+                        page.root
+                            .update(cx, |root, cx| root.navigate(Route::Player(req), cx))
+                            .ok();
+                    }
+                    Ok(Found::Resolved(ResolveOutcome::NeedsPick(candidates))) => {
                         page.pick = Some(Pick {
                             candidates,
                             ep,
@@ -563,8 +577,10 @@ impl ShowPage {
                                     .line_height(relative(1.55))
                                     .text_color(theme::text_dim())
                                     .line_clamp(4)
-                                    .text_ellipsis()
-                                    .child(view_models::blurb(&s))
+                                    .child(view_models::clamp_words(
+                                        &view_models::blurb(&s),
+                                        SYNOPSIS_CHARS,
+                                    ))
                             }))
                             .child(self.render_controls(cx)),
                     ),
@@ -1018,13 +1034,6 @@ impl Render for ShowPage {
     }
 }
 
-fn mode_label(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Sub => "Sub",
-        Mode::Dub => "Dub",
-    }
-}
-
 fn status_label(status: &str) -> String {
     match status {
         "RELEASING" => "Airing".into(),
@@ -1107,6 +1116,18 @@ fn start_download(
     let provider = lock(db).get_provider_title(&show.id).ok().flatten();
     let req = anicli::build_request(show, provider.as_deref(), ep, mode, quality);
     manager.start(show, req, dir);
+}
+
+/// The downloaded file of `ep`, if it finished and is still on disk. Reads
+/// the manager's state and the disk, so call it off the UI thread.
+fn downloaded_file(
+    manager: &DownloadManager,
+    show_id: &str,
+    mode: Mode,
+    ep: &str,
+) -> Option<PathBuf> {
+    let records: Vec<_> = manager.snapshot().into_iter().map(|(r, _)| r).collect();
+    playback::downloaded_file(&records, show_id, mode, ep).filter(|path| path.is_file())
 }
 
 /// This show's downloads in `mode`, by episode. Reads the manager's state,

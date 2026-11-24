@@ -203,6 +203,15 @@ unsafe extern "C" fn on_render_update(ctx: *mut c_void) {
     shared.signal(|w| w.update = true);
 }
 
+/// Whether libmpv loads with every symbol the player uses, without starting
+/// mpv. The library stays loaded: unloading it buys nothing and libmpv is
+/// not written to be unloaded.
+pub fn probe_library() -> Result<(), String> {
+    let api = Api::load(LIBRARY).map_err(|e| format!("{LIBRARY}: {e}"))?;
+    std::mem::forget(api);
+    Ok(())
+}
+
 pub struct MpvPlayer {
     shared: Arc<Shared>,
     render_thread: Option<JoinHandle<()>>,

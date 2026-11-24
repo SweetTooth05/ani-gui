@@ -339,6 +339,49 @@ pub fn blurb(synopsis: &str) -> String {
         .join(" ")
 }
 
+/// `text` cut at a word boundary to at most `max_chars` characters,
+/// counting the "…" added when anything was cut. gpui's own ellipsis
+/// measures clamped text as one long line, so wrapped previews lose their
+/// last words without one; cutting first keeps the preview in its clamp.
+pub fn clamp_words(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let cut: String = text.chars().take(keep).collect();
+    // Back off to the last whole word unless the cut fell after one.
+    let mid_word = text.chars().nth(keep).is_some_and(char::is_alphanumeric);
+    let words = match cut.rfind(char::is_whitespace) {
+        Some(i) if mid_word => &cut[..i],
+        _ => cut.as_str(),
+    };
+    let words = words.trim_end_matches(|c: char| c.is_whitespace() || c.is_ascii_punctuation());
+    let words = if words.is_empty() {
+        cut.as_str()
+    } else {
+        words
+    };
+    format!("{words}…")
+}
+
+/// AniList's media format for display ("TV_SHORT" is "TV short").
+pub fn format_label(format: &str) -> String {
+    match format {
+        "TV_SHORT" => "TV short".into(),
+        "MOVIE" => "Movie".into(),
+        "SPECIAL" => "Special".into(),
+        "MUSIC" => "Music".into(),
+        other => other.to_string(),
+    }
+}
+
+pub fn mode_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Sub => "Sub",
+        Mode::Dub => "Dub",
+    }
+}
+
 pub fn play_label(ep: &str, start: f64) -> String {
     if start > 0.0 {
         format!("Resume E{ep}")
@@ -591,6 +634,21 @@ mod tests {
             "The adventure is over. A new one begins…"
         );
         assert_eq!(blurb("One line"), "One line");
+    }
+
+    #[test]
+    fn clamp_words_cuts_at_a_word_with_ellipsis() {
+        assert_eq!(clamp_words("Short enough", 40), "Short enough");
+        assert_eq!(
+            clamp_words("Frieren and her party defeated the Demon King", 24),
+            "Frieren and her party…"
+        );
+        // Punctuation before the cut is dropped, never left before the "…".
+        assert_eq!(clamp_words("One, two, three", 9), "One, two…");
+        // Counts characters, not bytes.
+        assert_eq!(clamp_words("Ōkami ōkami ōkami", 12), "Ōkami ōkami…");
+        // A single word longer than the limit is cut inside it.
+        assert_eq!(clamp_words("Supercalifragilistic", 8), "Superca…");
     }
 
     #[test]
