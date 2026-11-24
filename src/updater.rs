@@ -7,15 +7,18 @@
 //! with the maintainer and in the release workflow's secret (see
 //! `docs/releasing.md`).
 //!
-//! An install extracts `bin/ani-gui` next to the installed binary and
-//! renames it over the old one. The running process keeps its old inode, so
-//! the new version starts the next time the app does. Dev builds, binaries
-//! the user can't write and root are never replaced: they are only told
-//! that an update exists.
+//! On Linux an install extracts `bin/ani-gui` next to the installed binary
+//! and renames it over the old one. The running process keeps its old
+//! inode, so the new version starts the next time the app does. On macOS
+//! the unit is the `ani-gui.app` bundle: the new bundle is extracted beside
+//! the old one and swapped in by renaming the old one aside. Dev builds,
+//! installs the user can't write and root are never replaced: they are only
+//! told that an update exists.
 
-use std::fs::{self, File, OpenOptions, Permissions};
+use std::collections::HashSet;
+use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -66,6 +69,48 @@ const MAX_SUMS: u64 = 64 << 10;
 const MAX_SIG: u64 = 1 << 10;
 const MAX_ARCHIVE: u64 = 256 << 20;
 const MAX_BINARY: u64 = 512 << 20;
+/// Most entries an app bundle archive may have.
+const MAX_BUNDLE_ENTRIES: usize = 10_000;
+
+/// The bundle at the top of a macOS release archive.
+const BUNDLE: &str = "ani-gui.app";
+/// The executable inside a bundle, relative to it.
+const BUNDLE_EXE: [&str; 3] = ["Contents", "MacOS", "ani-gui"];
+
+/// How a release for this platform is installed. Chosen once here; the code
+/// below takes it as data, so both layouts are tested on every platform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    /// A prefix tree: `<prefix>/bin/ani-gui` (Linux).
+    Prefix,
+    /// An `ani-gui.app` bundle (macOS).
+    AppBundle,
+}
+
+const LAYOUT: Layout = if cfg!(target_os = "macos") {
+    Layout::AppBundle
+} else {
+    Layout::Prefix
+};
+
+/// What an update replaces.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallTarget {
+    /// An installed binary, replaced by the archive's `<stem>/bin/ani-gui`.
+    Binary(PathBuf),
+    /// An app bundle such as `/Applications/ani-gui.app`, replaced whole by
+    /// the archive's `ani-gui.app`.
+    Bundle(PathBuf),
+}
+
+impl InstallTarget {
+    /// The folder the update's temporary files go in, so every rename stays
+    /// on one filesystem.
+    fn dir(&self) -> Result<&Path> {
+        let (InstallTarget::Binary(path) | InstallTarget::Bundle(path)) = self;
+        path.parent().context("the install path has no folder")
+    }
+}
 
 /// A plain `MAJOR.MINOR.PATCH` version. Pre-release and build suffixes are
 /// not accepted, so a tag like `v2.0.0-rc1` never counts as newer.
@@ -351,13 +396,13 @@ pub fn latest_newer(source: &Source, current: Version) -> Result<Option<Release>
     Ok(parse_release(&json)?.filter(|r| r.version > current))
 }
 
-/// Downloads `release` for `target`, verifies it against `key`, and swaps
-/// its `bin/ani-gui` in at `exe`. Any failure leaves `exe` untouched.
+/// Downloads `release` for `target`, verifies it against `keys`, and swaps
+/// it in at `dest`. Any failure leaves `dest` untouched.
 fn install(
     source: &Source,
     release: &Release,
     target: &str,
-    exe: &Path,
+    dest: &InstallTarget,
     keys: &[[u8; 32]],
 ) -> Result<()> {
     let picked = pick_assets(release, target, &source.download_prefix)?;
@@ -373,7 +418,7 @@ fn install(
     // The signature first: nothing in SHA256SUMS counts until it verifies.
     verify_sums(&sums, &sig, keys)?;
     let expected = expected_hash(&sums, &picked.archive.name)?;
-    let dir = exe.parent().context("the install path has no folder")?;
+    let dir = dest.dir()?;
     let mut archive = TempFile::new(dir, "download")?;
     let actual = download(&agent, &picked.archive.url, &mut archive.file, MAX_ARCHIVE)?;
     ensure!(
@@ -382,7 +427,12 @@ fn install(
         picked.archive.name
     );
     archive.file.seek(SeekFrom::Start(0))?;
-    replace_binary(&archive.file, &archive_stem(release.version, target), exe)
+    match dest {
+        InstallTarget::Binary(exe) => {
+            replace_binary(&archive.file, &archive_stem(release.version, target), exe)
+        }
+        InstallTarget::Bundle(app) => replace_bundle(&archive.file, app),
+    }
 }
 
 /// Writes the archive's `<top>/bin/ani-gui` into `out`. Only that one
@@ -423,16 +473,18 @@ fn extract_binary(archive: impl Read, top: &str, out: &mut impl Write, limit: u6
     Ok(())
 }
 
-/// Whether `magic` starts an executable for this OS.
-fn plausible_executable(magic: &[u8; 4]) -> bool {
-    if cfg!(target_os = "macos") {
-        matches!(
-            magic,
-            [0xcf, 0xfa, 0xed, 0xfe] | [0xce, 0xfa, 0xed, 0xfe] | [0xca, 0xfe, 0xba, 0xbe]
-        )
-    } else {
-        magic == b"\x7fELF"
-    }
+/// Whether `magic` starts an ELF executable (the Linux binary).
+fn is_elf(magic: &[u8; 4]) -> bool {
+    magic == b"\x7fELF"
+}
+
+/// Whether `magic` starts a Mach-O executable: 64-bit or 32-bit
+/// little-endian, or a universal binary.
+fn is_mach_o(magic: &[u8; 4]) -> bool {
+    matches!(
+        magic,
+        [0xcf, 0xfa, 0xed, 0xfe] | [0xce, 0xfa, 0xed, 0xfe] | [0xca, 0xfe, 0xba, 0xbe]
+    )
 }
 
 /// Extracts the new binary beside `exe`, checks it, and renames it over
@@ -446,7 +498,7 @@ fn replace_binary(archive: impl Read, top: &str, exe: &Path) -> Result<()> {
         .read_exact_at(&mut magic, 0)
         .context("the new binary is empty")?;
     ensure!(
-        plausible_executable(&magic),
+        is_elf(&magic),
         "bin/ani-gui in the archive isn't an executable for this system"
     );
     new.file.set_permissions(Permissions::from_mode(0o755))?;
@@ -460,6 +512,284 @@ fn replace_binary(archive: impl Read, top: &str, exe: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Extracts the archive's `ani-gui.app` beside `app`, checks it, and swaps
+/// it in for `app`.
+fn replace_bundle(archive: impl Read, app: &Path) -> Result<()> {
+    let dir = app.parent().context("the install path has no folder")?;
+    let new = TempDir::new(dir, "new")?;
+    extract_bundle(archive, BUNDLE, &new.path, MAX_BINARY)?;
+    check_bundle(&new.path)?;
+    swap_bundle(&new.path, app, |from, to| fs::rename(from, to))?;
+    // Makes the renames durable; the swap has happened either way.
+    if let Err(err) = File::open(dir).and_then(|d| d.sync_all()) {
+        eprintln!("ani-gui: update: syncing {}: {err}", dir.display());
+    }
+    Ok(())
+}
+
+/// The archive path `path` as plain names; an absolute path or one with
+/// `..` rejects the whole archive.
+fn safe_parts(path: &Path) -> Result<Vec<String>> {
+    let mut parts = Vec::new();
+    for part in path.components() {
+        match part {
+            Component::Normal(p) => parts.push(
+                p.to_str()
+                    .with_context(|| {
+                        format!("the archive has a non-UTF-8 path: {}", path.display())
+                    })?
+                    .to_owned(),
+            ),
+            Component::CurDir => {}
+            _ => bail!("the archive has an unsafe path: {}", path.display()),
+        }
+    }
+    Ok(parts)
+}
+
+/// Whether the symlink at `rel` (a path inside the bundle) pointing at
+/// `target` stays inside the bundle when resolved by name. Absolute targets
+/// never do. [`check_bundle`] then resolves every link for real, which also
+/// catches chains of links.
+fn link_stays_inside(rel: &[String], target: &Path) -> bool {
+    // The folders above the link, inside the bundle.
+    let mut depth = rel.len().saturating_sub(1);
+    for part in target.components() {
+        match part {
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+            Component::ParentDir => match depth.checked_sub(1) {
+                Some(d) => depth = d,
+                None => return false,
+            },
+            Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    true
+}
+
+/// Writes the archive's `<top>/…` tree into the existing empty folder
+/// `dest`. Folders, regular files and symlinks that stay inside the bundle
+/// are allowed; any other entry, anything outside `<top>`, a path that is
+/// absolute, climbs out with `..` or runs through a symlink, a duplicate, or
+/// more than `limit` bytes in all rejects the archive.
+fn extract_bundle(archive: impl Read, top: &str, dest: &Path, limit: u64) -> Result<()> {
+    let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
+    let mut links: HashSet<Vec<String>> = HashSet::new();
+    let mut written = 0u64;
+    let mut count = 0usize;
+    for entry in tar.entries().context("reading the archive")? {
+        let mut entry = entry.context("reading the archive")?;
+        count += 1;
+        ensure!(
+            count <= MAX_BUNDLE_ENTRIES,
+            "the archive has too many entries"
+        );
+        let path = entry.path().context("reading the archive")?.into_owned();
+        let parts = safe_parts(&path)?;
+        let Some((first, rel)) = parts.split_first() else {
+            // "./" itself.
+            continue;
+        };
+        ensure!(
+            first == top,
+            "the archive has something besides {top}: {}",
+            path.display()
+        );
+        let kind = entry.header().entry_type();
+        if rel.is_empty() {
+            ensure!(kind.is_dir(), "{top} in the archive isn't a folder");
+            continue;
+        }
+        // Nothing may be written through a link extracted earlier.
+        for end in 1..=rel.len() {
+            ensure!(
+                !links.contains(&rel[..end]),
+                "the archive writes through a symlink: {}",
+                path.display()
+            );
+        }
+        let out = rel.iter().fold(dest.to_path_buf(), |p, part| p.join(part));
+        let parent = out.parent().context("reading the archive")?;
+        match kind {
+            // May exist already as the parent of an earlier entry, but not as
+            // a file (a link at this path was refused above).
+            tar::EntryType::Directory => DirBuilder::new()
+                .recursive(true)
+                .mode(0o755)
+                .create(&out)
+                .with_context(|| format!("creating {}", out.display()))?,
+            tar::EntryType::Regular => {
+                DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o755)
+                    .create(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+                let executable = entry.header().mode().is_ok_and(|m| m & 0o111 != 0);
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(if executable { 0o755 } else { 0o644 })
+                    .open(&out)
+                    .with_context(|| format!("the archive repeats {}", path.display()))?;
+                let budget = limit - written;
+                let copied = io::copy(&mut (&mut entry).take(budget + 1), &mut file)
+                    .with_context(|| format!("extracting {}", path.display()))?;
+                ensure!(copied <= budget, "the app in the archive is too large");
+                written += copied;
+                file.sync_all()
+                    .with_context(|| format!("saving {}", out.display()))?;
+            }
+            tar::EntryType::Symlink => {
+                let target = entry
+                    .link_name()
+                    .context("reading the archive")?
+                    .with_context(|| format!("{} links to nothing", path.display()))?
+                    .into_owned();
+                ensure!(
+                    link_stays_inside(rel, &target),
+                    "the archive has a symlink out of the app: {} -> {}",
+                    path.display(),
+                    target.display()
+                );
+                DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o755)
+                    .create(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+                std::os::unix::fs::symlink(&target, &out)
+                    .with_context(|| format!("the archive repeats {}", path.display()))?;
+                links.insert(rel.to_vec());
+            }
+            other => bail!(
+                "the archive has an unsupported entry ({other:?}): {}",
+                path.display()
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Checks an extracted bundle: every symlink resolves inside it, and
+/// `Contents/MacOS/ani-gui` is a regular Mach-O file next to an Info.plist.
+fn check_bundle(app: &Path) -> Result<()> {
+    let root = fs::canonicalize(app).context("reading the new app")?;
+    check_links(&root, &root)?;
+    let exe = BUNDLE_EXE
+        .iter()
+        .fold(app.to_path_buf(), |p, part| p.join(part));
+    let meta =
+        fs::symlink_metadata(&exe).context("the archive's app has no Contents/MacOS/ani-gui")?;
+    ensure!(
+        meta.is_file(),
+        "Contents/MacOS/ani-gui in the archive isn't a regular file"
+    );
+    let mut magic = [0u8; 4];
+    File::open(&exe)
+        .and_then(|f| f.read_exact_at(&mut magic, 0))
+        .context("Contents/MacOS/ani-gui in the archive is empty")?;
+    ensure!(
+        is_mach_o(&magic),
+        "Contents/MacOS/ani-gui in the archive isn't a macOS executable"
+    );
+    let plist = fs::symlink_metadata(app.join("Contents/Info.plist"))
+        .context("the archive's app has no Contents/Info.plist")?;
+    ensure!(
+        plist.is_file(),
+        "Contents/Info.plist in the archive isn't a file"
+    );
+    Ok(())
+}
+
+/// Fails if any symlink under `dir` resolves (following chains, as the
+/// system would) to somewhere outside `root`, or doesn't resolve at all.
+fn check_links(root: &Path, dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(dir).context("reading the new app")? {
+        let entry = entry.context("reading the new app")?;
+        let path = entry.path();
+        let kind = entry.file_type().context("reading the new app")?;
+        if kind.is_symlink() {
+            let resolved = fs::canonicalize(&path)
+                .with_context(|| format!("the app has a dangling symlink: {}", path.display()))?;
+            ensure!(
+                resolved.starts_with(root),
+                "the app has a symlink out of it: {}",
+                path.display()
+            );
+        } else if kind.is_dir() {
+            check_links(root, &path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Puts the bundle at `new` in place of `app`: renames `app` aside, renames
+/// `new` in, then removes the old one. If the second rename fails the old
+/// bundle is renamed back. `rename` is `fs::rename` except in tests.
+fn swap_bundle(
+    new: &Path,
+    app: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<()> {
+    let dir = app.parent().context("the install path has no folder")?;
+    let aside = temp_path(dir, "old");
+    rename(app, &aside).with_context(|| format!("moving {} aside", app.display()))?;
+    if let Err(err) = rename(new, app) {
+        if let Err(back) = rename(&aside, app) {
+            bail!(
+                "moving the new app into place: {err}; putting the old one back \
+                 also failed ({back}), it is at {}",
+                aside.display()
+            );
+        }
+        return Err(err).context("moving the new app into place");
+    }
+    if let Err(err) = fs::remove_dir_all(&aside) {
+        eprintln!(
+            "ani-gui: update: removing the old app at {}: {err}",
+            aside.display()
+        );
+    }
+    Ok(())
+}
+
+/// A fresh hidden name in `dir` for an update's temporary file or folder.
+fn temp_path(dir: &Path, what: &str) -> PathBuf {
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!(
+        ".ani-gui-{what}-{}-{nanos}-{n}",
+        std::process::id()
+    ))
+}
+
+/// A folder created next to the installed bundle, removed again with
+/// everything in it unless it was renamed away.
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(dir: &Path, what: &str) -> Result<TempDir> {
+        let path = temp_path(dir, what);
+        DirBuilder::new()
+            .mode(0o755)
+            .create(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+        Ok(TempDir { path })
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // Gone already when the swap renamed it into place.
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 /// A file created next to the installed binary (so the final rename stays
 /// on one filesystem), removed again unless kept.
 struct TempFile {
@@ -470,15 +800,7 @@ struct TempFile {
 
 impl TempFile {
     fn new(dir: &Path, what: &str) -> Result<TempFile> {
-        static COUNT: AtomicU32 = AtomicU32::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let n = COUNT.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!(
-            ".ani-gui-{what}-{}-{nanos}-{n}",
-            std::process::id()
-        ));
+        let path = temp_path(dir, what);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -510,6 +832,7 @@ pub enum NotEligible {
     Root,
     NotOwned,
     NotWritable,
+    NotInBundle,
 }
 
 impl NotEligible {
@@ -522,13 +845,22 @@ impl NotEligible {
             NotEligible::NotWritable => {
                 "ani-gui is installed in a folder you can't write to, such as a system install."
             }
+            NotEligible::NotInBundle => {
+                "ani-gui isn't running from its ani-gui.app bundle, so it never replaces itself."
+            }
         }
     }
 }
 
-/// `exe` if ani-gui may replace it: a release build outside cargo's
-/// `target/`, run by the binary's owner, in a folder that user can write.
-fn self_update_path(exe: &Path, dev_build: bool) -> Result<PathBuf, NotEligible> {
+/// What ani-gui may replace when it runs as `exe`: a release build outside
+/// cargo's `target/`, run by its owner, in a folder that user can write.
+/// With [`Layout::AppBundle`] that is the bundle `exe` runs from, which must
+/// be a real folder owned by the same user.
+fn self_update_target(
+    exe: &Path,
+    dev_build: bool,
+    layout: Layout,
+) -> Result<InstallTarget, NotEligible> {
     if dev_build || in_cargo_target(exe) {
         return Err(NotEligible::DevBuild);
     }
@@ -540,10 +872,35 @@ fn self_update_path(exe: &Path, dev_build: bool) -> Result<PathBuf, NotEligible>
     if meta.uid() != euid {
         return Err(NotEligible::NotOwned);
     }
-    let dir = exe.parent().ok_or(NotEligible::UnknownPath)?;
+    let target = match layout {
+        Layout::Prefix => InstallTarget::Binary(exe.to_path_buf()),
+        Layout::AppBundle => {
+            let exe = fs::canonicalize(exe).map_err(|_| NotEligible::UnknownPath)?;
+            let app = app_bundle_of(&exe).ok_or(NotEligible::NotInBundle)?;
+            let meta = fs::symlink_metadata(&app).map_err(|_| NotEligible::UnknownPath)?;
+            if !meta.is_dir() || meta.uid() != euid {
+                return Err(NotEligible::NotOwned);
+            }
+            InstallTarget::Bundle(app)
+        }
+    };
+    let dir = target.dir().map_err(|_| NotEligible::UnknownPath)?;
     nix::unistd::access(dir, nix::unistd::AccessFlags::W_OK)
         .map_err(|_| NotEligible::NotWritable)?;
-    Ok(exe.to_path_buf())
+    Ok(target)
+}
+
+/// The `….app` folder when `exe` is `<…>.app/Contents/MacOS/ani-gui`.
+fn app_bundle_of(exe: &Path) -> Option<PathBuf> {
+    let mut up = exe;
+    for part in BUNDLE_EXE.iter().rev() {
+        if up.file_name()? != *part {
+            return None;
+        }
+        up = up.parent()?;
+    }
+    let name = up.file_name()?.to_str()?;
+    (name.len() > ".app".len() && name.ends_with(".app")).then(|| up.to_path_buf())
 }
 
 fn euid() -> u32 {
@@ -658,7 +1015,7 @@ pub struct Updates {
     pub status: Status,
     pub saved: Saved,
     /// Where this install can update itself, or why it can't.
-    pub install_path: Result<PathBuf, NotEligible>,
+    pub install_path: Result<InstallTarget, NotEligible>,
 }
 
 impl Updates {
@@ -689,7 +1046,7 @@ pub fn init(cx: &mut App) {
         let (saved, install_path) = cx
             .background_spawn(async move {
                 let install_path = exe.map_or(Err(NotEligible::UnknownPath), |exe| {
-                    self_update_path(&exe, cfg!(debug_assertions))
+                    self_update_target(&exe, cfg!(debug_assertions), LAYOUT)
                 });
                 (load_saved(&state_path()), install_path)
             })
@@ -756,7 +1113,7 @@ fn check(cx: &mut App, manual: bool) {
                     Status::Installed(release.version)
                 }
                 Ok(Some(release)) => match install_to {
-                    Some(exe) => return start_install(cx, release, exe, manual, true),
+                    Some(dest) => return start_install(cx, release, dest, manual, true),
                     None => Status::Available(release),
                 },
             };
@@ -782,14 +1139,14 @@ pub fn install_now(cx: &mut App) {
     else {
         return;
     };
-    let Ok(exe) = u.install_path.clone() else {
+    let Ok(dest) = u.install_path.clone() else {
         return;
     };
     let release = release.clone();
-    start_install(cx, release, exe, true, false);
+    start_install(cx, release, dest, true, false);
 }
 
-fn start_install(cx: &mut App, release: Release, exe: PathBuf, manual: bool, checked: bool) {
+fn start_install(cx: &mut App, release: Release, dest: InstallTarget, manual: bool, checked: bool) {
     let Some(updates) = model(cx) else {
         return;
     };
@@ -806,7 +1163,7 @@ fn start_install(cx: &mut App, release: Release, exe: PathBuf, manual: bool, che
                     &Source::github(),
                     &release,
                     TARGET,
-                    &exe,
+                    &dest,
                     RELEASE_PUBLIC_KEYS,
                 )
             })
@@ -1272,7 +1629,8 @@ mod tests {
         let exe = bin.join("ani-gui");
         fs::write(&exe, ELF).unwrap();
 
-        assert_eq!(self_update_path(&exe, true), Err(NotEligible::DevBuild));
+        let target = |exe: &Path, dev| self_update_target(exe, dev, Layout::Prefix);
+        assert_eq!(target(&exe, true), Err(NotEligible::DevBuild));
         assert!(in_cargo_target(Path::new(
             "/src/ani-gui/target/release/ani-gui"
         )));
@@ -1286,20 +1644,20 @@ mod tests {
         assert!(!in_cargo_target(Path::new("/home/u/target/bin/ani-gui")));
 
         if euid() == 0 {
-            assert_eq!(self_update_path(&exe, false), Err(NotEligible::Root));
+            assert_eq!(target(&exe, false), Err(NotEligible::Root));
         } else {
-            assert_eq!(self_update_path(&exe, false), Ok(exe.clone()));
+            assert_eq!(target(&exe, false), Ok(InstallTarget::Binary(exe.clone())));
             fs::set_permissions(&bin, Permissions::from_mode(0o555)).unwrap();
-            assert_eq!(self_update_path(&exe, false), Err(NotEligible::NotWritable));
+            assert_eq!(target(&exe, false), Err(NotEligible::NotWritable));
             fs::set_permissions(&bin, Permissions::from_mode(0o755)).unwrap();
             // A root-owned system binary, e.g. /usr/bin/env.
             let system = Path::new("/usr/bin/env");
             if system.exists() {
-                assert!(self_update_path(system, false).is_err());
+                assert!(target(system, false).is_err());
             }
         }
         assert_eq!(
-            self_update_path(&dir.join("missing"), false).unwrap_err(),
+            target(&dir.join("missing"), false).unwrap_err(),
             if euid() == 0 {
                 NotEligible::Root
             } else {
@@ -1414,15 +1772,10 @@ mod tests {
         });
     }
 
-    /// A fake GitHub with release v99.0.0 signed by `key`; `archive_bytes`
-    /// replaces the served archive after signing when given.
+    /// A fake GitHub with release v99.0.0 for Linux, signed by `key`;
+    /// `served_archive` replaces the served archive after signing when given.
     fn fake_github(key: &SigningKey, served_archive: Option<Vec<u8>>) -> Source {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let prefix = format!("{base}/download/");
-        let version = "99.0.0";
-        let top = format!("ani-gui-{version}-{T}");
-        let name = format!("{top}.tar.gz");
+        let top = format!("ani-gui-99.0.0-{T}");
         let archive = tarball(&[
             (
                 &format!("{top}/share/applications/io.github.sweettooth05.AniGui.desktop"),
@@ -1430,6 +1783,22 @@ mod tests {
             ),
             (&format!("{top}/bin/ani-gui"), ELF),
         ]);
+        fake_github_with(key, T, archive, served_archive)
+    }
+
+    /// A fake GitHub with release v99.0.0 whose `target` archive is
+    /// `archive`, signed by `key`.
+    fn fake_github_with(
+        key: &SigningKey,
+        target: &str,
+        archive: Vec<u8>,
+        served_archive: Option<Vec<u8>>,
+    ) -> Source {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let prefix = format!("{base}/download/");
+        let version = "99.0.0";
+        let name = format!("ani-gui-{version}-{target}.tar.gz");
         let sums = format!("{}  {name}\n", sha256(&archive));
         let sig = key.sign(sums.as_bytes()).to_bytes().to_vec();
         let url = |n: &str| format!("{prefix}v{version}/{n}");
@@ -1475,11 +1844,19 @@ mod tests {
 
         // The wrong key refuses the release and keeps the binary.
         let other = test_key(1).verifying_key().to_bytes();
-        let err = install(&source, &release, T, &exe, &[other]).unwrap_err();
+        let dest = InstallTarget::Binary(exe.clone());
+        let err = install(&source, &release, T, &dest, &[other]).unwrap_err();
         assert!(format!("{err:#}").contains("isn't signed"), "{err:#}");
         assert_eq!(fs::read(&exe).unwrap(), before);
 
-        install(&source, &release, T, &exe, &[public]).unwrap();
+        install(
+            &source,
+            &release,
+            T,
+            &InstallTarget::Binary(exe.clone()),
+            &[public],
+        )
+        .unwrap();
         assert_eq!(fs::read(&exe).unwrap(), ELF);
         assert_eq!(fs::metadata(&exe).unwrap().mode() & 0o777, 0o755);
         assert!(leftovers(&dir).is_empty());
@@ -1502,7 +1879,7 @@ mod tests {
             &source,
             &release,
             T,
-            &exe,
+            &InstallTarget::Binary(exe.clone()),
             &[key.verifying_key().to_bytes()],
         )
         .unwrap_err();
@@ -1564,13 +1941,433 @@ mod tests {
             https_only: false,
         };
         let dir = temp_dir("dist");
-        let exe = dir.join("ani-gui");
-        fs::write(&exe, b"\x7fELF old").unwrap();
+        let (dest, exe, magic) = match LAYOUT {
+            Layout::Prefix => {
+                let exe = dir.join("ani-gui");
+                fs::write(&exe, b"\x7fELF old").unwrap();
+                (InstallTarget::Binary(exe.clone()), exe, &b"\x7fELF"[..])
+            }
+            Layout::AppBundle => {
+                let app = dir.join(BUNDLE);
+                let exe = fake_bundle(&app, MACHO);
+                (InstallTarget::Bundle(app), exe, &MACHO[..4])
+            }
+        };
         let release = latest_newer(&source, v("0.0.1")).unwrap().unwrap();
-        install(&source, &release, TARGET, &exe, RELEASE_PUBLIC_KEYS).unwrap();
+        install(&source, &release, TARGET, &dest, RELEASE_PUBLIC_KEYS).unwrap();
         let installed = fs::read(&exe).unwrap();
-        assert_eq!(&installed[..4], b"\x7fELF");
+        assert_eq!(&installed[..4], magic);
         assert!(installed.len() > 1 << 20);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // macOS app bundles. Everything here is plain file-system work, so it runs
+    // on every platform.
+
+    const MAC: &str = "aarch64-apple-darwin";
+    const MACHO: &[u8] = b"\xcf\xfa\xed\xfe new ani-gui";
+    const PLIST: &[u8] = b"<?xml version=\"1.0\"?><plist version=\"1.0\"><dict/></plist>";
+
+    /// One entry of a test bundle archive.
+    enum E<'a> {
+        Dir(&'a str),
+        File(&'a str, &'a [u8], u32),
+        Link(&'a str, &'a str),
+    }
+
+    /// A gzipped tar of `entries`, written raw so hostile names survive.
+    fn bundle_tarball(entries: &[E]) -> Vec<u8> {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut tar = tar::Builder::new(gz);
+        for entry in entries {
+            let mut header = tar::Header::new_old();
+            let (name, kind, data, mode): (&str, _, &[u8], u32) = match entry {
+                E::Dir(name) => (name, tar::EntryType::Directory, b"", 0o755),
+                E::File(name, data, mode) => (name, tar::EntryType::Regular, data, *mode),
+                E::Link(name, target) => {
+                    header.set_link_name(target).unwrap();
+                    (name, tar::EntryType::Symlink, b"", 0o777)
+                }
+            };
+            let raw = &mut header.as_old_mut().name;
+            raw[..name.len()].copy_from_slice(name.as_bytes());
+            header.set_size(data.len() as u64);
+            header.set_mode(mode);
+            header.set_entry_type(kind);
+            header.set_cksum();
+            tar.append(&header, data).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap()
+    }
+
+    /// The entries of a well-formed `ani-gui.app` whose binary is `exe`.
+    fn good_bundle(exe: &[u8]) -> Vec<u8> {
+        bundle_tarball(&[
+            E::Dir("ani-gui.app/"),
+            E::Dir("ani-gui.app/Contents/"),
+            E::File("ani-gui.app/Contents/Info.plist", PLIST, 0o644),
+            E::Dir("ani-gui.app/Contents/MacOS/"),
+            E::File("ani-gui.app/Contents/MacOS/ani-gui", exe, 0o755),
+            E::File(
+                "ani-gui.app/Contents/Resources/AppIcon.icns",
+                b"icns",
+                0o644,
+            ),
+            E::Link("ani-gui.app/Contents/Current", "MacOS"),
+            E::Link(
+                "ani-gui.app/Contents/Resources/Icon",
+                "../Resources/AppIcon.icns",
+            ),
+        ])
+    }
+
+    /// Creates an installed-looking bundle at `app`; returns its binary.
+    fn fake_bundle(app: &Path, exe_bytes: &[u8]) -> PathBuf {
+        let macos = app.join("Contents/MacOS");
+        fs::create_dir_all(&macos).unwrap();
+        fs::write(app.join("Contents/Info.plist"), PLIST).unwrap();
+        let exe = macos.join("ani-gui");
+        fs::write(&exe, exe_bytes).unwrap();
+        fs::set_permissions(&exe, Permissions::from_mode(0o755)).unwrap();
+        exe
+    }
+
+    fn extract_to(archive: &[u8], dir: &Path) -> Result<PathBuf> {
+        let dest = dir.join("out");
+        let _ = fs::remove_dir_all(&dest);
+        fs::create_dir(&dest).unwrap();
+        extract_bundle(archive, BUNDLE, &dest, 1 << 20)?;
+        check_bundle(&dest)?;
+        Ok(dest)
+    }
+
+    #[test]
+    fn app_bundle_is_found_from_its_executable() {
+        let app = |p: &str| app_bundle_of(Path::new(p));
+        assert_eq!(
+            app("/Applications/ani-gui.app/Contents/MacOS/ani-gui"),
+            Some(PathBuf::from("/Applications/ani-gui.app"))
+        );
+        // A renamed bundle still counts.
+        assert_eq!(
+            app("/Users/u/Applications/ani-gui 2.app/Contents/MacOS/ani-gui"),
+            Some(PathBuf::from("/Users/u/Applications/ani-gui 2.app"))
+        );
+        for not in [
+            "/usr/local/bin/ani-gui",
+            "/Applications/ani-gui.app/Contents/MacOS/other",
+            "/Applications/ani-gui.app/Contents/Resources/ani-gui",
+            "/Applications/ani-gui/Contents/MacOS/ani-gui",
+            "/Applications/.app/Contents/MacOS/ani-gui",
+            "Contents/MacOS/ani-gui",
+            "ani-gui",
+        ] {
+            assert_eq!(app(not), None, "{not}");
+        }
+    }
+
+    #[test]
+    fn bundle_installs_are_eligible_only_inside_a_writable_bundle() {
+        let dir = temp_dir("bundle-eligible");
+        let apps = dir.join("Applications");
+        let app = apps.join(BUNDLE);
+        let exe = fake_bundle(&app, MACHO);
+        let target = |exe: &Path, dev| self_update_target(exe, dev, Layout::AppBundle);
+
+        assert_eq!(target(&exe, true), Err(NotEligible::DevBuild));
+        if euid() == 0 {
+            assert_eq!(target(&exe, false), Err(NotEligible::Root));
+            fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        let real_app = fs::canonicalize(&app).unwrap();
+        assert_eq!(
+            target(&exe, false),
+            Ok(InstallTarget::Bundle(real_app.clone()))
+        );
+        // Started through a symlink to the bundle: the real bundle is updated.
+        let link = dir.join("link.app");
+        std::os::unix::fs::symlink(&app, &link).unwrap();
+        assert_eq!(
+            target(&link.join("Contents/MacOS/ani-gui"), false),
+            Ok(InstallTarget::Bundle(real_app))
+        );
+        // A bare binary, or a binary that isn't the bundle's executable.
+        let bare = dir.join("ani-gui");
+        fs::write(&bare, MACHO).unwrap();
+        assert_eq!(target(&bare, false), Err(NotEligible::NotInBundle));
+        let other = app.join("Contents/MacOS/helper");
+        fs::write(&other, MACHO).unwrap();
+        assert_eq!(target(&other, false), Err(NotEligible::NotInBundle));
+        // A bundle in a folder the user can't write, like a locked /Applications.
+        fs::set_permissions(&apps, Permissions::from_mode(0o555)).unwrap();
+        assert_eq!(target(&exe, false), Err(NotEligible::NotWritable));
+        fs::set_permissions(&apps, Permissions::from_mode(0o755)).unwrap();
+        // The bare-binary layout still works the old way.
+        assert_eq!(
+            self_update_target(&bare, false, Layout::Prefix),
+            Ok(InstallTarget::Binary(bare.clone()))
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn bundle_extraction_keeps_the_tree_modes_and_inner_links() {
+        let dir = temp_dir("bundle-extract");
+        let out = extract_to(&good_bundle(MACHO), &dir).unwrap();
+        let exe = out.join("Contents/MacOS/ani-gui");
+        assert_eq!(fs::read(&exe).unwrap(), MACHO);
+        assert_eq!(fs::metadata(&exe).unwrap().mode() & 0o7777, 0o755);
+        let plist = out.join("Contents/Info.plist");
+        assert_eq!(fs::metadata(&plist).unwrap().mode() & 0o7777, 0o644);
+        // Parents an archive doesn't list are created.
+        assert!(out.join("Contents/Resources").is_dir());
+        assert_eq!(
+            fs::read_link(out.join("Contents/Current")).unwrap(),
+            PathBuf::from("MacOS")
+        );
+        assert_eq!(
+            fs::read(out.join("Contents/Resources/Icon")).unwrap(),
+            b"icns"
+        );
+        // A setuid bit in the archive is not kept.
+        let suid = bundle_tarball(&[
+            E::File("ani-gui.app/Contents/Info.plist", PLIST, 0o644),
+            E::File("ani-gui.app/Contents/MacOS/ani-gui", MACHO, 0o4755),
+        ]);
+        let out = extract_to(&suid, &dir).unwrap();
+        let mode = fs::metadata(out.join("Contents/MacOS/ani-gui"))
+            .unwrap()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o755);
+        // A folder entry whose parents aren't listed, then the same again.
+        let nested = bundle_tarball(&[
+            E::Dir("ani-gui.app/Contents/Frameworks/Lib/"),
+            E::Dir("ani-gui.app/Contents/Frameworks/Lib/"),
+            E::File("ani-gui.app/Contents/Info.plist", PLIST, 0o644),
+            E::File("ani-gui.app/Contents/MacOS/ani-gui", MACHO, 0o755),
+        ]);
+        let out = extract_to(&nested, &dir).unwrap();
+        assert!(out.join("Contents/Frameworks/Lib").is_dir());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn bundle_extraction_rejects_traversal_links_and_odd_entries() {
+        let dir = temp_dir("bundle-hostile");
+        let cases: Vec<(&str, Vec<E>)> = vec![
+            (
+                "unsafe path",
+                vec![E::File("ani-gui.app/../../evil", b"x", 0o644)],
+            ),
+            ("unsafe path", vec![E::File("/ani-gui.app/x", b"x", 0o644)]),
+            (
+                "besides ani-gui.app",
+                vec![E::File("other.app/Contents/MacOS/ani-gui", MACHO, 0o755)],
+            ),
+            (
+                "symlink out of the app",
+                vec![E::Link("ani-gui.app/Contents/escape", "/etc")],
+            ),
+            (
+                "symlink out of the app",
+                vec![E::Link("ani-gui.app/Contents/escape", "../../outside")],
+            ),
+            (
+                "writes through a symlink",
+                vec![
+                    E::Dir("ani-gui.app/Contents/"),
+                    E::Link("ani-gui.app/Contents/Inner", "MacOS"),
+                    E::File("ani-gui.app/Contents/Inner/ani-gui", MACHO, 0o755),
+                ],
+            ),
+            (
+                // Each link stays inside by name, but the system resolves
+                // `up` first, and `../..` from the bundle root leaves it.
+                "symlink out of it",
+                vec![
+                    E::Link("ani-gui.app/a/b/up", "../.."),
+                    E::Link("ani-gui.app/a/b/escape", "up/../../.."),
+                ],
+            ),
+            (
+                "dangling symlink",
+                vec![E::Link("ani-gui.app/Contents/nothing", "missing")],
+            ),
+            (
+                "repeats",
+                vec![
+                    E::File("ani-gui.app/Contents/Info.plist", PLIST, 0o644),
+                    E::File("ani-gui.app/Contents/Info.plist", PLIST, 0o644),
+                ],
+            ),
+            (
+                "writes through a symlink",
+                vec![
+                    E::Link("ani-gui.app/Contents/x", "MacOS"),
+                    E::Dir("ani-gui.app/Contents/x/"),
+                ],
+            ),
+            (
+                "creating",
+                vec![
+                    E::File("ani-gui.app/Contents/x", b"x", 0o644),
+                    E::Dir("ani-gui.app/Contents/x/"),
+                ],
+            ),
+            ("isn't a folder", vec![E::File("ani-gui.app", b"x", 0o644)]),
+            (
+                "isn't a regular file",
+                vec![E::Link(
+                    "ani-gui.app/Contents/MacOS/ani-gui",
+                    "../Info.plist",
+                )],
+            ),
+            (
+                "isn't a macOS executable",
+                vec![E::File(
+                    "ani-gui.app/Contents/MacOS/ani-gui",
+                    b"\x7fELF linux",
+                    0o755,
+                )],
+            ),
+            ("no Contents/MacOS/ani-gui", vec![]),
+        ];
+        for (want, mut entries) in cases {
+            let label: Vec<String> = entries
+                .iter()
+                .map(|e| match e {
+                    E::Dir(n) | E::File(n, ..) | E::Link(n, _) => n.to_string(),
+                })
+                .collect();
+            // The well-formed parts go after the hostile ones, so they don't
+            // mask what is being tested.
+            let has_exe = label.iter().any(|n| n.ends_with("MacOS/ani-gui"));
+            let has_plist = label.iter().any(|n| n.ends_with("Info.plist"));
+            if want != "no Contents/MacOS/ani-gui" && !has_exe {
+                entries.push(E::File("ani-gui.app/Contents/MacOS/ani-gui", MACHO, 0o755));
+            }
+            if !has_plist {
+                entries.push(E::File("ani-gui.app/Contents/Info.plist", PLIST, 0o644));
+            }
+            let err = extract_to(&bundle_tarball(&entries), &dir).unwrap_err();
+            let err = format!("{err:#}");
+            assert!(
+                err.contains(want),
+                "{label:?}: expected {want:?}, got {err}"
+            );
+        }
+
+        // A hard link, and a device node.
+        for kind in [tar::EntryType::Link, tar::EntryType::Char] {
+            let archive = raw_tarball("ani-gui.app/Contents/x", kind, b"");
+            let err = format!("{:#}", extract_to(&archive, &dir).unwrap_err());
+            assert!(err.contains("unsupported entry"), "{kind:?}: {err}");
+        }
+        // Too large in all.
+        let big = vec![0u8; 600 << 10];
+        let archive = bundle_tarball(&[
+            E::File("ani-gui.app/Contents/a", &big, 0o644),
+            E::File("ani-gui.app/Contents/b", &big, 0o644),
+        ]);
+        let err = format!("{:#}", extract_to(&archive, &dir).unwrap_err());
+        assert!(err.contains("too large"), "{err}");
+        // Nothing was ever written outside the extraction folder.
+        assert!(!dir.join("evil").exists());
+        assert!(!dir.join("outside").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn bundle_replace_swaps_atomically_and_failures_keep_the_old_app() {
+        let dir = temp_dir("bundle-replace");
+        let app = dir.join(BUNDLE);
+        let exe = fake_bundle(&app, b"\xcf\xfa\xed\xfe old");
+        // A running app keeps its open binary.
+        let mut running = File::open(&exe).unwrap();
+
+        replace_bundle(&good_bundle(MACHO)[..], &app).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), MACHO);
+        assert!(app.join("Contents/Resources/AppIcon.icns").is_file());
+        let mut old = Vec::new();
+        running.read_to_end(&mut old).unwrap();
+        assert_eq!(old, b"\xcf\xfa\xed\xfe old");
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+
+        // A Linux binary, a broken archive, a hostile one: refused, the
+        // installed app untouched, nothing left behind.
+        let linux = good_bundle(b"\x7fELF linux");
+        assert!(replace_bundle(&linux[..], &app).is_err());
+        let good = good_bundle(b"\xcf\xfa\xed\xfe newer");
+        assert!(replace_bundle(&good[..good.len() / 2], &app).is_err());
+        let hostile = bundle_tarball(&[E::Link("ani-gui.app/Contents/x", "/")]);
+        assert!(replace_bundle(&hostile[..], &app).is_err());
+        assert_eq!(fs::read(&exe).unwrap(), MACHO);
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn bundle_swap_rolls_back_when_the_new_app_cant_move_in() {
+        let dir = temp_dir("bundle-rollback");
+        let app = dir.join(BUNDLE);
+        let exe = fake_bundle(&app, b"\xcf\xfa\xed\xfe old");
+        let new = dir.join(".ani-gui-new-test");
+        fake_bundle(&new, MACHO);
+
+        // The second rename (new -> app) fails: the old app is put back.
+        let mut calls = 0;
+        let err = swap_bundle(&new, &app, |from, to| {
+            calls += 1;
+            if calls == 2 {
+                return Err(io::Error::other("disk full"));
+            }
+            fs::rename(from, to)
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("disk full"), "{err:#}");
+        assert_eq!(calls, 3);
+        assert_eq!(fs::read(&exe).unwrap(), b"\xcf\xfa\xed\xfe old");
+        assert!(new.is_dir());
+        // Moving the old app aside fails: nothing changes at all.
+        let err = swap_bundle(&new, &app, |_, _| Err(io::Error::other("busy"))).unwrap_err();
+        assert!(format!("{err:#}").contains("moving"), "{err:#}");
+        assert_eq!(fs::read(&exe).unwrap(), b"\xcf\xfa\xed\xfe old");
+        // Both fail: the error says where the old app is.
+        let mut calls = 0;
+        let err = swap_bundle(&new, &app, |from, to| {
+            calls += 1;
+            if calls == 1 {
+                fs::rename(from, to)
+            } else {
+                Err(io::Error::other("gone"))
+            }
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("it is at"), "{err:#}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The whole flow for a macOS bundle against a local server.
+    #[test]
+    fn end_to_end_update_replaces_an_app_bundle() {
+        let key = test_key(42);
+        let public = key.verifying_key().to_bytes();
+        let source = fake_github_with(&key, MAC, good_bundle(MACHO), None);
+        let dir = temp_dir("e2e-bundle");
+        let app = dir.join(BUNDLE);
+        let exe = fake_bundle(&app, b"\xcf\xfa\xed\xfe old");
+        let release = latest_newer(&source, v("1.0.0")).unwrap().unwrap();
+        let dest = InstallTarget::Bundle(app.clone());
+
+        let other = test_key(1).verifying_key().to_bytes();
+        assert!(install(&source, &release, MAC, &dest, &[other]).is_err());
+        assert_eq!(fs::read(&exe).unwrap(), b"\xcf\xfa\xed\xfe old");
+
+        install(&source, &release, MAC, &dest, &[public]).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), MACHO);
+        assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
         fs::remove_dir_all(&dir).unwrap();
     }
 }

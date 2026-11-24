@@ -65,6 +65,7 @@ name = "ani-gui"
 version = "1.0.0"
 dependencies = [
  "anyhow",
+ "core-foundation 0.10.0",
  "ed25519-dalek",
  "flate2",
  "futures",

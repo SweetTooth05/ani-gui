@@ -175,6 +175,97 @@ This removes the binary, the desktop entry and the icons. Your library and
 settings stay where they are (see below); delete those folders too for a
 clean slate.
 
+## macOS
+
+ani-gui also runs on macOS 11 or later, on Apple Silicon and Intel Macs. It
+comes as an `ani-gui.app` bundle.
+
+### Prerequisites
+
+Install the tools with [Homebrew](https://brew.sh):
+
+```sh
+brew install mpv ani-cli yt-dlp ffmpeg
+```
+
+`mpv` provides libmpv, which plays the video. ani-gui finds it in
+Homebrew's `/opt/homebrew/lib` (Apple Silicon) or `/usr/local/lib` (Intel).
+It also finds `ani-cli` and the other tools in Homebrew's `bin` folders, even
+when the app is started from Finder. **Settings → Diagnostics** shows what
+it found.
+
+### From a release
+
+Download `ani-gui-<version>-aarch64-apple-darwin.tar.gz` (Apple Silicon) or
+`...-x86_64-apple-darwin.tar.gz` (Intel) from the
+[latest release](https://github.com/SweetTooth05/ani-gui/releases/latest),
+then unpack it into an Applications folder:
+
+```sh
+mkdir -p ~/Applications
+tar -xzf ani-gui-*-apple-darwin.tar.gz -C ~/Applications
+```
+
+Use `/Applications` instead of `~/Applications` to install it for every user.
+
+### From source
+
+You need [rustup](https://rustup.rs) and the Xcode Command Line Tools
+(`xcode-select --install`). Then:
+
+```sh
+git clone https://github.com/SweetTooth05/ani-gui.git
+cd ani-gui
+make app
+cp -R target/release/ani-gui.app ~/Applications/
+```
+
+`make app` builds the release binary and wraps it in
+`target/release/ani-gui.app`, with its icon, signed ad hoc.
+
+### The first launch (Gatekeeper)
+
+The app is signed ad hoc, not with an Apple Developer ID, and it is not
+notarized by Apple. When you download it in a browser, macOS can block it the
+first time with a message that it "cannot be opened" or "cannot be
+verified". To allow it:
+
+- On macOS 14 and earlier, right-click `ani-gui.app` in Finder and choose
+  **Open**, then **Open** again.
+- On macOS 15 and later, try to open it once, then go to **System Settings →
+  Privacy & Security** and click **Open Anyway**.
+- On any version, you can instead remove the download quarantine flag in
+  Terminal:
+
+  ```sh
+  xattr -dr com.apple.quarantine ~/Applications/ani-gui.app
+  ```
+
+You only need to do this once. A copy you built yourself, or downloaded with
+`curl` rather than a browser, carries no quarantine flag and opens straight
+away.
+
+### Updates on macOS
+
+ani-gui updates the whole `ani-gui.app` bundle in place, with the same
+signature checks as on Linux. It needs to be able to write to the folder that
+holds the app:
+
+- In `~/Applications`, automatic updates work without an administrator
+  account.
+- In `/Applications`, they work only if your account can write there (on a
+  standard Mac, administrator accounts can). Otherwise ani-gui only tells you
+  when a new version is out.
+- An app started from the download folder before you move it (macOS then
+  runs it from a read-only copy) or from `target/release/` also only tells
+  you.
+
+On macOS, your library and settings live in
+`~/Library/Application Support/ani-gui/` and the cache in
+`~/Library/Caches/ani-gui/`. Downloads go to `~/Movies/ani-gui` by default.
+ani-cli's watch history is in the same place as on Linux. To uninstall, drag
+`ani-gui.app` to the Bin.
+
 ## Connecting MyAnimeList and AniList
 
 Connect either account, or both, in **Settings → Accounts**. ani-gui then:
@@ -245,7 +336,8 @@ list; your lists on MyAnimeList and AniList are untouched.
 | Downloaded episodes | `~/Videos/ani-gui` by default; change it in Settings |
 | Watch history shared with ani-cli | `~/.local/state/ani-cli/ani-hsts` (ani-cli's own file; `$ANI_CLI_HIST_DIR` and `$XDG_STATE_HOME` are honoured) |
 
-The cache is safe to delete at any time.
+The paths above are for Linux. For macOS, see [macOS](#macos). The cache is
+safe to delete at any time.
 
 ## Troubleshooting
 

@@ -14,7 +14,9 @@ use anyhow::Result;
 
 #[cfg(target_os = "linux")]
 use linux::Inhibitor;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+use macos::Inhibitor;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 use other::Inhibitor;
 
 /// The application name desktops show next to the inhibition.
@@ -371,10 +373,82 @@ mod linux {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+mod macos {
+    //! An IOKit power assertion that stops the display from sleeping (and
+    //! with it the screen saver and the lock). The assertion belongs to the
+    //! process, not the thread, and lasts until it is released.
+
+    use anyhow::{Result, bail};
+    use core_foundation::base::TCFType;
+    use core_foundation::string::{CFString, CFStringRef};
+
+    type IOPMAssertionID = u32;
+    type IOPMAssertionLevel = u32;
+    type IOReturn = i32;
+
+    /// `kIOPMAssertionLevelOn`.
+    const LEVEL_ON: IOPMAssertionLevel = 255;
+    /// `kIOReturnSuccess`.
+    const SUCCESS: IOReturn = 0;
+    /// The value of `kIOPMAssertionTypePreventUserIdleDisplaySleep`, a
+    /// `CFSTR` macro in IOPMLib.h rather than a linkable symbol.
+    const PREVENT_DISPLAY_SLEEP: &str = "PreventUserIdleDisplaySleep";
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOPMAssertionCreateWithName(
+            assertion_type: CFStringRef,
+            level: IOPMAssertionLevel,
+            name: CFStringRef,
+            id: *mut IOPMAssertionID,
+        ) -> IOReturn;
+        fn IOPMAssertionRelease(id: IOPMAssertionID) -> IOReturn;
+    }
+
+    /// Holds one assertion; dropping it releases the assertion.
+    pub struct Inhibitor {
+        id: IOPMAssertionID,
+    }
+
+    impl Inhibitor {
+        pub fn acquire(app: &str, reason: &str) -> Result<Inhibitor> {
+            let kind = CFString::from_static_string(PREVENT_DISPLAY_SLEEP);
+            // Shown by `pmset -g assertions`.
+            let name = CFString::new(&format!("{app}: {reason}"));
+            let mut id: IOPMAssertionID = 0;
+            // SAFETY: both strings are valid CFStrings that outlive the call
+            // (IOKit retains what it keeps), and `id` is a valid out pointer.
+            let rc = unsafe {
+                IOPMAssertionCreateWithName(
+                    kind.as_concrete_TypeRef(),
+                    LEVEL_ON,
+                    name.as_concrete_TypeRef(),
+                    &mut id,
+                )
+            };
+            if rc != SUCCESS {
+                bail!("IOPMAssertionCreateWithName failed: {rc:#x}");
+            }
+            Ok(Inhibitor { id })
+        }
+    }
+
+    impl Drop for Inhibitor {
+        fn drop(&mut self) {
+            // SAFETY: `id` came from a successful IOPMAssertionCreateWithName
+            // and is released exactly once, here.
+            let rc = unsafe { IOPMAssertionRelease(self.id) };
+            if rc != SUCCESS {
+                eprintln!("ani-gui: keep awake: IOPMAssertionRelease failed: {rc:#x}");
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod other {
-    //! No inhibition yet on this platform (macOS will use IOKit power
-    //! assertions); the guard does nothing.
+    //! No inhibition on this platform; the guard does nothing.
 
     use anyhow::Result;
 

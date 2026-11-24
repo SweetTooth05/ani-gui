@@ -57,17 +57,16 @@ jobs:
           # also runs on older distributions.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
-          # macOS goes here. Add entries such as
-          #   - target: aarch64-apple-darwin
-          #     os: macos-14
-          #   - target: x86_64-apple-darwin
-          #     os: macos-13
-          # then guard the Linux-only steps below with
-          # `if: runner.os == 'Linux'` and add a macOS packaging step that
-          # writes dist/ani-gui-<version>-<target>.tar.gz. The archive name
-          # must carry the target triple: the updater picks its asset by
-          # `ani-gui-<version>-<target>.tar.gz`, and the release job signs
-          # every dist/*.tar.gz it receives.
+          # macOS: each built and tested natively. macos-13, the last Intel
+          # image of its generation, was retired; macos-15-intel replaces it.
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          # Every entry writes dist/ani-gui-<version>-<target>.tar.gz. The
+          # archive name must carry the target triple: the updater picks its
+          # asset by it, and the release job signs every dist/*.tar.gz it
+          # receives.
     env:
       TARGET: ${{ matrix.target }}
       VERSION: ${{ needs.version.outputs.version }}
@@ -94,6 +93,11 @@ jobs:
           rustup toolchain install stable --profile minimal --target "$TARGET"
           rustup default stable
 
+      # Matches LSMinimumSystemVersion in packaging/macos/Info.plist.
+      - name: Set the macOS deployment target
+        if: runner.os == 'macOS'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+
       - name: Test
         run: cargo test --locked
 
@@ -116,6 +120,37 @@ jobs:
           tar --sort=name --owner=0 --group=0 --numeric-owner \
             -czf "dist/$stem.tar.gz" -C "$stage" "$stem"
           tar -tzvf "dist/$stem.tar.gz"
+
+      # ani-gui.app at the top of the archive, so
+      # `tar -xzf ... -C ~/Applications` installs it. The updater expects
+      # exactly this layout.
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          stem="ani-gui-${VERSION}-${TARGET}"
+          stage="$RUNNER_TEMP/stage"
+          mkdir -p "$stage"
+          make app BIN="target/$TARGET/release/ani-gui" APP_DIR="$stage"
+          app="$stage/ani-gui.app"
+          case "$TARGET" in
+            aarch64-*) arch=arm64 ;;
+            x86_64-*) arch=x86_64 ;;
+          esac
+          test "$(lipo -archs "$app/Contents/MacOS/ani-gui")" = "$arch"
+          codesign --verify --strict --verbose=2 "$app"
+          mkdir -p dist
+          # No AppleDouble (._*) files or extended attributes in the archive.
+          COPYFILE_DISABLE=1 tar --no-xattrs -czf "dist/$stem.tar.gz" -C "$stage" ani-gui.app
+          tar -tzvf "dist/$stem.tar.gz"
+          if tar -tzf "dist/$stem.tar.gz" | grep -v '^ani-gui\.app/' | grep -q .; then
+            echo "::error::The archive has entries outside ani-gui.app/"
+            exit 1
+          fi
+          if tar -tzf "dist/$stem.tar.gz" | grep -q '/\._'; then
+            echo "::error::The archive has AppleDouble files"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

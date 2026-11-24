@@ -4,12 +4,13 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+
+use crate::opener;
 
 /// Fixed so the user can register the exact redirect URI with MAL.
 pub const REDIRECT_PORT: u16 = 53682;
@@ -270,24 +271,14 @@ const PAGE_INVALID: &str = "<!doctype html><meta charset=utf-8><title>ani-gui</t
     <h1>This sign-in link isn't valid</h1><p>Start again from ani-gui's Settings.</p>";
 const PAGE_NOT_FOUND: &str = "<!doctype html><meta charset=utf-8><title>Not found</title>";
 
-/// Opens an https URL with the platform's opener (`open` on macOS,
-/// `xdg-open` elsewhere), reaping it on a thread of its own.
+/// Opens an https URL with the platform's opener (see [`opener::open`]).
 pub fn open_browser(url: &str) -> Result<()> {
     if !url.starts_with("https://") {
         bail!("refusing to open a non-https URL");
     }
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let mut child = Command::new(opener)
-        .arg(url)
-        .spawn()
-        .with_context(|| format!("Couldn't run {opener} to open your browser"))?;
-    thread::Builder::new().name(opener.into()).spawn(move || {
-        let _ = child.wait();
-    })?;
+    // The browser's exit status means nothing here.
+    let _exited = opener::open(url.as_ref())
+        .with_context(|| format!("Couldn't run {} to open your browser", opener::PROGRAM))?;
     Ok(())
 }
 

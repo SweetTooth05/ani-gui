@@ -8,8 +8,6 @@ macro_rules! platforms {
             #[cfg(any($(target_os = $platform),*))]
             pub use self::$module::*;
 
-            #[cfg(any($(target_os = $platform),*))]
-            pub const ENOATTR: ::libc::c_int = ::libc::ENODATA; // ENOATTR == ENODATA on Linux; newer libc dropped the alias
         )*
 
         #[cfg(all(feature = "unsupported", not(any($($(target_os = $platform),*),*))))]
@@ -38,3 +36,11 @@ platforms! {
     "android"; "linux"; "macos" => linux_macos,
     "freebsd"; "netbsd" => bsd
 }
+
+// "No such attribute". Linux and Android report it as ENODATA (newer libc
+// dropped their ENOATTR alias); macOS and the BSDs have a real ENOATTR, which
+// differs from their ENODATA (macOS: ENOATTR 93, ENODATA 96).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const ENOATTR: ::libc::c_int = ::libc::ENODATA;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub const ENOATTR: ::libc::c_int = ::libc::ENOATTR;

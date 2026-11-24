@@ -12,6 +12,7 @@ mod keep_awake;
 mod lists;
 mod model;
 mod net;
+mod opener;
 mod paths;
 mod playback;
 mod player;

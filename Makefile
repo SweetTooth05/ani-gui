@@ -4,6 +4,7 @@
 #   make install                  install into ~/.local (no root needed)
 #   make install PREFIX=/usr/local
 #   make uninstall                remove exactly what install put there
+#   make app                      macOS: build target/release/ani-gui.app
 #
 # The release workflow stages its tarball with
 #   make install DESTDIR=<stage> PREFIX= DESKTOP_EXEC=ani-gui BIN=<binary>
@@ -28,7 +29,10 @@ ICONS := $(foreach s,$(ICON_SIZES),$(s)/apps/$(APP_ID).png) \
 	scalable/apps/$(APP_ID).svg \
 	symbolic/apps/$(APP_ID)-symbolic.svg
 
-.PHONY: all build install uninstall
+# Where `make app` writes ani-gui.app.
+APP_DIR ?= target/release
+
+.PHONY: all build install uninstall app
 
 all: build
 
@@ -56,6 +60,14 @@ install: $(BIN)
 		gtk-update-icon-cache -f -t $(ICONDIR) >/dev/null 2>&1 || true
 	-@[ -n "$(DESTDIR)" ] || ! command -v update-desktop-database >/dev/null 2>&1 || \
 		update-desktop-database $(APPSDIR) >/dev/null 2>&1 || true
+
+# macOS only. Builds the release binary first unless BIN names another one
+# (the release workflow passes its cross-target binary).
+app:
+ifeq ($(BIN),target/release/ani-gui)
+	cargo build --release
+endif
+	sh packaging/macos/build-app.sh "$(BIN)" "$(APP_DIR)"
 
 # The caches install refreshed are rebuilt for whatever other apps remain, or
 # removed when nothing else is left in that directory.

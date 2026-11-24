@@ -16,7 +16,21 @@ use std::{iter, ptr};
 use crate::model::Stream;
 use ffi::{Api, MpvEventEndFile, MpvEventProperty, MpvHandle, MpvRenderContext, MpvRenderParam};
 
-const LIBRARY: &str = "libmpv.so.2";
+/// libmpv's file names, tried in order. On macOS the bare names go through
+/// dyld's search path, which an app started from Finder doesn't extend with
+/// Homebrew's lib folders, so those are tried by full path too.
+const LIBRARIES: &[&str] = if cfg!(target_os = "macos") {
+    &[
+        "libmpv.2.dylib",
+        "/opt/homebrew/lib/libmpv.2.dylib",
+        "/usr/local/lib/libmpv.2.dylib",
+        "libmpv.dylib",
+        "/opt/homebrew/lib/libmpv.dylib",
+        "/usr/local/lib/libmpv.dylib",
+    ]
+} else {
+    &["libmpv.so.2"]
+};
 const HWDEC: &CStr = c"auto-copy";
 const DEFAULT_SIZE: (u32, u32) = (1280, 720);
 const MAX_SIDE: u32 = 16384;
@@ -207,9 +221,29 @@ unsafe extern "C" fn on_render_update(ctx: *mut c_void) {
 /// mpv. The library stays loaded: unloading it buys nothing and libmpv is
 /// not written to be unloaded.
 pub fn probe_library() -> Result<(), String> {
-    let api = Api::load(LIBRARY).map_err(|e| format!("{LIBRARY}: {e}"))?;
+    let api = load_api(LIBRARIES)?;
     std::mem::forget(api);
     Ok(())
+}
+
+/// The first of `names` that loads with every symbol. The error names the
+/// first failure (the most likely location) and counts the rest: dyld's
+/// messages list every path it tried, so all of them would be unreadable.
+fn load_api(names: &[&str]) -> Result<Api, String> {
+    let mut first = None;
+    for name in names {
+        match Api::load(name) {
+            Ok(api) => return Ok(api),
+            Err(e) => {
+                first.get_or_insert_with(|| format!("{name}: {e}"));
+            }
+        }
+    }
+    let first = first.unwrap_or_else(|| "no library name to load".into());
+    Err(match names.len() {
+        0 | 1 => first,
+        n => format!("{first} (and {} other locations)", n - 1),
+    })
 }
 
 pub struct MpvPlayer {
@@ -220,12 +254,11 @@ pub struct MpvPlayer {
 
 impl MpvPlayer {
     pub fn new() -> Result<MpvPlayer, PlayerError> {
-        MpvPlayer::with_library(LIBRARY, HWDEC)
+        MpvPlayer::with_library(LIBRARIES, HWDEC)
     }
 
-    fn with_library(name: &str, hwdec: &CStr) -> Result<MpvPlayer, PlayerError> {
-        let api =
-            Api::load(name).map_err(|e| PlayerError::LibraryMissing(format!("{name}: {e}")))?;
+    fn with_library(names: &[&str], hwdec: &CStr) -> Result<MpvPlayer, PlayerError> {
+        let api = load_api(names).map_err(PlayerError::LibraryMissing)?;
         // SAFETY: plain constructor.
         let mpv = unsafe { (api.create)() };
         if mpv.is_null() {
@@ -727,7 +760,7 @@ mod tests {
 
     /// Hardware decoding off keeps tests quiet and independent of the GPU.
     fn test_player() -> Option<MpvPlayer> {
-        match MpvPlayer::with_library(LIBRARY, c"no") {
+        match MpvPlayer::with_library(LIBRARIES, c"no") {
             Ok(p) => Some(p),
             Err(PlayerError::LibraryMissing(msg)) => {
                 eprintln!("skipping: libmpv not available: {msg}");
@@ -756,10 +789,29 @@ mod tests {
 
     #[test]
     fn load_library_missing_returns_error() {
-        match MpvPlayer::with_library("libdoes-not-exist.so", c"no") {
-            Err(PlayerError::LibraryMissing(msg)) => assert!(!msg.is_empty()),
+        match MpvPlayer::with_library(&["libdoes-not-exist.so"], c"no") {
+            Err(PlayerError::LibraryMissing(msg)) => {
+                assert!(msg.starts_with("libdoes-not-exist.so: "), "{msg}");
+            }
             Err(other) => panic!("expected LibraryMissing, got {other}"),
             Ok(_) => panic!("expected LibraryMissing, got a player"),
+        }
+    }
+
+    #[test]
+    fn every_library_name_is_tried_and_the_first_failure_reported() {
+        let Err(msg) = load_api(&["libnope-a.so", "/nonexistent/libnope-b.so", "libnope-c.so"])
+        else {
+            panic!("nothing should load");
+        };
+        assert!(msg.starts_with("libnope-a.so: "), "{msg}");
+        assert!(msg.ends_with(" (and 2 other locations)"), "{msg}");
+        assert!(load_api(&[]).is_err());
+        // The real candidates for this platform.
+        if cfg!(target_os = "macos") {
+            assert_eq!(LIBRARIES[0], "libmpv.2.dylib");
+        } else {
+            assert_eq!(LIBRARIES, ["libmpv.so.2"]);
         }
     }
 
