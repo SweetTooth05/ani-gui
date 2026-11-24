@@ -8,6 +8,7 @@ mod diagnostics;
 mod downloads;
 mod history;
 mod images;
+mod lists;
 mod model;
 mod net;
 mod paths;

@@ -8,8 +8,12 @@ license = "GPL-3.0-or-later"
 [dependencies]
 anyhow = "1.0.105"
 futures = "0.3.34"
+getrandom = "0.3.4"
 gpui = "0.2.2"
 image = { version = "0.25.10", default-features = false }
+# OS keychain for MyAnimeList/AniList tokens: Secret Service (pure-Rust zbus,
+# no libdbus needed) on Linux, Apple Keychain on macOS. No plaintext store.
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "async-secret-service", "async-io", "crypto-rust"] }
 libloading = "0.8.9"
 nix = { version = "0.31.4", features = ["fs", "process", "signal", "term"] }
 regex = "1.13.2"
