@@ -3,20 +3,24 @@ use gpui::{
     linear_color_stop, linear_gradient, prelude::*, px, relative,
 };
 
+use super::icon::icon;
 use super::image::rounded_image;
+use crate::ui::metadata::CardMeta;
 use crate::ui::theme;
 
 type OnClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 const RADIUS: f32 = 10.;
 
-/// Portrait cover with the title beneath.
+/// Portrait cover with the title beneath. With `meta`, a quiet score badge
+/// sits in the corner and hovering raises a scrim with the show's facts.
 #[derive(IntoElement)]
 pub struct PosterCard {
     id: ElementId,
     title: SharedString,
     subtitle: Option<SharedString>,
     cover_url: String,
+    meta: Option<CardMeta>,
     on_click: Option<OnClick>,
 }
 
@@ -30,6 +34,7 @@ pub fn poster_card(
         title: title.into(),
         subtitle: None,
         cover_url: cover_url.to_string(),
+        meta: None,
         on_click: None,
     }
 }
@@ -37,6 +42,12 @@ pub fn poster_card(
 impl PosterCard {
     pub fn subtitle(mut self, subtitle: impl Into<SharedString>) -> Self {
         self.subtitle = Some(subtitle.into());
+        self
+    }
+
+    /// Facts for the hover overlay; an empty `meta` adds nothing.
+    pub fn meta(mut self, meta: CardMeta) -> Self {
+        self.meta = (!meta.is_empty()).then_some(meta);
         self
     }
 
@@ -68,6 +79,13 @@ impl RenderOnce for PosterCard {
                         theme::night(),
                         None,
                     ))
+                    .children(self.meta.as_ref().map(info_overlay))
+                    .children(
+                        self.meta
+                            .as_ref()
+                            .and_then(|m| m.score.clone())
+                            .map(score_badge),
+                    )
                     .child(hover_ring("poster")),
             )
             .child(
@@ -203,6 +221,111 @@ impl RenderOnce for EpisodeCard {
             None => card,
         }
     }
+}
+
+/// The always-on score in the poster's top-left corner: small and glassy,
+/// so it reads over any art without competing with it.
+fn score_badge(score: String) -> gpui::Div {
+    div()
+        .absolute()
+        .top(px(8.))
+        .left(px(8.))
+        .flex()
+        .items_center()
+        .gap(px(4.))
+        .pl(px(6.))
+        .pr(px(7.))
+        .py(px(3.))
+        .rounded(px(6.))
+        .bg(theme::night_alpha(0.78))
+        .text_size(px(12.))
+        .line_height(px(14.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::text())
+        .child(icon("star").size(px(11.)).text_color(theme::accent()))
+        .child(score)
+}
+
+/// The hover reveal: a scrim rising from the poster's foot, carrying status,
+/// facts, genres and the start of the synopsis. Hidden until the card's
+/// group is hovered.
+fn info_overlay(meta: &CardMeta) -> gpui::Div {
+    let facts = meta.facts.join(" · ");
+    div()
+        .absolute()
+        .inset_0()
+        .rounded(px(RADIUS))
+        .overflow_hidden()
+        .opacity(0.)
+        .group_hover("poster", |s| s.opacity(1.))
+        .bg(linear_gradient(
+            0.,
+            linear_color_stop(theme::night_alpha(0.98), 0.),
+            linear_color_stop(theme::night_alpha(0.74), 0.7),
+        ))
+        .flex()
+        .flex_col()
+        .justify_end()
+        .gap(px(7.))
+        .px(px(12.))
+        .pt(px(36.))
+        .pb(px(12.))
+        .text_size(px(12.))
+        .line_height(relative(1.3))
+        .children(meta.status.clone().map(|status| {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(if meta.airing {
+                    theme::accent()
+                } else {
+                    theme::text()
+                })
+                .when(meta.airing, |s| {
+                    s.child(div().size(px(6.)).rounded_full().bg(theme::accent()))
+                })
+                .child(div().truncate().child(status))
+        }))
+        .when(!facts.is_empty(), |s| {
+            s.child(
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::text_dim())
+                    .truncate()
+                    .child(facts),
+            )
+        })
+        .when(!meta.genres.is_empty(), |s| {
+            s.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(4.))
+                    // One row: chips that don't fit are left out.
+                    .max_h(px(19.))
+                    .overflow_hidden()
+                    .children(meta.genres.iter().map(|g| {
+                        div()
+                            .px(px(6.))
+                            .py(px(2.))
+                            .rounded(px(4.))
+                            .bg(gpui::white().opacity(0.1))
+                            .text_size(px(11.))
+                            .text_color(theme::text_dim())
+                            .child(g.clone())
+                    })),
+            )
+        })
+        .children(meta.synopsis.clone().map(|s| {
+            div()
+                .text_size(px(11.5))
+                .line_height(relative(1.35))
+                .text_color(theme::text_dim())
+                .line_clamp(3)
+                .child(s)
+        }))
 }
 
 /// Accent outline over a card's art while `group` is hovered.

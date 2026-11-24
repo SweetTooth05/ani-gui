@@ -1,0 +1,54 @@
+{
+  "pagination": { "last_visible_page": 1, "has_next_page": false },
+  "data": [
+    {
+      "mal_id": 500002,
+      "url": "https://myanimelist.net/reviews.php?id=500002",
+      "type": "anime",
+      "reactions": { "overall": 640, "nice": 500, "love_it": 100, "funny": 0, "confusing": 0, "informative": 40, "well_written": 0, "creative": 0 },
+      "date": "2024-03-30T10:12:00+00:00",
+      "review": "The ending reveals who the real villain was.\r\nI did not expect it.",
+      "score": 7,
+      "tags": ["Mixed Feelings"],
+      "is_spoiler": true,
+      "is_preliminary": false,
+      "episodes_watched": null,
+      "user": { "url": "https://myanimelist.net/profile/kiri", "username": "kiri" }
+    },
+    {
+      "mal_id": 500001,
+      "url": "https://myanimelist.net/reviews.php?id=500001",
+      "type": "anime",
+      "reactions": { "overall": 1204, "nice": 1000, "love_it": 200, "funny": 4 },
+      "date": "2024-03-23T08:00:00+00:00",
+      "review": "Frieren is a quiet triumph.\n\nIt stays with you.",
+      "score": 10,
+      "tags": ["Recommended"],
+      "is_spoiler": false,
+      "is_preliminary": false,
+      "episodes_watched": null,
+      "user": { "url": "https://myanimelist.net/profile/Lenovo", "username": "Lenovo" }
+    },
+    {
+      "mal_id": 500003,
+      "url": "javascript:alert(1)",
+      "type": "anime",
+      "reactions": { "overall": 3 },
+      "review": "Fine.",
+      "score": 0,
+      "tags": [],
+      "is_spoiler": false,
+      "user": { "username": "Shiro" }
+    },
+    {
+      "mal_id": 500004,
+      "url": "https://myanimelist.net/reviews.php?id=500004",
+      "reactions": { "overall": 9999 },
+      "review": "  \n ",
+      "score": 9,
+      "tags": ["Recommended"],
+      "is_spoiler": false,
+      "user": { "username": "empty" }
+    }
+  ]
+}

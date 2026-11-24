@@ -694,6 +694,7 @@ mod tests {
                 episodes: Some(28),
                 next_airing: Some((5, 1_700_000_000)),
                 episode_thumbs: vec![("Episode 1".into(), "https://example.com/e1.jpg".into())],
+                ..Default::default()
             }),
             updated_at: 1_700_000_000,
         };

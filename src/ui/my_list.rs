@@ -9,10 +9,12 @@ use gpui::{
 };
 
 use crate::app::{AppState, Root, Route, ShowRef};
-use crate::db::Db;
+use crate::db::{self, Db};
 use crate::model::{Mode, ShowRecord};
+use crate::ui::calendar::local_offset;
 use crate::ui::components::button::{ButtonKind, button};
 use crate::ui::components::poster::poster_card;
+use crate::ui::metadata::CardMeta;
 use crate::ui::theme;
 use crate::ui::view_models::mode_label;
 
@@ -67,6 +69,8 @@ impl MyListPage {
     }
 
     fn render_body(&self, mode: Mode, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let now = db::now();
+        let tz = local_offset(now);
         match &self.state {
             State::Loading => div().into_any_element(),
             State::Failed(err) => div()
@@ -131,7 +135,12 @@ impl MyListPage {
                         anilist_id: show.anilist_id,
                         title: show.display_title().to_string(),
                     });
+                    let meta = match &record.media {
+                        Some(media) => CardMeta::from_media(media, now, tz),
+                        None => CardMeta::from_summary(show),
+                    };
                     poster_card(("my-list", i), show.display_title().to_string(), cover)
+                        .meta(meta)
                         .subtitle(episodes_label(
                             show.count(mode),
                             show.count(other(mode)),

@@ -12,13 +12,21 @@ const TTL_SECS: i64 = 6 * 60 * 60;
 const TRENDING_COUNT: usize = 20;
 const WEEK_SECS: i64 = 7 * 24 * 60 * 60;
 
+/// Bumped whenever the AniList queries ask for more fields. Old rows still
+/// decode (new fields default), so without a new key they would be served
+/// with those fields blank until they expire.
+const ANILIST_KEY: &str = "anilist:v2";
+
 pub fn trending(db: &Mutex<Db>) -> Vec<AniListMedia> {
-    cached(db, "anilist:trending", || anilist::trending(TRENDING_COUNT)).unwrap_or_default()
+    cached(db, &format!("{ANILIST_KEY}:trending"), || {
+        anilist::trending(TRENDING_COUNT)
+    })
+    .unwrap_or_default()
 }
 
 /// Airings from now until a week ahead (a stale cache may include past ones).
 pub fn schedule_week(db: &Mutex<Db>) -> Vec<Airing> {
-    cached(db, "anilist:schedule", || {
+    cached(db, &format!("{ANILIST_KEY}:schedule"), || {
         let now = db::now();
         anilist::schedule(now, now + WEEK_SECS)
     })
@@ -26,7 +34,28 @@ pub fn schedule_week(db: &Mutex<Db>) -> Vec<Airing> {
 }
 
 pub fn media(db: &Mutex<Db>, id: i64) -> Option<AniListMedia> {
-    cached(db, &format!("anilist:media:{id}"), || anilist::media(id))
+    cached(db, &format!("{ANILIST_KEY}:media:{id}"), || {
+        anilist::media(id)
+    })
+}
+
+/// Card data for `ids`, e.g. to dress AllAnime search results. Keyed by the
+/// sorted ids, so the same result set hits the cache in any order.
+pub fn cards(db: &Mutex<Db>, ids: &[i64]) -> Vec<AniListMedia> {
+    let mut ids: Vec<i64> = ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.truncate(50);
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let key: Vec<String> = ids.iter().map(i64::to_string).collect();
+    cached(
+        db,
+        &format!("{ANILIST_KEY}:cards:{}", key.join(",")),
+        || anilist::cards(&ids),
+    )
+    .unwrap_or_default()
 }
 
 pub fn for_you(db: &Mutex<Db>, seed_ids: &[i64]) -> Vec<AniListMedia> {
@@ -34,7 +63,7 @@ pub fn for_you(db: &Mutex<Db>, seed_ids: &[i64]) -> Vec<AniListMedia> {
         return Vec::new();
     }
     let ids: Vec<String> = seed_ids.iter().map(i64::to_string).collect();
-    cached(db, &format!("anilist:recs:{}", ids.join(",")), || {
+    cached(db, &format!("{ANILIST_KEY}:recs:{}", ids.join(",")), || {
         anilist::recommendations(seed_ids)
     })
     .unwrap_or_default()
@@ -95,6 +124,16 @@ where
     T: Serialize + DeserializeOwned,
     F: FnOnce() -> Result<T>,
 {
+    fetch_cached(db, key, ttl, fetch).ok()
+}
+
+/// `cached_or`, keeping the fetch error when there is no stale entry to
+/// fall back on.
+pub fn fetch_cached<T, F>(db: &Mutex<Db>, key: &str, ttl: i64, fetch: F) -> Result<T>
+where
+    T: Serialize + DeserializeOwned,
+    F: FnOnce() -> Result<T>,
+{
     let read = |json: Result<Option<String>>| {
         json.inspect_err(|err| eprintln!("ani-gui: reading cache {key}: {err:#}"))
             .ok()
@@ -106,7 +145,7 @@ where
             })
     };
     if let Some(value) = read(lock(db).cache_get(key, ttl)) {
-        return Some(value);
+        return Ok(value);
     }
     match fetch() {
         Ok(value) => {
@@ -116,11 +155,11 @@ where
             if let Err(err) = stored {
                 eprintln!("ani-gui: writing cache {key}: {err:#}");
             }
-            Some(value)
+            Ok(value)
         }
         Err(err) => {
             eprintln!("ani-gui: fetching {key}: {err:#}");
-            read(lock(db).cache_get_stale(key))
+            read(lock(db).cache_get_stale(key)).ok_or(err)
         }
     }
 }

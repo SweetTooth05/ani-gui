@@ -12,11 +12,13 @@ use serde::{Deserialize, Serialize};
 use crate::app::{AppState, PlayRequest, Root, Route, ShowRef};
 use crate::db::{self, Db, lock};
 use crate::model::{AniListMedia, Mode, Settings, ShowRecord, ShowSummary};
+use crate::ui::calendar::local_offset;
 use crate::ui::components::button::{ButtonKind, button};
 use crate::ui::components::image::{remote_image, shimmer};
 use crate::ui::components::poster::{episode_card, poster_card};
 use crate::ui::components::row::row;
 use crate::ui::components::toast;
+use crate::ui::metadata::CardMeta;
 use crate::ui::theme;
 use crate::ui::view_models::{
     self, Catalog, ContinueItem, HeroModel, HeroSource, format_label, media_title,
@@ -417,6 +419,8 @@ impl HomePage {
         scroll: &ScrollHandle,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let now = db::now();
+        let tz = local_offset(now);
         let cards = items.iter().enumerate().map(|(i, media)| {
             let route = Route::Show(ShowRef {
                 allanime: None,
@@ -424,6 +428,7 @@ impl HomePage {
                 title: media_title(media).to_string(),
             });
             let card = poster_card((id, i), media_title(media).to_string(), &media.cover_url)
+                .meta(CardMeta::from_media(media, now, tz))
                 .on_click(cx.listener(move |page, _, _, cx| page.navigate(route.clone(), cx)));
             match media.year {
                 Some(year) => card.subtitle(year.to_string()),

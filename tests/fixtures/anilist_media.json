@@ -23,6 +23,21 @@
       "status": "FINISHED",
       "episodes": 28,
       "nextAiringEpisode": null,
+      "idMal": 52991,
+      "meanScore": 90,
+      "popularity": 501920,
+      "favourites": 57272,
+      "season": "FALL",
+      "startDate": { "year": 2023, "month": 9, "day": 29 },
+      "endDate": { "year": 2024, "month": 3, "day": 22 },
+      "duration": 24,
+      "source": "MANGA",
+      "studios": { "nodes": [{ "name": "MADHOUSE" }] },
+      "rankings": [
+        { "rank": 1, "type": "RATED", "allTime": true, "season": null, "year": null, "context": "highest rated all time" },
+        { "rank": 50, "type": "POPULAR", "allTime": true, "season": null, "year": null, "context": "most popular all time" },
+        { "rank": 1, "type": "POPULAR", "allTime": false, "season": "FALL", "year": 2023, "context": "most popular" }
+      ],
       "streamingEpisodes": [
         {
           "title": "Episode 1 - The Journey's End",

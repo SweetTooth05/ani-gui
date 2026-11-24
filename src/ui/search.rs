@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui::{
@@ -5,13 +6,16 @@ use gpui::{
     WeakEntity, Window, div, prelude::*, px,
 };
 
-use crate::allanime;
 use crate::app::{AppState, Root, Route, ShowRef};
-use crate::model::{Mode, ShowSummary};
+use crate::db;
+use crate::model::{AniListMedia, Mode, ShowSummary};
+use crate::ui::calendar::local_offset;
 use crate::ui::components::button::segmented;
 use crate::ui::components::poster::poster_card;
 use crate::ui::components::text_input::{Changed, TextInput};
+use crate::ui::metadata::CardMeta;
 use crate::ui::theme;
+use crate::{allanime, catalog};
 
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
@@ -29,8 +33,12 @@ pub struct SearchPage {
     /// The query `results` are for.
     query: String,
     results: Vec<ShowSummary>,
+    /// AniList card data for `results` that carry an AniList id, fetched
+    /// after them so results appear without waiting on AniList.
+    media: HashMap<i64, AniListMedia>,
     state: State,
     pending: Option<Task<()>>,
+    enrich: Option<Task<()>>,
     focus_next_render: bool,
     scroll: ScrollHandle,
     _changes: Subscription,
@@ -51,8 +59,10 @@ impl SearchPage {
             mode,
             query: String::new(),
             results: Vec::new(),
+            media: HashMap::new(),
             state: State::Idle,
             pending: None,
+            enrich: None,
             focus_next_render: true,
             scroll: ScrollHandle::new(),
             _changes: changes,
@@ -101,6 +111,7 @@ impl SearchPage {
                     Ok(results) => {
                         page.results = results;
                         page.state = State::Done;
+                        page.enrich(cx);
                     }
                     Err(err) => {
                         page.results.clear();
@@ -108,6 +119,33 @@ impl SearchPage {
                     }
                 }
                 page.scroll.set_offset(gpui::point(px(0.), px(0.)));
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Fetches AniList card data for the results in the background.
+    fn enrich(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<i64> = self
+            .results
+            .iter()
+            .filter_map(|s| s.anilist_id)
+            .filter(|id| !self.media.contains_key(id))
+            .collect();
+        let Some(db) = cx.try_global::<AppState>().map(|s| s.db.clone()) else {
+            return;
+        };
+        if ids.is_empty() {
+            return;
+        }
+        self.enrich = Some(cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_spawn(async move { catalog::cards(&db, &ids) })
+                .await;
+            this.update(cx, |page, cx| {
+                page.enrich = None;
+                page.media.extend(found.into_iter().map(|m| (m.id, m)));
                 cx.notify();
             })
             .ok();
@@ -152,14 +190,22 @@ impl Render for SearchPage {
         }
         let mode = self.mode;
         let failed = matches!(self.state, State::Failed(_));
+        let now = db::now();
+        let tz = local_offset(now);
         let cards = self.results.iter().enumerate().map(|(i, show)| {
             let target = show.clone();
             let count = show.count(mode);
+            let media = show.anilist_id.and_then(|id| self.media.get(&id));
+            let meta = match media {
+                Some(media) => CardMeta::from_media(media, now, tz),
+                None => CardMeta::from_summary(show),
+            };
             poster_card(
                 ("result", i),
                 show.display_title().to_string(),
                 &show.cover_url,
             )
+            .meta(meta)
             .subtitle(if count == 1 {
                 "1 episode".to_string()
             } else {

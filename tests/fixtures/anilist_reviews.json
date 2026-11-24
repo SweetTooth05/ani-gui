@@ -1,0 +1,46 @@
+{
+  "data": {
+    "Media": {
+      "reviews": {
+        "nodes": [
+          {
+            "summary": "Fascinating, fulfilling, and full of feelings.",
+            "body": ">#####___This review is spoiler-free.___\n\n~~~<p align=\"justify\"><h1>**〈 A journey is not about the destination... 〉**</h1></p>~~~\n\n<hr><p align=\"justify\">Have you ever felt you're way too cautious when it comes to interacting with art? **I've been there and done that, and one of the best examples is _Frieren_.**</p>\n\n~~~img220(https://media.tenor.com/example.gif)~~~",
+            "score": 100,
+            "rating": 336,
+            "ratingAmount": 385,
+            "siteUrl": "https://anilist.co/review/24476",
+            "user": { "name": "befalt" }
+          },
+          {
+            "summary": "At its best, Frieren can be compassionate and contemplative.",
+            "body": "# ~~~__\"It would be embarrassing when we met again.\"__~~~\n\nThe pacing drags in the exam arc. ~!Himmel's statue scene.!~ Still, the ending lands.",
+            "score": 65,
+            "rating": 140,
+            "ratingAmount": 354,
+            "siteUrl": "https://evil.example/review/1",
+            "user": { "name": "chain" }
+          },
+          {
+            "summary": null,
+            "body": "Short and sweet.",
+            "score": 90,
+            "rating": null,
+            "ratingAmount": null,
+            "siteUrl": null,
+            "user": null
+          },
+          {
+            "summary": "Only an image",
+            "body": "img(https://x.example/a.png)",
+            "score": 50,
+            "rating": 1,
+            "ratingAmount": 1,
+            "siteUrl": "https://anilist.co/review/1",
+            "user": { "name": "pics" }
+          }
+        ]
+      }
+    }
+  }
+}

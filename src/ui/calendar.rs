@@ -10,7 +10,9 @@ use gpui::{
 use crate::app::{AppState, Root, Route, ShowRef};
 use crate::model::Airing;
 use crate::ui::components::button::{ButtonKind, button};
+use crate::ui::components::icon::icon;
 use crate::ui::components::image::rounded_image;
+use crate::ui::metadata::score_label;
 use crate::ui::theme;
 use crate::ui::view_models::{format_label, media_title};
 use crate::{catalog, db};
@@ -303,6 +305,14 @@ impl CalendarPage {
                             .text_size(px(theme::SMALL))
                             .text_color(theme::text_dim())
                             .child(episode)
+                            .children(media.score.and_then(score_label).map(|score| {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .child(icon("star").size(px(12.)).text_color(theme::accent()))
+                                    .child(score)
+                            }))
                             .children(media.format.as_deref().map(format_label))
                             .children(
                                 media.genres.iter().take(2).map(|g| {
@@ -445,7 +455,7 @@ fn until_label(secs: i64) -> String {
 }
 
 /// Seconds the local time zone is east of UTC at `ts`.
-fn local_offset(ts: i64) -> i64 {
+pub fn local_offset(ts: i64) -> i64 {
     let t: nix::libc::time_t = ts;
     // SAFETY: `tm` is plain data that localtime_r fills; both pointers are
     // valid for the call.
