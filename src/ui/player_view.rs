@@ -13,9 +13,9 @@ use futures::channel::mpsc::{self, UnboundedSender};
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, Context, CursorStyle, Div, ElementId,
     FocusHandle, FontWeight, Hsla, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    NavigationDirection, ObjectFit, PathBuilder, Pixels, RenderImage, SharedString, Stateful, Task,
-    WeakEntity, Window, actions, canvas, div, ease_in_out, img, linear_color_stop, linear_gradient,
-    point, prelude::*, px, relative,
+    NavigationDirection, ObjectFit, Pixels, RenderImage, ScrollStrategy, SharedString, Task,
+    UniformListScrollHandle, WeakEntity, Window, actions, canvas, deferred, div, ease_in_out, img,
+    linear_color_stop, linear_gradient, prelude::*, px, relative, uniform_list,
 };
 use image::RgbaImage;
 
@@ -23,10 +23,14 @@ use crate::anicli::{ResolveOutcome, ResolveScope};
 use crate::app::{AppState, Back, PlayRequest, Root};
 use crate::db::{self, Db};
 use crate::downloads::DownloadManager;
+use crate::keep_awake::KeepAwake;
 use crate::model::{DownloadRecord, Progress, Stream};
 use crate::playback;
 use crate::player::{MpvPlayer, PlaybackState, PlayerError};
 use crate::ui::components::button::{ButtonKind, button};
+use crate::ui::components::hud::{
+    self, HudButtonKind, divider, glass_pill, hud_button, skip_button, volume_icon,
+};
 use crate::ui::components::pick_dialog::pick_dialog;
 use crate::ui::theme;
 use crate::ui::view_models::mode_label;
@@ -42,6 +46,7 @@ actions!(
         VolumeUp,
         VolumeDown,
         NextEpisode,
+        PreviousEpisode,
         ToggleMute
     ]
 );
@@ -55,6 +60,11 @@ const SEEK_STEP: f64 = 10.0;
 const SKIP_INTRO: f64 = 85.0;
 const VOLUME_STEP: f64 = 5.0;
 const MAX_VOLUME: f64 = 100.0;
+/// Episode picker grid: columns, and rows visible before it scrolls.
+const EPISODE_COLUMNS: usize = 5;
+const EPISODE_ROWS_SHOWN: usize = 7;
+/// How long the controls take to fade in.
+const FADE_IN: Duration = Duration::from_millis(140);
 const LIBMPV_MISSING: &str = "Install libmpv2 (sudo apt install libmpv2)";
 
 pub fn bind_keys(cx: &mut App) {
@@ -67,6 +77,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("up", VolumeUp, Some(CONTEXT)),
         KeyBinding::new("down", VolumeDown, Some(CONTEXT)),
         KeyBinding::new("n", NextEpisode, Some(CONTEXT)),
+        KeyBinding::new("p", PreviousEpisode, Some(CONTEXT)),
         KeyBinding::new("m", ToggleMute, Some(CONTEXT)),
     ]);
 }
@@ -116,6 +127,15 @@ pub struct PlayerView {
     pending_size: Option<(u32, u32)>,
     resize_task: Option<Task<()>>,
     controls: bool,
+    /// Counts the controls appearing, keying their fade-in.
+    shown: usize,
+    /// The pointer is over the bottom controls, which then stay up.
+    hud_hovered: bool,
+    /// The episode picker is open.
+    episodes_open: bool,
+    episode_scroll: UniformListScrollHandle,
+    /// Seek bar fraction under the pointer, for the time bubble.
+    seek_hover: Option<f64>,
     hide_at: Instant,
     hide_task: Option<Task<()>>,
     seek_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -130,6 +150,8 @@ pub struct PlayerView {
     /// Kills this view's ani-cli runs when it goes away.
     resolves: ResolveScope,
     leaving: bool,
+    /// Holds off screen blanking while video actually plays.
+    keep_awake: KeepAwake,
     _wake_task: Task<()>,
 }
 
@@ -182,6 +204,11 @@ impl PlayerView {
             pending_size: None,
             resize_task: None,
             controls: true,
+            shown: 0,
+            hud_hovered: false,
+            episodes_open: false,
+            episode_scroll: UniformListScrollHandle::new(),
+            seek_hover: None,
             hide_at: Instant::now(),
             hide_task: None,
             seek_bounds: Rc::default(),
@@ -193,6 +220,7 @@ impl PlayerView {
             resolve_task: None,
             resolves: ResolveScope::default(),
             leaving: false,
+            keep_awake: KeepAwake::default(),
             _wake_task: wake_task,
         };
         view.create_player(cx);
@@ -464,6 +492,10 @@ impl PlayerView {
         self.up_next = Some(UpNext { ep, _timer: timer });
     }
 
+    fn prev_ep(&self) -> Option<String> {
+        previous_episode(&self.req.episodes, &self.req.ep)
+    }
+
     fn play_next(&mut self, cx: &mut Context<Self>) {
         if self.leaving || !matches!(self.phase, Phase::Playing) {
             return;
@@ -471,6 +503,39 @@ impl PlayerView {
         if let Some(ep) = self.next_ep() {
             self.advance(ep, cx);
         }
+    }
+
+    fn play_previous(&mut self, cx: &mut Context<Self>) {
+        if self.leaving || !matches!(self.phase, Phase::Playing) {
+            return;
+        }
+        if let Some(ep) = self.prev_ep() {
+            self.advance(ep, cx);
+        }
+    }
+
+    fn toggle_episodes(&mut self, cx: &mut Context<Self>) {
+        self.episodes_open = !self.episodes_open && self.req.episodes.len() > 1;
+        if self.episodes_open
+            && let Some(i) = self.req.episodes.iter().position(|e| *e == self.req.ep)
+        {
+            self.episode_scroll
+                .scroll_to_item(i / EPISODE_COLUMNS, ScrollStrategy::Center);
+        }
+        self.poke(cx);
+        cx.notify();
+    }
+
+    /// Inhibits screen blanking exactly while video is playing: loaded,
+    /// started, not paused, not at the end, not failed or leaving.
+    fn sync_keep_awake(&mut self) {
+        let playing = !self.leaving
+            && matches!(self.phase, Phase::Playing)
+            && self.player.is_some()
+            && self.started
+            && !self.state.paused
+            && !self.state.eof;
+        self.keep_awake.set_active(playing);
     }
 
     /// Saves the current episode, then plays `ep` in the same quality: from
@@ -527,6 +592,7 @@ impl PlayerView {
         }
         self.leaving = true;
         self.up_next = None;
+        self.sync_keep_awake();
         if let Some(player) = &self.player {
             player.set_pause(true);
         }
@@ -545,6 +611,7 @@ impl PlayerView {
     /// tears the player down off the UI thread (mpv waits for its network
     /// threads).
     fn release(&mut self, cx: &mut App) {
+        self.keep_awake.set_active(false);
         if let Some(image) = self.image.take() {
             cx.defer(move |cx| cx.drop_image(image, None));
         }
@@ -616,7 +683,10 @@ impl PlayerView {
     }
 
     fn escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if window.is_fullscreen() {
+        if self.episodes_open {
+            self.episodes_open = false;
+            cx.notify();
+        } else if window.is_fullscreen() {
             window.toggle_fullscreen();
         } else {
             self.leave(cx);
@@ -635,6 +705,7 @@ impl PlayerView {
         self.hide_at = Instant::now() + HIDE_AFTER;
         if !self.controls {
             self.controls = true;
+            self.shown += 1;
             cx.notify();
         }
         if self.hide_task.is_some() {
@@ -668,6 +739,8 @@ impl PlayerView {
             && !self.state.paused
             && self.scrub.is_none()
             && !self.volume_drag
+            && !self.hud_hovered
+            && !self.episodes_open
     }
 
     fn seek_down(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
@@ -685,6 +758,13 @@ impl PlayerView {
 
     fn mouse_moved(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         self.poke(cx);
+        let bounds = self.seek_bounds.get();
+        let hover = (self.controls && bounds.contains(&event.position))
+            .then(|| fraction_at(bounds, event.position.x));
+        if hover != self.seek_hover {
+            self.seek_hover = hover;
+            cx.notify();
+        }
         let held = event.pressed_button == Some(MouseButton::Left);
         if self.scrub.is_some() {
             if held {
@@ -814,7 +894,15 @@ impl PlayerView {
                             .map(|image| img(image).size_full().object_fit(ObjectFit::Contain)),
                     )
                     .child(measure)
-                    .on_click(cx.listener(|view, _, _, cx| view.toggle_pause(cx))),
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        // A click beside the open picker only closes it.
+                        if view.episodes_open {
+                            view.episodes_open = false;
+                            cx.notify();
+                        } else {
+                            view.toggle_pause(cx);
+                        }
+                    })),
             )
             .children(waiting.map(|label| {
                 div()
@@ -834,8 +922,18 @@ impl PlayerView {
                     )
             }))
             .when(self.controls, |d| {
-                d.child(self.render_top_bar(cx))
-                    .child(self.render_bottom_bar(window, cx))
+                d.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .child(self.render_top_bar(cx))
+                        .child(self.render_bottom_bar(window, cx))
+                        .with_animation(
+                            ElementId::NamedInteger("player-controls".into(), self.shown as u64),
+                            Animation::new(FADE_IN),
+                            |d, t| d.opacity(t),
+                        ),
+                )
             })
             .children(
                 self.up_next
@@ -845,18 +943,20 @@ impl PlayerView {
             .into_any_element()
     }
 
-    fn render_title(&self) -> Div {
+    /// What is playing and where: the bottom-left of the controls.
+    fn render_title(&self, position: f64, duration: f64) -> Div {
         div()
             .flex()
             .flex_col()
-            .gap(px(4.))
+            .gap(px(3.))
             .min_w_0()
             .child(
                 div()
                     .font_family(theme::DISPLAY_FONT)
                     .font_weight(FontWeight::BOLD)
-                    .text_size(px(30.))
+                    .text_size(px(26.))
                     .line_height(relative(1.05))
+                    .text_color(hud::paper())
                     .truncate()
                     .child(self.req.show.display_title().to_string()),
             )
@@ -865,20 +965,29 @@ impl PlayerView {
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .text_size(px(theme::BODY))
+                    .text_size(px(theme::SMALL))
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::text_dim())
-                    .child(format!("Episode {}", self.req.ep))
+                    .text_color(hud::ash())
                     .child(
                         div()
-                            .px(px(8.))
-                            .py(px(1.))
+                            .text_color(hud::paper())
+                            .child(format!("Episode {}", self.req.ep)),
+                    )
+                    .child(
+                        div()
+                            .px(px(7.))
                             .rounded(px(5.))
                             .border_1()
-                            .border_color(gpui::white().opacity(0.24))
-                            .text_size(px(12.))
+                            .border_color(hud::hairline())
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
                             .child(mode_label(self.req.mode)),
-                    ),
+                    )
+                    .child(if duration > 0.0 {
+                        format!("{} / {}", clock(position), clock(duration))
+                    } else {
+                        clock(position)
+                    }),
             )
     }
 
@@ -888,23 +997,17 @@ impl PlayerView {
             .top_0()
             .left_0()
             .right_0()
+            .h(px(150.))
             .flex()
             .items_start()
-            .gap(px(18.))
             .px(px(28.))
             .pt(px(22.))
-            .pb(px(56.))
             .bg(linear_gradient(
                 180.,
-                linear_color_stop(shade(0.82), 0.),
+                linear_color_stop(shade(0.66), 0.),
                 linear_color_stop(shade(0.), 1.),
             ))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(
-                control("player-back", "‹ Back")
-                    .on_click(cx.listener(|view, _, window, cx| view.go_back(window, cx))),
-            )
-            .child(self.render_title())
+            .child(back_button(cx))
             .into_any_element()
     }
 
@@ -920,16 +1023,44 @@ impl PlayerView {
         } else {
             0.0
         };
-        let has_next = self.next_ep().is_some();
-        let muted = s.volume <= 0.0;
+        let next = self.next_ep();
+        let prev = self.prev_ep();
         let seek_bounds = self.seek_bounds.clone();
         let volume_bounds = self.volume_bounds.clone();
 
+        // The time under the pointer, floating over the seek bar.
+        let bubble = self
+            .scrub
+            .or(self.seek_hover)
+            .filter(|_| duration > 0.0)
+            .map(|f| {
+                div()
+                    .absolute()
+                    .bottom(px(24.))
+                    .left(relative(f as f32))
+                    .ml(px(-30.))
+                    .w(px(60.))
+                    .flex()
+                    .justify_center()
+                    .child(
+                        div()
+                            .px(px(8.))
+                            .py(px(3.))
+                            .rounded(px(6.))
+                            .bg(theme::night_alpha(0.94))
+                            .border_1()
+                            .border_color(hud::hairline())
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hud::paper())
+                            .child(clock(f * duration)),
+                    )
+            });
         let seek = div()
             .id("seek")
             .group("seek")
             .relative()
-            .flex_1()
+            .w_full()
             .h(px(22.))
             .flex()
             .items_center()
@@ -938,122 +1069,272 @@ impl PlayerView {
                 MouseButton::Left,
                 cx.listener(|view, e: &MouseDownEvent, _, cx| view.seek_down(e, cx)),
             )
-            .child(track(fraction, px(4.), Some("seek"), self.scrub.is_some()))
+            .child(hud::seek_track(fraction, "seek", self.scrub.is_some()))
+            .children(bubble)
             .child(record_bounds(seek_bounds));
+
         let volume = div()
             .id("volume")
             .group("volume")
             .relative()
-            .w(px(92.))
-            .h(px(22.))
+            .w(px(88.))
+            .h(px(36.))
             .flex()
             .items_center()
             .cursor_pointer()
+            .tooltip(|_, cx| hud::tooltip("Volume (↑ ↓)".into(), cx))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|view, e: &MouseDownEvent, _, cx| view.volume_down(e, cx)),
             )
-            .child(track(
+            .child(hud::volume_track(
                 (s.volume / MAX_VOLUME) as f32,
-                px(3.),
-                Some("volume"),
+                "volume",
                 self.volume_drag,
             ))
             .child(record_bounds(volume_bounds));
 
+        let transport = div()
+            .flex()
+            .items_center()
+            .gap(px(14.))
+            .child(
+                hud_button(
+                    "player-prev",
+                    "skip-back",
+                    match &prev {
+                        Some(ep) => format!("Episode {ep} (P)"),
+                        None => "No previous episode".into(),
+                    },
+                )
+                .kind(HudButtonKind::Glass)
+                .disabled(prev.is_none())
+                .on_click(cx.listener(|view, _, _, cx| view.play_previous(cx))),
+            )
+            .child(
+                skip_button("player-back-10", false, SEEK_STEP as u32, "Back 10 s (←)")
+                    .on_click(cx.listener(|view, _, _, cx| view.seek_by(-SEEK_STEP, cx))),
+            )
+            .child(
+                hud_button(
+                    "player-play",
+                    if s.paused { "play" } else { "pause" },
+                    if s.paused {
+                        "Play (Space)"
+                    } else {
+                        "Pause (Space)"
+                    },
+                )
+                .kind(HudButtonKind::Play)
+                .on_click(cx.listener(|view, _, _, cx| view.toggle_pause(cx))),
+            )
+            .child(
+                skip_button(
+                    "player-forward-10",
+                    true,
+                    SEEK_STEP as u32,
+                    "Forward 10 s (→)",
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.seek_by(SEEK_STEP, cx))),
+            )
+            .child(
+                hud_button(
+                    "player-next",
+                    "skip-forward",
+                    match &next {
+                        Some(ep) => format!("Episode {ep} (N)"),
+                        None => "No next episode".into(),
+                    },
+                )
+                .kind(HudButtonKind::Glass)
+                .disabled(next.is_none())
+                .on_click(cx.listener(|view, _, _, cx| view.play_next(cx))),
+            );
+
+        let fullscreen = window.is_fullscreen();
+        let has_episodes = self.req.episodes.len() > 1;
+        let utilities = div()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(2.))
+            .child(
+                hud_button(
+                    "player-mute",
+                    volume_icon(s.volume),
+                    if s.volume <= 0.0 {
+                        "Unmute (M)"
+                    } else {
+                        "Mute (M)"
+                    },
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.toggle_mute(cx))),
+            )
+            .child(volume)
+            .child(divider())
+            .child(
+                hud_button(
+                    "player-subs",
+                    if s.sub_visible {
+                        "captions"
+                    } else {
+                        "captions-off"
+                    },
+                    if s.sub_visible {
+                        "Hide subtitles"
+                    } else {
+                        "Show subtitles"
+                    },
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.toggle_subs(cx))),
+            )
+            .child(
+                div()
+                    .relative()
+                    .child(
+                        hud_button("player-episodes", "list-video", "Episodes")
+                            .disabled(!has_episodes)
+                            .active(self.episodes_open)
+                            .on_click(cx.listener(|view, _, _, cx| view.toggle_episodes(cx))),
+                    )
+                    .when(self.episodes_open && has_episodes, |d| {
+                        d.child(deferred(self.render_episodes(cx)).with_priority(1))
+                    }),
+            )
+            .child(
+                hud_button(
+                    "player-fullscreen",
+                    if fullscreen { "minimize" } else { "maximize" },
+                    if fullscreen {
+                        "Exit full screen (F)"
+                    } else {
+                        "Full screen (F)"
+                    },
+                )
+                .on_click(cx.listener(|view, _, window, cx| {
+                    window.toggle_fullscreen();
+                    view.poke(cx);
+                })),
+            );
+
         div()
+            .id("player-hud")
             .absolute()
             .bottom_0()
             .left_0()
             .right_0()
             .flex()
             .flex_col()
-            .gap(px(10.))
             .px(px(28.))
-            .pt(px(72.))
-            .pb(px(22.))
+            .pt(px(96.))
+            .pb(px(20.))
             .bg(linear_gradient(
                 0.,
                 linear_color_stop(shade(0.9), 0.),
                 linear_color_stop(shade(0.), 1.),
             ))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_hover(cx.listener(|view, hovered: &bool, _, cx| {
+                view.hud_hovered = *hovered;
+                if !*hovered {
+                    view.poke(cx);
+                }
+            }))
             .child(
+                div().flex().justify_end().pb(px(14.)).child(
+                    // Hidden, not removed, under the episode picker, so
+                    // the bar doesn't jump.
+                    glass_pill("player-skip-intro", "Skip intro")
+                        .when(self.episodes_open, |d| d.invisible())
+                        .tooltip(|_, cx| hud::tooltip("Jump ahead 1:25".into(), cx))
+                        .on_click(cx.listener(|view, _, _, cx| view.seek_by(SKIP_INTRO, cx))),
+                ),
+            )
+            .child(seek)
+            .child(
+                // Title at the start, the transport on the centre line,
+                // settings at the end.
                 div()
+                    .mt(px(10.))
                     .flex()
                     .items_center()
-                    .gap(px(16.))
-                    .text_size(px(theme::SMALL))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::text_dim())
-                    .child(div().min_w(px(52.)).child(clock(position)))
-                    .child(seek)
+                    .gap(px(24.))
                     .child(
                         div()
-                            .min_w(px(52.))
-                            .flex()
-                            .justify_end()
-                            .child(format!("−{}", clock(duration - position))),
-                    ),
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.render_title(position, duration)),
+                    )
+                    .child(transport)
+                    .child(div().flex_1().flex().justify_end().child(utilities)),
             )
+            .into_any_element()
+    }
+
+    /// The show's episodes as a grid of numbers; the current one in the
+    /// accent, any other a click away.
+    fn render_episodes(&self, cx: &mut Context<Self>) -> AnyElement {
+        let episodes = self.req.episodes.clone();
+        let rows = episodes.len().div_ceil(EPISODE_COLUMNS);
+        let current = self.req.ep.clone();
+        let list = uniform_list(
+            "player-episode-rows",
+            rows,
+            cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
+                let mut rows = Vec::with_capacity(range.len());
+                for row in range {
+                    let start = row * EPISODE_COLUMNS;
+                    let end = (start + EPISODE_COLUMNS).min(episodes.len());
+                    let mut line = div().flex().gap(px(6.)).pb(px(6.));
+                    for ep in &episodes[start..end] {
+                        line = line.child(episode_chip(ep, *ep == current, cx));
+                    }
+                    rows.push(line);
+                }
+                rows
+            }),
+        )
+        .track_scroll(self.episode_scroll.clone())
+        .h(px((rows.min(EPISODE_ROWS_SHOWN) * 42) as f32));
+        div()
+            .id("player-episodes-panel")
+            .absolute()
+            .bottom(px(54.))
+            .right(px(-60.))
+            .w(px(EPISODE_COLUMNS as f32 * 50. + 22.))
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .p(px(14.))
+            .pr(px(8.))
+            .rounded(px(14.))
+            .bg(theme::night_alpha(0.95))
+            .border_1()
+            .border_color(hud::hairline())
+            .shadow_lg()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .gap(px(6.))
-                    .child(play_button(s.paused, cx))
-                    .child(div().w(px(8.)))
+                    .items_baseline()
+                    .justify_between()
+                    .pr(px(6.))
                     .child(
-                        control("player-back-10", "−10 s")
-                            .on_click(cx.listener(|view, _, _, cx| view.seek_by(-SEEK_STEP, cx))),
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(hud::paper())
+                            .child("Episodes"),
                     )
                     .child(
-                        control("player-forward-10", "+10 s")
-                            .on_click(cx.listener(|view, _, _, cx| view.seek_by(SEEK_STEP, cx))),
-                    )
-                    .child(
-                        control("player-skip-intro", "Skip intro")
-                            .on_click(cx.listener(|view, _, _, cx| view.seek_by(SKIP_INTRO, cx))),
-                    )
-                    .child(div().flex_1())
-                    .child(if has_next {
-                        control("player-next", "Next episode")
-                            .on_click(cx.listener(|view, _, _, cx| view.play_next(cx)))
-                    } else {
-                        control_label("player-next", "Next episode").opacity(0.4)
-                    })
-                    .child(
-                        control(
-                            "player-subs",
-                            if s.sub_visible {
-                                "Hide subtitles"
-                            } else {
-                                "Show subtitles"
-                            },
-                        )
-                        .on_click(cx.listener(|view, _, _, cx| view.toggle_subs(cx))),
-                    )
-                    .child(
-                        control("player-mute", if muted { "Unmute" } else { "Mute" })
-                            .on_click(cx.listener(|view, _, _, cx| view.toggle_mute(cx))),
-                    )
-                    .child(volume)
-                    .child(div().w(px(6.)))
-                    .child(
-                        control(
-                            "player-fullscreen",
-                            if window.is_fullscreen() {
-                                "Exit full screen"
-                            } else {
-                                "Full screen"
-                            },
-                        )
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            window.toggle_fullscreen();
-                            view.poke(cx);
-                        })),
+                        div()
+                            .text_size(px(theme::SMALL))
+                            .text_color(hud::ash())
+                            .child(self.req.episodes.len().to_string()),
                     ),
             )
+            .child(list)
             .into_any_element()
     }
 
@@ -1170,10 +1451,11 @@ impl PlayerView {
                     }),
             )
             .child(
-                div().absolute().top(px(22.)).left(px(28.)).child(
-                    control("player-back", "‹ Back")
-                        .on_click(cx.listener(|view, _, window, cx| view.go_back(window, cx))),
-                ),
+                div()
+                    .absolute()
+                    .top(px(22.))
+                    .left(px(28.))
+                    .child(back_button(cx)),
             )
             .children(pick.map(|candidates| self.render_pick(candidates, cx)))
             .into_any_element()
@@ -1238,6 +1520,7 @@ impl Render for PlayerView {
             self.focused = true;
         }
         self.sync_frame(window);
+        self.sync_keep_awake();
         let body = match &self.phase {
             Phase::Playing => self.render_playing(window, cx),
             Phase::Resolving { pick } => self.render_resolving(pick.as_deref(), cx),
@@ -1271,6 +1554,7 @@ impl Render for PlayerView {
                 view.set_volume(view.state.volume - VOLUME_STEP, cx)
             }))
             .on_action(cx.listener(|view, _: &NextEpisode, _, cx| view.play_next(cx)))
+            .on_action(cx.listener(|view, _: &PreviousEpisode, _, cx| view.play_previous(cx)))
             .on_action(cx.listener(|view, _: &ToggleMute, _, cx| view.toggle_mute(cx)))
             .on_mouse_move(cx.listener(|view, e: &MouseMoveEvent, _, cx| view.mouse_moved(e, cx)))
             .on_mouse_up(
@@ -1301,6 +1585,25 @@ fn save_progress(db: &Mutex<Db>, progress: &Progress) {
     let db = db.lock().unwrap_or_else(PoisonError::into_inner);
     if let Err(err) = db.save_progress(progress) {
         eprintln!("ani-gui: saving progress: {err:#}");
+    }
+}
+
+/// The episode before `ep` in `episodes` (ascending), matching labels like
+/// `progress::next_after` does: exactly, else by number.
+fn previous_episode(episodes: &[String], ep: &str) -> Option<String> {
+    let num = |e: &str| e.parse::<f64>().ok().filter(|n| n.is_finite());
+    let target = num(ep);
+    let same = |e: &str| e == ep || (target.is_some() && num(e) == target);
+    match episodes.iter().position(|e| same(e)) {
+        Some(i) => i.checked_sub(1).and_then(|i| episodes.get(i)).cloned(),
+        None => {
+            let target = target?;
+            episodes
+                .iter()
+                .rev()
+                .find(|e| num(e).is_some_and(|n| n < target))
+                .cloned()
+        }
     }
 }
 
@@ -1339,112 +1642,45 @@ fn record_bounds(cell: Rc<Cell<Bounds<Pixels>>>) -> impl IntoElement {
         .inset_0()
 }
 
-/// A thin bar filled to `fraction` in the accent, thicker with a knob while
-/// its `group` is hovered or `active`.
-fn track(fraction: f32, height: Pixels, group: Option<&'static str>, active: bool) -> Div {
-    let fraction = fraction.clamp(0.0, 1.0);
-    let knob = div()
-        .absolute()
-        .top((height - px(12.)) / 2.)
-        .left(relative(fraction))
-        .ml(px(-6.))
-        .size(px(12.))
-        .rounded_full()
-        .bg(theme::accent());
-    let mut bar = div()
-        .relative()
-        .w_full()
-        .h(height)
-        .rounded(height)
-        .bg(gpui::white().opacity(0.22))
-        .child(
-            div()
-                .h_full()
-                .w(relative(fraction))
-                .rounded(height)
-                .bg(theme::accent()),
-        );
-    if active {
-        bar = bar.child(knob);
-    } else if let Some(group) = group {
-        bar = bar.child(knob.invisible().group_hover(group, |s| s.visible()));
-    }
-    bar
+/// The glass arrow that leaves the player.
+fn back_button(cx: &mut Context<PlayerView>) -> impl IntoElement {
+    hud_button("player-back", "arrow-left", "Back (Esc)")
+        .kind(HudButtonKind::Glass)
+        .on_click(cx.listener(|view, _, window, cx| view.go_back(window, cx)))
 }
 
-/// A text control on the video.
-fn control(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
-    control_label(id, label)
-        .cursor_pointer()
-        .hover(|s| s.bg(gpui::white().opacity(0.12)))
-}
-
-/// `control` without hover or pointer, for one that is unavailable.
-fn control_label(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
+/// One episode in the picker.
+fn episode_chip(ep: &str, current: bool, cx: &mut Context<PlayerView>) -> impl IntoElement {
+    let target = ep.to_string();
     div()
-        .id(id)
-        .flex()
-        .flex_none()
-        .items_center()
-        .h(px(36.))
-        .px(px(12.))
-        .rounded(px(8.))
-        .text_size(px(14.))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(theme::text())
-        .whitespace_nowrap()
-        .child(label.into())
-}
-
-/// The accent disc that plays and pauses.
-fn play_button(paused: bool, cx: &mut Context<PlayerView>) -> impl IntoElement {
-    let glyph: AnyElement = if paused {
-        canvas(
-            |_, _, _| {},
-            |bounds, _, window, _| {
-                let (o, s) = (bounds.origin, bounds.size);
-                let mut path = PathBuilder::fill();
-                path.move_to(o);
-                path.line_to(point(o.x + s.width, o.y + s.height / 2.));
-                path.line_to(point(o.x, o.y + s.height));
-                path.close();
-                if let Ok(path) = path.build() {
-                    window.paint_path(path, theme::on_accent());
-                }
-            },
-        )
-        .w(px(15.))
-        .h(px(17.))
-        .ml(px(3.))
-        .into_any_element()
-    } else {
-        let bar = || {
-            div()
-                .w(px(4.))
-                .h(px(16.))
-                .rounded(px(1.))
-                .bg(theme::on_accent())
-        };
-        div()
-            .flex()
-            .gap(px(4.))
-            .child(bar())
-            .child(bar())
-            .into_any_element()
-    };
-    div()
-        .id("player-play")
+        .id(ElementId::Name(format!("player-ep-{ep}").into()))
         .flex()
         .flex_none()
         .items_center()
         .justify_center()
-        .size(px(48.))
-        .rounded_full()
-        .bg(theme::accent())
-        .cursor_pointer()
-        .hover(|s| s.bg(theme::accent_hover()))
-        .on_click(cx.listener(|view, _, _, cx| view.toggle_pause(cx)))
-        .child(glyph)
+        .w(px(44.))
+        .h(px(36.))
+        .rounded(px(8.))
+        .text_size(px(14.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .tooltip({
+            let label: SharedString = format!("Episode {ep}").into();
+            move |_, cx| hud::tooltip(label.clone(), cx)
+        })
+        .when(current, |d| {
+            d.bg(theme::accent()).text_color(theme::on_accent())
+        })
+        .when(!current, |d| {
+            d.bg(gpui::white().opacity(0.06))
+                .text_color(hud::paper())
+                .cursor_pointer()
+                .hover(|s| s.bg(gpui::white().opacity(0.16)))
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.episodes_open = false;
+                    view.advance(target.clone(), cx);
+                }))
+        })
+        .child(ep.to_string())
 }
 
 /// An accent sliver sweeping a thin track while something loads.
@@ -1486,5 +1722,21 @@ mod tests {
         assert_eq!(clock(3725.0), "1:02:05");
         assert_eq!(clock(-3.0), "0:00");
         assert_eq!(clock(f64::NAN), "0:00");
+    }
+
+    #[test]
+    fn previous_episode_steps_back_through_the_list() {
+        let eps: Vec<String> = ["1", "2", "3", "3.5", "4"]
+            .iter()
+            .map(|e| e.to_string())
+            .collect();
+        assert_eq!(previous_episode(&eps, "1"), None);
+        assert_eq!(previous_episode(&eps, "2").as_deref(), Some("1"));
+        assert_eq!(previous_episode(&eps, "4").as_deref(), Some("3.5"));
+        assert_eq!(previous_episode(&eps, "04").as_deref(), Some("3.5"));
+        // Not in the list: the nearest lower number.
+        assert_eq!(previous_episode(&eps, "3.2").as_deref(), Some("3"));
+        assert_eq!(previous_episode(&eps, "special"), None);
+        assert_eq!(previous_episode(&[], "2"), None);
     }
 }
