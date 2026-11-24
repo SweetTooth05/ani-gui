@@ -82,8 +82,8 @@ development packages:
 
 ```sh
 sudo apt install build-essential pkg-config libxkbcommon-x11-dev libxkbcommon-dev \
-  libwayland-dev libvulkan-dev libfontconfig-dev libfreetype-dev libssl-dev \
-  libxcb1-dev libzstd-dev
+  libwayland-dev libvulkan-dev libfontconfig-dev libfreetype-dev \
+  libxcb1-dev
 ```
 
 libmpv isn't needed to build, because the app loads it at runtime.

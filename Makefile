@@ -29,7 +29,8 @@ build:
 	cargo build --release
 
 # Built only when missing, so `sudo make install` after `make` never runs
-# cargo as root.
+# cargo as root. It does not track sources: run `make` before `make install`
+# after pulling changes, or the old binary is installed.
 $(BIN):
 	cargo build --release
 
@@ -40,9 +41,10 @@ install: $(BIN)
 		echo "install -Dm644 assets/icons/hicolor/$$icon $(ICONDIR)/$$icon"; \
 		install -Dm644 assets/icons/hicolor/$$icon $(ICONDIR)/$$icon || exit 1; \
 	done
-	-@command -v gtk-update-icon-cache >/dev/null 2>&1 && \
+	@# Staged installs (DESTDIR) leave cache refreshes to the package manager.
+	-@[ -n "$(DESTDIR)" ] || ! command -v gtk-update-icon-cache >/dev/null 2>&1 || \
 		gtk-update-icon-cache -f -t $(ICONDIR) >/dev/null 2>&1 || true
-	-@command -v update-desktop-database >/dev/null 2>&1 && \
+	-@[ -n "$(DESTDIR)" ] || ! command -v update-desktop-database >/dev/null 2>&1 || \
 		update-desktop-database $(APPSDIR) >/dev/null 2>&1 || true
 
 # The caches install refreshed are rebuilt for whatever other apps remain, or

@@ -124,7 +124,6 @@ impl AssetSource for Assets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::AssetSource;
 
     #[test]
     fn assets_serve_embedded_logo() {
@@ -134,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn assets_unknown_path_is_none() {
+    fn assets_list_logo_and_miss_unknown_paths() {
         assert!(Assets.load("nope.svg").expect("load").is_none());
         assert!(Assets.list("").expect("list").contains(&LOGO.into()));
     }
