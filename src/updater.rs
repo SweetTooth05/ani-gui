@@ -1477,7 +1477,9 @@ mod tests {
     #[test]
     fn openssl_signatures_verify() {
         match Command::new("openssl").arg("version").output() {
-            Ok(out) if String::from_utf8_lossy(&out.stdout).starts_with("OpenSSL") => {}
+            Ok(out) if String::from_utf8_lossy(&out.stdout).starts_with("OpenSSL") => {
+                eprintln!("using {}", String::from_utf8_lossy(&out.stdout).trim());
+            }
             _ => {
                 eprintln!("OpenSSL not found; skipping");
                 return;
@@ -1491,7 +1493,11 @@ mod tests {
         fs::write(&sums, format!("{}  a.tar.gz\n", sha256(b"a"))).unwrap();
         let run = |args: &[&str]| {
             let out = Command::new("openssl").args(args).output().unwrap();
-            assert!(out.status.success(), "openssl {args:?} failed");
+            assert!(
+                out.status.success(),
+                "openssl {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         let p = |p: &Path| p.to_str().unwrap().to_string();
         run(&["genpkey", "-algorithm", "ed25519", "-out", &p(&key)]);
