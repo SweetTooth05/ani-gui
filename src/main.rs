@@ -82,7 +82,8 @@ fn main() {
         return;
     }
 
-    Application::new().run(|cx: &mut App| {
+    let app = Application::new().with_assets(ui::theme::Assets);
+    app.run(|cx: &mut App| {
         ui::theme::register_fonts(cx);
         text_input::bind_keys(cx);
         app::bind_keys(cx);

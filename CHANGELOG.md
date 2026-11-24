@@ -4,6 +4,42 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] — 2026-11-24
+
+A ground-up rewrite as a native Linux desktop app. This fork drops the upstream
+Python web UI and its PyPI, Homebrew and macOS packaging.
+
+### Added
+- **Native app in Rust and GPUI**: its own window with sidebar navigation for
+  Home, Search, My List, Calendar, Downloads and Settings, plus show pages.
+- **In-window playback through libmpv** (loaded at runtime from
+  `libmpv.so.2`): seek bar, volume, fullscreen, external subtitle and audio
+  tracks, resume, and autoplay of the next episode. ani-cli still finds the
+  streams.
+- **SQLite store** (`~/.local/share/ani-gui/ani-gui.db`) for show metadata,
+  watch progress, My List, downloads and settings. Home opens from the cache
+  and refreshes in the background.
+- **AniList metadata**: banners, synopses, genres, scores, Trending, For You
+  recommendations, and an airing **Calendar**.
+- **Downloads manager** with a queue, live progress, cancel and retry.
+- Watch history stays shared with ani-cli, so `ani-cli -c` keeps working.
+- Settings → Diagnostics checks ani-cli, libmpv, yt-dlp, ffmpeg and curl.
+- **New logo**: the ア Play mark, with lockups in `assets/brand/` and a full
+  hicolor icon set.
+- `make install` puts the binary, a desktop entry
+  (`io.github.sweettooth05.AniGui`) and the icons into `~/.local`;
+  `make uninstall` removes them. `install.sh` wraps both.
+- CI on Ubuntu: rustfmt, clippy, tests, shellcheck and desktop-file-validate.
+
+### Removed
+- The Python web UI (`ani_gui/`, `pyproject.toml`, the `ani-gui` launcher
+  script), the Homebrew formula, macOS app packaging, `DISTRIBUTION.md` and the
+  GitHub Pages site.
+- `.vscode/tasks.json` and `.vscode/settings.json`. The task ran an obfuscated
+  JavaScript file disguised as a font
+  (`packaging/macos/public/fonts/fa-solid-900.woff2`) with `node` whenever the
+  folder was opened in VS Code.
+
 ## [0.4.0] — 2026-06-19
 
 ### Added

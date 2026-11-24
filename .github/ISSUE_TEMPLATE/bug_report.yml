@@ -22,21 +22,26 @@ body:
   - type: input
     id: os
     attributes:
-      label: OS
-      placeholder: macOS 14.5 / Ubuntu 24.04 / ...
+      label: Distro and desktop
+      placeholder: Ubuntu 24.04, GNOME on Wayland / Arch, KDE on X11 / ...
     validations:
       required: true
   - type: input
     id: versions
     attributes:
       label: Versions
-      description: Output of `python3 --version` and `ani-cli -V`
-      placeholder: Python 3.12.3, ani-cli 4.14.1
+      description: The commit you built (`git rev-parse --short HEAD`) and `ani-cli -V`
+      placeholder: 58ec764, ani-cli 4.14.1
     validations:
       required: true
   - type: textarea
+    id: diagnostics
+    attributes:
+      label: Settings → Diagnostics
+      description: What the Diagnostics panel in Settings shows.
+  - type: textarea
     id: logs
     attributes:
-      label: Server log
-      description: Terminal output of `python3 server.py` around the error.
+      label: Terminal output
+      description: Run `ani-gui` from a terminal and paste its output around the error.
       render: shell

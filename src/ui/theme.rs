@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 
-use gpui::{App, Hsla, Pixels, Rgba, px, rgb, rgba};
+use gpui::{App, AssetSource, Hsla, Pixels, Rgba, SharedString, px, rgb, rgba};
 
 /// The page behind everything.
 pub fn night() -> Rgba {
@@ -95,5 +95,47 @@ pub fn register_fonts(cx: &App) {
     let fonts = FONTS.iter().map(|f| Cow::Borrowed(*f)).collect();
     if let Err(err) = cx.text_system().add_fonts(fonts) {
         eprintln!("ani-gui: loading fonts: {err:#}");
+    }
+}
+
+/// Asset path of the sidebar logo (compact lockup for dark backgrounds).
+pub const LOGO: &str = "brand/ani-gui-compact-reversed.svg";
+const LOGO_SVG: &[u8] = include_bytes!("../../assets/brand/svg/ani-gui-compact-reversed.svg");
+
+/// Images embedded in the binary, so an installed `ani-gui` needs no asset
+/// directory. `img(LOGO)` goes through GPUI's resource loader, which
+/// rasterises SVG in full colour.
+pub struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
+        Ok((path == LOGO).then_some(Cow::Borrowed(LOGO_SVG)))
+    }
+
+    fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
+        Ok(if LOGO.starts_with(path) {
+            vec![LOGO.into()]
+        } else {
+            Vec::new()
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::AssetSource;
+
+    #[test]
+    fn assets_serve_embedded_logo() {
+        let logo = Assets.load(LOGO).expect("load").expect("logo present");
+        assert!(logo.starts_with(b"<?xml"));
+        assert!(std::str::from_utf8(&logo).expect("utf8").contains("<svg"));
+    }
+
+    #[test]
+    fn assets_unknown_path_is_none() {
+        assert!(Assets.load("nope.svg").expect("load").is_none());
+        assert!(Assets.list("").expect("list").contains(&LOGO.into()));
     }
 }

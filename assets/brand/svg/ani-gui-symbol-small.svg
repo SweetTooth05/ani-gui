@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   viewBox="0 0 256 256"
+   version="1.1"
+   id="svg3"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs3" />
+  <title
+     id="title1">ani-gui</title>
+  <rect
+     x="8"
+     y="8"
+     width="240"
+     height="240"
+     rx="56"
+     fill="#FF5C7A"
+     id="rect1" />
+  <g
+     transform="translate(30,30) scale(0.94)"
+     fill="none"
+     id="g2">
+    <path
+       style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#ffffff;stroke:none;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+       d="m 28,21 v 38 h 112.01562 c -6.99862,14.596723 -18.2827,27.556287 -35.05859,39.539062 l 22.08594,30.921878 c 31.11076,-22.22197 51.40617,-51.719304 57.65039,-86.062503 L 188.76562,21 Z"
+       id="path1" />
+    <path
+       style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#ffffff;stroke:none;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+       d="m 79,76 v 38.80859 c -2.232737,22.84916 -13.686471,39.57993 -40.349609,54.65039 l 18.699218,33.08204 c 34.45823,-19.4764 56.341611,-49.28306 59.572271,-84.82032 L 117,116.86133 V 76 Z"
+       id="path2" />
+  </g>
+  <g
+     id="path3"
+     style="opacity:1">
+    <path
+       style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#ffc24b;stroke-linejoin:round;enable-background:accumulate;stop-color:#000000;stop-opacity:1"
+       d="m 176,156 v 50 l 43.3,-25 z"
+       id="path4" />
+    <path
+       style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#ffc24b;stroke-linejoin:round;enable-background:accumulate;stop-color:#000000;stop-opacity:1"
+       d="M 173,150.80469 A 6.0006,6.0006 0 0 0 170,156 v 50 a 6.0006,6.0006 0 0 0 9,5.19531 l 43.30078,-25 a 6.0006,6.0006 0 0 0 0,-10.39062 l -43.30078,-25 a 6.0006,6.0006 0 0 0 -6,0 z m 9,15.58593 L 207.30273,181 182,195.60937 Z"
+       id="path5" />
+  </g>
+</svg>

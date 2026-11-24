@@ -1,4 +1,4 @@
-use gpui::{Context, FontWeight, IntoElement, div, prelude::*, px};
+use gpui::{Context, FontWeight, IntoElement, ObjectFit, div, img, prelude::*, px};
 
 use crate::app::{Root, Route};
 use crate::ui::theme;
@@ -11,6 +11,12 @@ const ITEMS: [(&str, Route); 6] = [
     ("Downloads", Route::Downloads),
     ("Settings", Route::Settings),
 ];
+
+/// Logo width: the sidebar minus its padding and the nav items' inset, so the
+/// lockup lines up with the labels below it.
+const LOGO_W: f32 = theme::SIDEBAR_WIDTH - 4. * 14.;
+/// Height / width of `assets/brand/svg/ani-gui-compact-reversed.svg` (882 x 240).
+const LOGO_ASPECT: f32 = 240. / 882.;
 
 /// The sidebar entry a route belongs to (Show and Player pages have none).
 fn section(route: &Route) -> Option<&'static str> {
@@ -35,15 +41,12 @@ pub fn sidebar(active: &Route, cx: &mut Context<Root>) -> impl IntoElement {
         .px(px(14.))
         .gap(px(2.))
         .child(
-            div()
-                .px(px(14.))
-                .pb(px(28.))
-                .font_family(theme::DISPLAY_FONT)
-                .font_weight(FontWeight::BOLD)
-                .text_size(px(30.))
-                .line_height(px(30.))
-                .text_color(theme::text())
-                .child("ani-gui"),
+            div().px(px(14.)).pb(px(28.)).child(
+                img(theme::LOGO)
+                    .w(px(LOGO_W))
+                    .h(px(LOGO_W * LOGO_ASPECT))
+                    .object_fit(ObjectFit::Contain),
+            ),
         )
         .children(ITEMS.into_iter().map(|(label, route)| {
             let selected = active == Some(label);
