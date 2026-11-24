@@ -4,6 +4,25 @@ use std::path::{Path, PathBuf};
 
 const APP_DIR: &str = "ani-gui";
 
+/// Where data, cache and downloads go when no `XDG_*` variable says
+/// otherwise, relative to the home directory: the XDG defaults on Linux, the
+/// standard Library folders on macOS. Explicit `XDG_*` variables win on both.
+const DATA_FALLBACK: &str = if cfg!(target_os = "macos") {
+    "Library/Application Support"
+} else {
+    ".local/share"
+};
+const CACHE_FALLBACK: &str = if cfg!(target_os = "macos") {
+    "Library/Caches"
+} else {
+    ".cache"
+};
+const VIDEOS_DIR: &str = if cfg!(target_os = "macos") {
+    "Movies"
+} else {
+    "Videos"
+};
+
 fn home() -> PathBuf {
     env::home_dir().unwrap_or_default()
 }
@@ -18,11 +37,11 @@ fn xdg_base(value: Option<OsString>, home: &Path, fallback: &str) -> PathBuf {
 }
 
 pub fn data_dir() -> PathBuf {
-    xdg_base(env::var_os("XDG_DATA_HOME"), &home(), ".local/share").join(APP_DIR)
+    xdg_base(env::var_os("XDG_DATA_HOME"), &home(), DATA_FALLBACK).join(APP_DIR)
 }
 
 pub fn cache_dir() -> PathBuf {
-    xdg_base(env::var_os("XDG_CACHE_HOME"), &home(), ".cache").join(APP_DIR)
+    xdg_base(env::var_os("XDG_CACHE_HOME"), &home(), CACHE_FALLBACK).join(APP_DIR)
 }
 
 pub fn db_path() -> PathBuf {
@@ -30,7 +49,7 @@ pub fn db_path() -> PathBuf {
 }
 
 pub fn default_download_dir() -> PathBuf {
-    home().join("Videos").join(APP_DIR)
+    home().join(VIDEOS_DIR).join(APP_DIR)
 }
 
 pub fn ani_cli_history_path() -> PathBuf {
@@ -43,7 +62,8 @@ pub fn ani_cli_history_path() -> PathBuf {
 
 /// Mirrors ani-cli's
 /// `${ANI_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ani-cli}/ani-hsts`
-/// exactly (empty counts as unset), so both programs share one file.
+/// exactly (empty counts as unset), so both programs share one file. ani-cli
+/// uses the same location on macOS.
 fn history_path(hist_dir: Option<OsString>, state_home: Option<OsString>, home: &Path) -> PathBuf {
     let non_empty = |v: Option<OsString>| v.filter(|v| !v.is_empty()).map(PathBuf::from);
     let dir = non_empty(hist_dir).unwrap_or_else(|| {
@@ -72,6 +92,26 @@ mod tests {
         assert_eq!(
             xdg_base(None, home, ".cache"),
             PathBuf::from("/home/u/.cache")
+        );
+    }
+
+    #[test]
+    fn fallbacks_match_the_platform() {
+        let home = Path::new("/Users/u");
+        let (data, cache) = if cfg!(target_os = "macos") {
+            (
+                "/Users/u/Library/Application Support",
+                "/Users/u/Library/Caches",
+            )
+        } else {
+            ("/Users/u/.local/share", "/Users/u/.cache")
+        };
+        assert_eq!(xdg_base(None, home, DATA_FALLBACK), PathBuf::from(data));
+        assert_eq!(xdg_base(None, home, CACHE_FALLBACK), PathBuf::from(cache));
+        // An explicit XDG variable wins on every platform.
+        assert_eq!(
+            xdg_base(Some("/x/cache".into()), home, CACHE_FALLBACK),
+            PathBuf::from("/x/cache")
         );
     }
 

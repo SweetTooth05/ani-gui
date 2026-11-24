@@ -33,16 +33,37 @@ const MENU_ALIASES: [&str; 2] = ["rofi", "dmenu"];
 /// The argument `main` dispatches to [`menu_main`].
 pub const MENU_FLAG: &str = "--ani-cli-menu";
 const NO_RESULTS: &str = "No results found";
+/// Folders with ani-cli and its tools that a session started from a desktop
+/// launcher may lack on PATH (besides `~/.local/bin`). On macOS an app
+/// started from Finder gets only the system folders, so Homebrew's prefixes
+/// (Apple Silicon, then Intel) are added.
+const EXTRA_BIN_DIRS: &[&str] = if cfg!(target_os = "macos") {
+    &["/opt/homebrew/bin", "/usr/local/bin"]
+} else {
+    &["/usr/local/bin"]
+};
 
-/// The `ani-cli` executable on PATH, else in `~/.local/bin` or `/usr/local/bin`.
+/// The `ani-cli` executable on PATH, else in `~/.local/bin` or one of
+/// [`EXTRA_BIN_DIRS`].
 pub fn find() -> Option<PathBuf> {
     let path = env::var_os("PATH").unwrap_or_default();
     env::split_paths(&path)
         .filter(|dir| dir.is_absolute())
         .chain(env::home_dir().map(|home| home.join(".local/bin")))
-        .chain([PathBuf::from("/usr/local/bin")])
+        .chain(EXTRA_BIN_DIRS.iter().map(PathBuf::from))
         .map(|dir| dir.join("ani-cli"))
         .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
+/// The error for a missing ani-cli, naming where [`find`] looked.
+pub fn not_installed() -> String {
+    let mut dirs: Vec<&str> = vec!["~/.local/bin"];
+    dirs.extend(EXTRA_BIN_DIRS);
+    let last = dirs.pop().unwrap_or_default();
+    format!(
+        "ani-cli is not installed (looked on PATH, in {} and {last})",
+        dirs.join(", ")
+    )
 }
 
 /// `ani-cli -V`, e.g. "5.1.8".
@@ -324,8 +345,7 @@ pub fn resolve(
     shims: &Path,
     owner: &ResolveHandle,
 ) -> Result<ResolveOutcome> {
-    let program = find()
-        .context("ani-cli is not installed (looked on PATH, in ~/.local/bin and /usr/local/bin)")?;
+    let program = find().with_context(not_installed)?;
     resolve_with(&program, req, shims, &[], RESOLVE_TIMEOUT, Some(owner))
 }
 
@@ -450,12 +470,14 @@ pub(crate) fn shim_env(
     ]
 }
 
-/// The PATH ani-cli finds its tools on: `/usr/local/bin` and `~/.local/bin`
-/// (for sessions started from a desktop launcher), then the app's own PATH.
+/// The PATH ani-cli finds its tools on: [`EXTRA_BIN_DIRS`] and
+/// `~/.local/bin` (for sessions started from a desktop launcher), then the
+/// app's own PATH.
 pub fn tool_path() -> OsString {
     let current = env::var_os("PATH").unwrap_or_default();
-    let dirs = [PathBuf::from("/usr/local/bin")]
-        .into_iter()
+    let dirs = EXTRA_BIN_DIRS
+        .iter()
+        .map(PathBuf::from)
         .chain(env::home_dir().map(|home| home.join(".local/bin")))
         .chain(env::split_paths(&current));
     env::join_paths(dirs).unwrap_or(current)
@@ -979,6 +1001,17 @@ mod tests {
     }
 
     #[test]
+    fn not_installed_names_every_folder_searched() {
+        let expected = if cfg!(target_os = "macos") {
+            "ani-cli is not installed (looked on PATH, in ~/.local/bin, \
+             /opt/homebrew/bin and /usr/local/bin)"
+        } else {
+            "ani-cli is not installed (looked on PATH, in ~/.local/bin and /usr/local/bin)"
+        };
+        assert_eq!(not_installed(), expected);
+    }
+
+    #[test]
     fn shim_env_pins_ani_cli_settings() {
         let dir = Path::new("/tmp/shims");
         let value = |env: &[(&str, OsString)], key: &str| {
@@ -997,7 +1030,8 @@ mod tests {
             assert_eq!(value(&env, "ANI_CLI_SKIP_INTRO"), "0");
             assert_eq!(value(&env, "ANI_CLI_MENU_FLAGS"), "");
             let path = value(&env, "PATH");
-            assert!(path.starts_with("/tmp/shims:/usr/local/bin:"), "{path}");
+            let first = format!("/tmp/shims:{}:", EXTRA_BIN_DIRS[0]);
+            assert!(path.starts_with(&first), "{path}");
             assert!(path.ends_with(&*tool_path().to_string_lossy()), "{path}");
         }
     }

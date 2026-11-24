@@ -22,6 +22,7 @@ use image::RgbaImage;
 use crate::anicli::{ResolveOutcome, ResolveScope};
 use crate::app::{AppState, Back, PlayRequest, Root};
 use crate::db::{self, Db};
+use crate::diagnostics::LIBMPV_INSTALL_HINT;
 use crate::downloads::DownloadManager;
 use crate::keep_awake::KeepAwake;
 use crate::model::{DownloadRecord, Progress, Stream};
@@ -65,7 +66,6 @@ const EPISODE_COLUMNS: usize = 5;
 const EPISODE_ROWS_SHOWN: usize = 7;
 /// How long the controls take to fade in.
 const FADE_IN: Duration = Duration::from_millis(140);
-const LIBMPV_MISSING: &str = "Install libmpv2 (sudo apt install libmpv2)";
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
@@ -258,7 +258,7 @@ impl PlayerView {
                 self.start_episode(cx);
             }
             Err(PlayerError::LibraryMissing(_)) => {
-                self.fail("Video playback needs libmpv", LIBMPV_MISSING.into());
+                self.fail("Video playback needs libmpv", LIBMPV_INSTALL_HINT.into());
             }
             Err(err) => self.fail("The video player couldn't start", err.to_string()),
         }

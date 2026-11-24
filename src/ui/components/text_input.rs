@@ -50,6 +50,17 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", End, Some(CONTEXT)),
         KeyBinding::new("escape", Clear, Some(CONTEXT)),
     ]);
+    // macOS uses ⌘ for the clipboard and ⌘←/⌘→ for line start and end.
+    if cfg!(target_os = "macos") {
+        cx.bind_keys([
+            KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
+            KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
+            KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
+            KeyBinding::new("cmd-x", Cut, Some(CONTEXT)),
+            KeyBinding::new("cmd-left", Home, Some(CONTEXT)),
+            KeyBinding::new("cmd-right", End, Some(CONTEXT)),
+        ]);
+    }
 }
 
 /// Emitted after every edit.

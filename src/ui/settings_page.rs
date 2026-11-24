@@ -515,7 +515,10 @@ fn checks(report: &Report) -> Vec<Check> {
         detail: if found {
             "Found on your PATH".into()
         } else {
-            format!("Not found on your PATH. ani-cli needs it {needed_for}.")
+            format!(
+                "Not found on your PATH. ani-cli needs it {needed_for}.{}",
+                diagnostics::install_tip(name)
+            )
         },
     };
     vec![
@@ -530,7 +533,10 @@ fn checks(report: &Report) -> Vec<Check> {
                     "Found at {}, but it didn't report a version",
                     display_path(path)
                 ),
-                None => "Not found. Install ani-cli to stream and download episodes.".into(),
+                None => format!(
+                    "Not found. Install ani-cli to stream and download episodes.{}",
+                    diagnostics::install_tip("ani-cli")
+                ),
             },
         },
         Check {
@@ -539,7 +545,8 @@ fn checks(report: &Report) -> Vec<Check> {
             detail: match &report.libmpv {
                 Ok(()) => "Loaded, so videos play in this window".into(),
                 Err(err) => format!(
-                    "Couldn't load it ({err}). Install libmpv2 (sudo apt install libmpv2) to play videos."
+                    "Couldn't load it ({err}). {} to play videos.",
+                    diagnostics::LIBMPV_INSTALL_HINT
                 ),
             },
         },

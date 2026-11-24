@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 use futures::StreamExt;
 use gpui::{
-    App, Context, Entity, EntityId, FocusHandle, Global, KeyBinding, MouseButton,
-    NavigationDirection, SharedString, Window, actions, div, prelude::*, px,
+    App, Context, Entity, EntityId, FocusHandle, Global, KeyBinding, Menu, MenuItem, MouseButton,
+    NavigationDirection, SharedString, SystemMenuType, Window, actions, div, prelude::*, px,
 };
 
 use crate::db::Db;
@@ -24,11 +24,66 @@ use crate::ui::show::ShowPage;
 use crate::ui::{sidebar, theme};
 use crate::{anicli, paths};
 
-actions!(ani_gui, [Back]);
+actions!(
+    ani_gui,
+    [Back, Quit, Hide, HideOthers, ShowAll, Minimize, Zoom]
+);
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("alt-left", Back, None)]);
     player_view::bind_keys(cx);
+    if cfg!(target_os = "macos") {
+        install_mac_menus(cx);
+    }
+}
+
+/// The standard macOS application and Window menus with their shortcuts.
+/// GPUI provides none of them, not even ⌘Q.
+fn install_mac_menus(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-[", Back, None),
+        KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-h", Hide, None),
+        KeyBinding::new("alt-cmd-h", HideOthers, None),
+        KeyBinding::new("cmd-m", Minimize, None),
+    ]);
+    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &Hide, cx| cx.hide());
+    cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+    cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    cx.on_action(|_: &Minimize, cx| {
+        if let Some(window) = cx.active_window() {
+            window
+                .update(cx, |_, window, _| window.minimize_window())
+                .ok();
+        }
+    });
+    cx.on_action(|_: &Zoom, cx| {
+        if let Some(window) = cx.active_window() {
+            window.update(cx, |_, window, _| window.zoom_window()).ok();
+        }
+    });
+    cx.set_menus(vec![
+        Menu {
+            name: "ani-gui".into(),
+            items: vec![
+                MenuItem::os_submenu("Services", SystemMenuType::Services),
+                MenuItem::separator(),
+                MenuItem::action("Hide ani-gui", Hide),
+                MenuItem::action("Hide Others", HideOthers),
+                MenuItem::action("Show All", ShowAll),
+                MenuItem::separator(),
+                MenuItem::action("Quit ani-gui", Quit),
+            ],
+        },
+        Menu {
+            name: "Window".into(),
+            items: vec![
+                MenuItem::action("Minimize", Minimize),
+                MenuItem::action("Zoom", Zoom),
+            ],
+        },
+    ]);
 }
 
 /// Shared app services, set once startup has opened the database.

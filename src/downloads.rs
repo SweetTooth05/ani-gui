@@ -13,9 +13,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
-use nix::fcntl::OFlag;
 use nix::libc;
-use nix::pty::{Winsize, grantpt, posix_openpt, ptsname_r, unlockpt};
+use nix::pty::{Winsize, grantpt, unlockpt};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, setsid};
 use regex::Regex;
@@ -734,7 +733,7 @@ fn spawn_in_pty(
 /// A 24x100 pseudo-terminal whose two fds are close-on-exec from the start,
 /// so children spawned by other threads never inherit them.
 fn open_pty() -> io::Result<(OwnedFd, File)> {
-    let master = posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC)?;
+    let master = pty::open_master()?;
     grantpt(&master)?;
     unlockpt(&master)?;
     // std opens files with O_CLOEXEC.
@@ -742,7 +741,7 @@ fn open_pty() -> io::Result<(OwnedFd, File)> {
         .read(true)
         .write(true)
         .custom_flags(libc::O_NOCTTY)
-        .open(ptsname_r(&master)?)?;
+        .open(pty::slave_name(&master)?)?;
     let size = Winsize {
         ws_row: 24,
         ws_col: 100,
@@ -754,6 +753,62 @@ fn open_pty() -> io::Result<(OwnedFd, File)> {
         return Err(io::Error::last_os_error());
     }
     Ok((master.into(), slave))
+}
+
+#[cfg(not(target_os = "macos"))]
+mod pty {
+    use std::io;
+
+    use nix::fcntl::OFlag;
+    use nix::pty::{PtyMaster, posix_openpt, ptsname_r};
+
+    pub fn open_master() -> io::Result<PtyMaster> {
+        Ok(posix_openpt(
+            OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC,
+        )?)
+    }
+
+    pub fn slave_name(master: &PtyMaster) -> io::Result<String> {
+        Ok(ptsname_r(master)?)
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod pty {
+    //! macOS has no `ptsname_r`, and its `posix_openpt` isn't documented to
+    //! take `O_CLOEXEC`.
+
+    use std::fs::OpenOptions;
+    use std::io;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::{Mutex, PoisonError};
+
+    use nix::libc;
+    use nix::pty::{PtyMaster, ptsname};
+
+    /// Opens the clone device directly, which is what `posix_openpt` does,
+    /// so the fd is close-on-exec from the start (std always sets it).
+    pub fn open_master() -> io::Result<PtyMaster> {
+        let fd: OwnedFd = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open("/dev/ptmx")?
+            .into();
+        // SAFETY: the fd was just opened from /dev/ptmx, so it is a pty master.
+        Ok(unsafe { PtyMaster::from_owned_fd(fd) })
+    }
+
+    /// `ptsname` returns a static buffer; this lock serialises the only
+    /// caller in the process.
+    pub fn slave_name(master: &PtyMaster) -> io::Result<String> {
+        static PTSNAME: Mutex<()> = Mutex::new(());
+        let _guard = PTSNAME.lock().unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: nothing else in ani-gui calls ptsname, and the lock keeps
+        // concurrent downloads from racing on its buffer.
+        Ok(unsafe { ptsname(master) }?)
+    }
 }
 
 fn failure_detail(tail: &str, status: ExitStatus) -> String {
