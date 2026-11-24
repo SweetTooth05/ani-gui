@@ -260,8 +260,8 @@ fn info_overlay(meta: &CardMeta) -> gpui::Div {
         .group_hover("poster", |s| s.opacity(1.))
         .bg(linear_gradient(
             0.,
-            linear_color_stop(theme::night_alpha(0.97), 0.),
-            linear_color_stop(theme::night_alpha(0.62), 0.62),
+            linear_color_stop(theme::night_alpha(0.98), 0.),
+            linear_color_stop(theme::night_alpha(0.74), 0.7),
         ))
         .flex()
         .flex_col()
@@ -303,7 +303,8 @@ fn info_overlay(meta: &CardMeta) -> gpui::Div {
                     .flex()
                     .flex_wrap()
                     .gap(px(4.))
-                    .max_h(px(44.))
+                    // One row: chips that don't fit are left out.
+                    .max_h(px(19.))
                     .overflow_hidden()
                     .children(meta.genres.iter().map(|g| {
                         div()
@@ -321,7 +322,7 @@ fn info_overlay(meta: &CardMeta) -> gpui::Div {
             div()
                 .text_size(px(11.5))
                 .line_height(relative(1.35))
-                .text_color(theme::text_muted())
+                .text_color(theme::text_dim())
                 .line_clamp(3)
                 .child(s)
         }))

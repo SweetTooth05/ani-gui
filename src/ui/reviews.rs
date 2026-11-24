@@ -16,8 +16,10 @@ use crate::ui::metadata::thousands;
 use crate::ui::theme;
 use crate::ui::view_models::clamp_words;
 
-/// Characters of body text a collapsed review shows.
+/// Characters of body text a collapsed review shows, in at most
+/// `PREVIEW_BLOCKS` paragraphs (some reviews are one-line paragraphs).
 const PREVIEW_CHARS: usize = 420;
+const PREVIEW_BLOCKS: usize = 4;
 
 enum Load {
     Loading,
@@ -292,7 +294,7 @@ impl ReviewsSection {
                 .into_any_element(),
             );
         }
-        if let Some(url) = review.url.clone().filter(|_| expanded || review.shortened) {
+        if let Some(url) = review.url.clone().filter(|_| expanded) {
             let label = if review.shortened {
                 format!("Read the rest on {}", source.label())
             } else {
@@ -367,7 +369,7 @@ impl Render for ReviewsSection {
             .flex_col()
             .gap(px(8.))
             .px(theme::gutter())
-            .pt(px(40.))
+            .pt(px(8.))
             .pb(px(64.))
             .child(
                 div()
@@ -428,33 +430,30 @@ fn blocks(review: &Review, revealed: bool) -> Vec<Block> {
 /// The leading blocks worth about `budget` characters, the last paragraph
 /// cut at a word; and whether anything was left out.
 fn preview(blocks: Vec<Block>, budget: usize) -> (Vec<Block>, bool) {
+    let total = blocks.len();
     let mut left = budget;
     let mut out = Vec::new();
-    let total = blocks.len();
-    for (i, block) in blocks.into_iter().enumerate() {
-        if left == 0 {
-            return (out, true);
+    for block in blocks {
+        if left == 0 || out.len() == PREVIEW_BLOCKS {
+            break;
         }
         match block {
-            Block::Hidden => out.push(Block::Hidden),
+            Block::Para { text, spoiler } if text.chars().count() > left => {
+                out.push(Block::Para {
+                    text: clamp_words(&text, left),
+                    spoiler,
+                });
+                return (out, true);
+            }
             Block::Para { text, spoiler } => {
-                let len = text.chars().count();
-                if len > left {
-                    out.push(Block::Para {
-                        text: clamp_words(&text, left),
-                        spoiler,
-                    });
-                    return (out, true);
-                }
-                left -= len;
+                left -= text.chars().count();
                 out.push(Block::Para { text, spoiler });
             }
-        }
-        if i + 1 == total {
-            return (out, false);
+            Block::Hidden => out.push(Block::Hidden),
         }
     }
-    (out, false)
+    let cut = out.len() < total;
+    (out, cut)
 }
 
 fn render_block(
@@ -604,6 +603,10 @@ mod tests {
         assert!(cut);
         assert_eq!(shown, [para("aaaa", false)]);
         assert_eq!(preview(Vec::new(), 10), (Vec::new(), false));
+        let many = vec![para("a", false); PREVIEW_BLOCKS + 1];
+        let (shown, cut) = preview(many, 100);
+        assert!(cut);
+        assert_eq!(shown.len(), PREVIEW_BLOCKS);
     }
 
     #[test]

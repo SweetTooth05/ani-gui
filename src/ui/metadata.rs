@@ -7,7 +7,7 @@ use crate::ui::calendar::{day_parts, local_day};
 use crate::ui::view_models::{blurb, clamp_words, format_label};
 
 /// About three lines of overlay text on a 160 px poster.
-const CARD_SYNOPSIS_CHARS: usize = 96;
+const CARD_SYNOPSIS_CHARS: usize = 72;
 const CARD_GENRES: usize = 3;
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
