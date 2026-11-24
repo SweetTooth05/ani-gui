@@ -1,63 +1,49 @@
 #!/bin/sh
-# ani-gui bootstrap installer.
+# Build ani-gui from this checkout and install it for the current user.
 #
-#   curl -sL https://raw.githubusercontent.com/rickwiththeportalgun/ani-gui/main/install.sh | sh
+#   ./install.sh                      installs into ~/.local
+#   PREFIX=~/apps ./install.sh        any other prefix you can write to
 #
-# Installs ani-cli (if missing), a video player (mpv, if no player is found),
-# and ani-gui itself via pipx. Re-running is safe — anything already present is
-# left alone. No sudo unless your package manager needs it.
+# For a system-wide install, don't run this script with sudo (it would build
+# as root); run `make && sudo make install PREFIX=/usr/local` instead.
+#
+# This is a thin wrapper around `make && make install`; see README.md for the
+# packages it expects.
 set -eu
 
 say()  { printf '\033[36m==>\033[0m %s\n' "$1"; }
-warn() { printf '\033[33m warning:\033[0m %s\n' "$1" >&2; }
-
+warn() { printf '\033[33mwarning:\033[0m %s\n' "$1" >&2; }
+die()  { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# Detect a system package manager (used for mpv / pipx, not for ani-cli).
-pkg_install() {
-  if   have brew;    then brew install "$@"
-  elif have apt-get; then sudo apt-get update -qq && sudo apt-get install -y "$@"
-  elif have dnf;     then sudo dnf install -y "$@"
-  elif have pacman;  then sudo pacman -S --noconfirm "$@"
-  else return 1
-  fi
-}
+[ "$(id -u)" -ne 0 ] || die "don't run this as root; use 'make && sudo make install PREFIX=/usr/local'"
 
-# 1. ani-cli — the thing that actually plays anime.
-if have ani-cli; then
-  say "ani-cli already installed ($(command -v ani-cli))"
-elif have brew; then
-  say "installing ani-cli via Homebrew"
-  brew install ani-cli
-else
-  # No-sudo install: drop the upstream script into a bin dir on PATH.
-  bindir="$HOME/.local/bin"
-  mkdir -p "$bindir"
-  say "installing ani-cli to $bindir"
-  curl -sL https://raw.githubusercontent.com/pystardust/ani-cli/master/ani-cli -o "$bindir/ani-cli"
-  chmod +x "$bindir/ani-cli"
-  case ":$PATH:" in
-    *":$bindir:"*) : ;;
-    *) warn "add $bindir to your PATH, then restart your shell" ;;
-  esac
+cd "$(dirname "$0")"
+if [ ! -f Cargo.toml ] || [ ! -f Makefile ]; then
+  die "run this script from an ani-gui checkout"
 fi
 
-# 2. A video player — only install one if none is present.
-if have mpv || have iina || have vlc; then
-  say "video player already present"
-else
-  say "installing mpv (video player)"
-  pkg_install mpv || warn "couldn't auto-install a player — install mpv, IINA, or VLC yourself"
-fi
+have cargo || die "cargo not found; install Rust from https://rustup.rs"
+have make  || die "make not found; install your distro's build tools (e.g. build-essential)"
+have cc    || die "no C compiler found; install your distro's build tools (e.g. build-essential)"
+have pkg-config || die "pkg-config not found; see the build dependencies in README.md"
+pkg-config --exists xkbcommon-x11 fontconfig wayland-client \
+  || die "missing development libraries; see the build dependencies in README.md"
 
-# 3. pipx, then ani-gui.
-if ! have pipx; then
-  say "installing pipx"
-  pkg_install pipx || python3 -m pip install --user pipx
-  python3 -m pipx ensurepath >/dev/null 2>&1 || pipx ensurepath >/dev/null 2>&1 || true
-fi
+# Runtime dependencies: the build works without them, the app does not.
+have ani-cli || warn "ani-cli not found; ani-gui needs it to find streams"
+{ ldconfig -p 2>/dev/null || /sbin/ldconfig -p 2>/dev/null; } | grep -q 'libmpv\.so\.2' \
+  || warn "libmpv.so.2 not found; install libmpv2 to play video"
+have yt-dlp || warn "yt-dlp not found; downloads need yt-dlp and ffmpeg"
 
-say "installing ani-gui"
-pipx install ani-gui || pipx upgrade ani-gui
+PREFIX=${PREFIX:-$HOME/.local}
+say "building (cargo build --release)"
+make build
+say "installing into $PREFIX"
+make install PREFIX="$PREFIX"
 
-say "done — run 'ani-gui' to start (opens http://127.0.0.1:17390)"
+case ":$PATH:" in
+  *":$PREFIX/bin:"*) : ;;
+  *) warn "$PREFIX/bin is not on your PATH; add it (or log out and back in) so the launcher entry can start ani-gui" ;;
+esac
+say "done; launch ani-gui from your app menu or run 'ani-gui'"

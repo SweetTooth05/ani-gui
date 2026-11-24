@@ -1,0 +1,36 @@
+{
+  "data": {
+    "show": {
+      "_id": "qpeexkeTa7DzLjRnp",
+      "name": "Sousou no Frieren 2nd Season",
+      "thumbnail": "https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx182255-butzrqd4I0aC.jpg",
+      "availableEpisodesDetail": {
+        "sub": [
+          "10",
+          "9",
+          "8",
+          "7",
+          "6",
+          "5",
+          "4",
+          "3",
+          "2",
+          "1"
+        ],
+        "dub": [
+          "10",
+          "9",
+          "8",
+          "7",
+          "6",
+          "5",
+          "4",
+          "3",
+          "2",
+          "1"
+        ],
+        "raw": []
+      }
+    }
+  }
+}

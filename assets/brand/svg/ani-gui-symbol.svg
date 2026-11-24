@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   viewBox="0 0 256 256"
+   version="1.1"
+   id="svg3"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <defs
+     id="defs3" />
+  <title
+     id="title1">ani-gui</title>
+  <rect
+     x="8"
+     y="8"
+     width="240"
+     height="240"
+     rx="64"
+     fill="#FF5C7A"
+     id="rect1" />
+  <g
+     transform="translate(30,30) scale(0.94)"
+     fill="none"
+     id="g2">
+    <path
+       style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#ffffff;stroke:none;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+       d="m 28,24 v 32 h 116.70312 c -7.00802,16.878302 -19.28519,31.609961 -38.0039,44.98047 l 18.60156,26.03906 C 155.92037,105.1484 175.64179,76.413496 181.74219,42.861328 L 185.17187,24 Z"
+       id="path1" />
+    <path
+       style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#ffffff;stroke:none;enable-background:accumulate;stop-color:#000000;stop-opacity:1;opacity:1"
+       d="m 82,76 v 38.99609 c -2.305341,23.87724 -14.573901,41.64427 -41.873047,57.07422 l 15.746094,27.85938 C 89.732609,180.79167 110.79199,152.00691 113.93359,117.44922 L 114,116.72656 V 76 Z"
+       id="path2" />
+  </g>
+  <g
+     id="path3"
+     style="opacity:1">
+    <path
+       style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#ffc24b;stroke-linejoin:round;enable-background:accumulate;stop-color:#000000;stop-opacity:1"
+       d="m 170,152 v 52 l 45,-26 z"
+       id="path4" />
+    <path
+       style="baseline-shift:baseline;display:inline;overflow:visible;vector-effect:none;fill:#ffc24b;stroke-linejoin:round;enable-background:accumulate;stop-color:#000000;stop-opacity:1"
+       d="M 166.50195,145.9375 A 7.0007,7.0007 0 0 0 163,152 v 52 a 7.0007,7.0007 0 0 0 10.50195,6.06055 l 45,-26 a 7.0007,7.0007 0 0 0 0,-12.1211 l -45,-26 a 7.0007,7.0007 0 0 0 -7,-0.002 z M 177,164.12891 201.00781,178 177,191.87109 Z"
+       id="path5" />
+  </g>
+</svg>

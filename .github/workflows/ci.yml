@@ -2,28 +2,86 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, native-gpui]
   pull_request:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  lint:
+  rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-
-      - name: Compile (no syntax errors)
-        run: python -m py_compile ani_gui/server.py
-
-      - name: Ruff (lint)
+      - name: Install system packages
         run: |
-          pip install ruff
-          ruff check .
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libxkbcommon-x11-dev libxkbcommon-dev libwayland-dev libvulkan-dev \
+            libfontconfig-dev libfreetype-dev libxcb1-dev \
+            libmpv-dev ffmpeg
 
-      - name: ShellCheck scripts
-        uses: ludeeus/action-shellcheck@master
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          additional_files: ani-gui install.sh
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      # libmpv for the playback tests (they skip without it); ffmpeg comes
+      # with it and makes their test clip.
+      - name: Install mpv
+        run: brew install mpv
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test
+
+      - name: make app
+        run: |
+          make app
+          plutil -lint target/release/ani-gui.app/Contents/Info.plist
+          codesign --verify --strict --verbose=2 target/release/ani-gui.app
+          file target/release/ani-gui.app/Contents/MacOS/ani-gui
+
+  packaging:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck desktop-file-utils
+
+      - name: shellcheck
+        run: shellcheck install.sh packaging/macos/build-app.sh
+
+      - name: desktop-file-validate
+        run: desktop-file-validate assets/ani-gui.desktop

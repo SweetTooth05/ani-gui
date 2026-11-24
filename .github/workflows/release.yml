@@ -1,0 +1,232 @@
+# Builds, signs and publishes a release when a vX.Y.Z tag is pushed.
+#
+# Trust model (see docs/releasing.md): the app installs an update only if
+# SHA256SUMS is signed by the Ed25519 key it embeds. The private key is the
+# RELEASE_SIGNING_KEY secret and only the `release` job sees it. That job
+# runs no project code and no cargo build scripts, and it runs in the
+# `release` environment, which can require a manual approval.
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Check the tag matches Cargo.toml
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: check
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # The first `version =` in Cargo.toml is the [package] version.
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ -z "$version" ] || [ "$TAG" != "v$version" ]; then
+            echo "::error::Tag $TAG does not match Cargo.toml version '$version'. Tag v$version instead, or bump Cargo.toml first."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # ubuntu-22.04 links against an older glibc (2.35), so the binary
+          # also runs on older distributions.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # macOS: each built and tested natively. macos-13, the last Intel
+          # image of its generation, was retired; macos-15-intel replaces it.
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          # Every entry writes dist/ani-gui-<version>-<target>.tar.gz. The
+          # archive name must carry the target triple: the updater picks its
+          # asset by it, and the release job signs every dist/*.tar.gz it
+          # receives.
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install system packages
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libxkbcommon-x11-dev libxkbcommon-dev libwayland-dev libvulkan-dev \
+            libfontconfig-dev libfreetype-dev libxcb1-dev \
+            libmpv-dev ffmpeg
+
+      # rustup ships on the hosted runners. No third-party action and no
+      # build cache: a cache written by another workflow could poison a
+      # release build.
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+
+      # Matches LSMinimumSystemVersion in packaging/macos/Info.plist.
+      - name: Set the macOS deployment target
+        if: runner.os == 'macOS'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+
+      # A prefix tree, so `tar -xzf ... -C ~/.local --strip-components=1`
+      # installs it. The launcher entry runs `ani-gui` from PATH; the
+      # README's install command points it at the absolute path.
+      - name: Package
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          stem="ani-gui-${VERSION}-${TARGET}"
+          stage="$RUNNER_TEMP/stage"
+          make install DESTDIR="$stage/$stem" PREFIX= DESKTOP_EXEC=ani-gui \
+            BIN="target/$TARGET/release/ani-gui"
+          test -x "$stage/$stem/bin/ani-gui"
+          mkdir -p dist
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            -czf "dist/$stem.tar.gz" -C "$stage" "$stem"
+          tar -tzvf "dist/$stem.tar.gz"
+
+      # ani-gui.app at the top of the archive, so
+      # `tar -xzf ... -C ~/Applications` installs it. The updater expects
+      # exactly this layout.
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          stem="ani-gui-${VERSION}-${TARGET}"
+          stage="$RUNNER_TEMP/stage"
+          mkdir -p "$stage"
+          make app BIN="target/$TARGET/release/ani-gui" APP_DIR="$stage"
+          app="$stage/ani-gui.app"
+          case "$TARGET" in
+            aarch64-*) arch=arm64 ;;
+            x86_64-*) arch=x86_64 ;;
+          esac
+          test "$(lipo -archs "$app/Contents/MacOS/ani-gui")" = "$arch"
+          codesign --verify --strict --verbose=2 "$app"
+          mkdir -p dist
+          # No AppleDouble (._*) files or extended attributes in the archive.
+          COPYFILE_DISABLE=1 tar --no-xattrs -czf "dist/$stem.tar.gz" -C "$stage" ani-gui.app
+          tar -tzvf "dist/$stem.tar.gz"
+          if tar -tzf "dist/$stem.tar.gz" | grep -v '^ani-gui\.app/' | grep -q .; then
+            echo "::error::The archive has entries outside ani-gui.app/"
+            exit 1
+          fi
+          if tar -tzf "dist/$stem.tar.gz" | grep -q '/\._'; then
+            echo "::error::The archive has AppleDouble files"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Sign and publish
+    needs: [version, build]
+    runs-on: ubuntu-22.04
+    # Configure this environment with required reviewers and an environment
+    # secret (docs/releasing.md), so a pushed tag alone can't get a build
+    # signed.
+    environment: release
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          shopt -s failglob
+          sha256sum -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Sign SHA256SUMS
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "::error::The RELEASE_SIGNING_KEY secret is not set. See docs/releasing.md."
+            exit 1
+          fi
+          umask 077
+          key="$RUNNER_TEMP/release-signing-key.pem"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$RELEASE_SIGNING_KEY" > "$key"
+          # Refuse to sign with a key the app doesn't embed: such a release
+          # could never be installed by the updater. The PEM file lists the
+          # accepted keys (two during a rotation), one base64 line each.
+          pub=$(openssl pkey -in "$key" -pubout | grep -v -- '-----')
+          if ! grep -qxF -- "$pub" docs/release-signing-key.pub.pem; then
+            echo "::error::RELEASE_SIGNING_KEY is not a key listed in docs/release-signing-key.pub.pem."
+            exit 1
+          fi
+          openssl pkeyutl -sign -rawin -inkey "$key" \
+            -in dist/SHA256SUMS -out dist/SHA256SUMS.sig
+          openssl pkey -in "$key" -pubout > "$RUNNER_TEMP/release-signing-key.pub.pem"
+          openssl pkeyutl -verify -rawin -pubin \
+            -inkey "$RUNNER_TEMP/release-signing-key.pub.pem" \
+            -in dist/SHA256SUMS -sigfile dist/SHA256SUMS.sig
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "ani-gui $VERSION" \
+            --generate-notes \
+            dist/*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sig

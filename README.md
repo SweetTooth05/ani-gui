@@ -1,229 +1,381 @@
- # ani-gui
-
 <p align="center">
-  <a href="https://github.com/rickwiththeportalgun/ani-gui/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue?logo=gnu" alt="license: GPL-3.0"></a>
-  <a href="https://pypi.org/project/ani-gui/"><img src="https://img.shields.io/pypi/v/ani-gui?logo=pypi&label=pypi" alt="PyPI version"></a>
-  <a href="#"><img src="https://img.shields.io/badge/python-3.6%2B-blue?logo=python&logoColor=white" alt="python 3.6+"></a>
-  <a href="#"><img src="https://img.shields.io/badge/dependencies-none-brightgreen" alt="zero dependencies"></a>
-  <a href="https://github.com/rickwiththeportalgun/ani-gui/releases"><img src="https://img.shields.io/github/v/release/rickwiththeportalgun/ani-gui?include_prereleases&label=release&logo=github" alt="GitHub release"></a>
-  <a href="https://github.com/rickwiththeportalgun/ani-gui"><img src="https://img.shields.io/github/stars/rickwiththeportalgun/ani-gui?style=flat&logo=github" alt="GitHub stars"></a>
-  <a href="https://github.com/rickwiththeportalgun/ani-gui"><img src="https://img.shields.io/github/last-commit/rickwiththeportalgun/ani-gui?logo=github" alt="last commit"></a>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/svg/ani-gui-horizontal-reversed.svg">
+    <img src="assets/brand/svg/ani-gui-horizontal.svg" alt="ani-gui" width="420">
+  </picture>
 </p>
 
-A small local web UI for [ani-cli](https://github.com/pystardust/ani-cli).
+<p align="center">
+  <a href="https://github.com/SweetTooth05/ani-gui/actions/workflows/ci.yml"><img src="https://github.com/SweetTooth05/ani-gui/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="license: GPL-3.0"></a>
+</p>
 
-It searches the same AllAnime API that ani-cli uses (so it can show a proper
-list of series and an episode grid), and hands playback off to your installed
-`ani-cli` binary — so all the stream-extraction and player logic stays in one
-place and keeps working as ani-cli updates.
+A native Linux desktop app for watching anime, built in Rust with
+[GPUI](https://www.gpui.rs/). It browses AllAnime and AniList, plays episodes
+inside its own window through libmpv, and uses
+[ani-cli](https://github.com/pystardust/ani-cli) to find streams. Because
+ani-cli does the stream extraction, ani-gui keeps working as ani-cli updates.
 
 ## Features
 
-- Search with cover art (AniList / MyAnimeList / Wikipedia fallback), sub/dub toggle, episode grid
-- Play or download any episode in your chosen player (mpv / IINA / VLC)
-- **Continue Watching** — resumes the next episode from ani-cli's history
-- Quality selection (best / 1080 / 720 / 480 / worst)
-- Update & health check — flags ani-cli and ani-gui updates, missing binaries, or no player
-- Zero third-party dependencies; single Python file + single HTML file
+- **Home**: a hero banner, Continue Watching, recommendations based on what you
+  watch, and AniList's trending shows. Opens from the local cache straight away
+  and refreshes in the background.
+- **Search** with cover art and sub/dub episode counts.
+- **Show pages** with the synopsis, genres, score, and an episode list that
+  marks what you've watched.
+- **In-window playback** through libmpv: seek bar, volume, fullscreen, external
+  subtitle and audio tracks, autoplay of the next episode, and resume from where
+  you stopped.
+- **My List** for the shows you want to keep track of, plus your
+  MyAnimeList and/or AniList list grouped by status.
+- **MyAnimeList and AniList sync** (optional): imports what you've watched,
+  marks episodes you finish, and sends a 1–10 rating when you finish a show.
+  See [Connecting MyAnimeList and AniList](#connecting-myanimelist-and-anilist).
+- **Calendar** of this week's airing episodes, from AniList.
+- **Downloads** manager with live progress, cancel and retry.
+- **Shares history with ani-cli**: what you watch here shows up in
+  `ani-cli -c`, and the other way round.
+- Settings for sub/dub, quality, download folder and autoplay, plus a
+  Diagnostics panel that checks your dependencies.
+
+### Player keys
+
+| Key | Action |
+|---|---|
+| Space | Play / pause |
+| ← / → | Seek back / forward |
+| ↑ / ↓ | Volume |
+| M | Mute |
+| F | Fullscreen |
+| N | Next episode |
+| Esc | Leave fullscreen, then the player |
+| Alt+← | Back (anywhere in the app) |
 
 ## Requirements
 
-- `ani-cli` (it handles playback) — the [one-line installer](#install--run),
-  the Homebrew formula, and `ani-gui --install-ani-cli` will set it up for you
-  if it's missing; or install it yourself
-- `python3` (standard library only — no pip installs)
-- A player ani-cli knows about (mpv / IINA / VLC) for watching
+Linux on X11 or Wayland, with a GPU that supports Vulkan.
 
-On Linux, install the dependencies from your package manager first:
+### Runtime
 
-```sh
-# Debian/Ubuntu
-sudo apt install mpv python3 pipx
-# Fedora
-sudo dnf install mpv python3 pipx
-# Arch
-sudo pacman -S mpv python python-pipx
-```
+| Package | Why |
+|---|---|
+| [`ani-cli`](https://github.com/pystardust/ani-cli) | Finds the stream for each episode (it needs `curl`, `grep` and `sed`, plus `fzf` to use it in a terminal) |
+| `libmpv2` | Plays video inside the window. Loaded when the app starts; without it, everything except playback still works |
+| `yt-dlp` and `ffmpeg` | Downloads (ani-cli calls them) |
 
-`ani-cli` isn't packaged on most distros — install it from the
-[upstream repo](https://github.com/pystardust/ani-cli) (Arch users: `yay -S ani-cli`):
+On Debian or Ubuntu:
 
 ```sh
-sudo curl -sL https://raw.githubusercontent.com/pystardust/ani-cli/master/ani-cli -o /usr/local/bin/ani-cli
-sudo chmod +x /usr/local/bin/ani-cli
+sudo apt install libmpv2 curl fzf yt-dlp ffmpeg
 ```
 
-## Install & run
-
-**One-line installer** — installs ani-cli, a player, and ani-gui (skips
-whatever's already there):
+ani-cli isn't packaged on most distros. Install it from the
+[upstream repo](https://github.com/pystardust/ani-cli#installation), or:
 
 ```sh
-curl -sL https://raw.githubusercontent.com/rickwiththeportalgun/ani-gui/main/install.sh | sh
+mkdir -p ~/.local/bin
+curl -sL https://raw.githubusercontent.com/pystardust/ani-cli/master/ani-cli -o ~/.local/bin/ani-cli
+chmod +x ~/.local/bin/ani-cli
 ```
 
-**pipx** — recommended. Isolated environment, handles PATH automatically:
+### Build
+
+A recent stable Rust toolchain (from [rustup](https://rustup.rs)) and these
+development packages:
 
 ```sh
-# Install pipx first (one time):
-#   Debian/Ubuntu:  sudo apt install pipx
-#   Fedora:         sudo dnf install pipx
-#   Arch:           sudo pacman -S python-pipx
-#   macOS:          brew install pipx
-#   any OS:         python3 -m pip install --user pipx
-pipx ensurepath          # adds ~/.local/bin to PATH — restart your shell after
-
-pipx install ani-gui
-ani-gui
+sudo apt install build-essential pkg-config libxkbcommon-x11-dev libxkbcommon-dev \
+  libwayland-dev libvulkan-dev libfontconfig-dev libfreetype-dev \
+  libxcb1-dev
 ```
 
-**Homebrew** (macOS / Linux) — see [`Formula/ani-gui.rb`](Formula/ani-gui.rb):
+libmpv isn't needed to build, because the app loads it at runtime.
+
+## Install
+
+### From the latest release (recommended)
+
+One command, no root and no build tools. It installs into `~/.local`:
 
 ```sh
-brew install rickwiththeportalgun/tap/ani-gui
-ani-gui
+v=$(curl -fsSL https://api.github.com/repos/SweetTooth05/ani-gui/releases/latest \
+      | sed -n 's/.*"tag_name": *"v\([0-9.]*\)".*/\1/p') &&
+  [ -n "$v" ] && mkdir -p ~/.local &&
+  curl -fL "https://github.com/SweetTooth05/ani-gui/releases/download/v$v/ani-gui-$v-x86_64-unknown-linux-gnu.tar.gz" \
+    | tar -xz -C ~/.local --strip-components=1 &&
+  sed -i "s|^Exec=ani-gui\$|Exec=$HOME/.local/bin/ani-gui|" \
+    ~/.local/share/applications/io.github.sweettooth05.AniGui.desktop
 ```
 
-**pip** — works but may need a PATH tweak. Scripts land in a user bin dir that
-isn't always on `PATH`: `~/.local/bin` on Linux, `~/Library/Python/3.x/bin` on
-macOS. Add it to your shell config if `ani-gui` isn't found:
+The tarball is laid out like an install prefix (`bin/`, `share/`), so this
+puts the binary, the launcher entry and the icons in the same places as
+`make install` below. The last step points the launcher entry at
+`~/.local/bin/ani-gui`, because that folder is often missing from the desktop
+session's `PATH`. To check a download's signature by hand first, see
+[docs/releasing.md](docs/releasing.md#verifying-a-release-by-hand).
+
+### From source
 
 ```sh
-pip3 install --user ani-gui
-# Linux — if "command not found":
-export PATH="$HOME/.local/bin:$PATH"
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc   # or ~/.zshrc
-# macOS — if "command not found":
-export PATH="$HOME/Library/Python/$(python3 -c 'import sys;print(sys.version_info.minor)')/bin:$PATH"
-ani-gui
+git clone https://github.com/SweetTooth05/ani-gui.git
+cd ani-gui
+make
+make install
 ```
 
-**From source** (no install):
+This installs into `~/.local` and needs no root:
+
+- `~/.local/bin/ani-gui`
+- `~/.local/share/applications/io.github.sweettooth05.AniGui.desktop`
+- `~/.local/share/icons/hicolor/*/apps/io.github.sweettooth05.AniGui*` (PNG sizes 16–512, scalable and symbolic SVG)
+
+ani-gui then shows up in your app launcher. The launcher entry runs
+`~/.local/bin/ani-gui` by its full path.
+
+To install system-wide instead, build as your user and install as root, so cargo
+never runs as root:
 
 ```sh
-git clone https://github.com/rickwiththeportalgun/ani-gui && cd ani-gui
-./ani-gui
+make
+sudo make install PREFIX=/usr/local
 ```
 
-**macOS .app** (double-click, no terminal):
+`./install.sh` does the same as `make && make install` after checking that the
+build tools and libraries are there.
+
+### Updates
+
+ani-gui updates itself when it is installed in `~/.local`, from the release
+tarball or with `make install`:
+
+- It checks GitHub's latest release a few seconds after it starts, at most
+  once every six hours. **Settings → Updates → Check now** checks straight
+  away.
+- It installs a newer version only if the release's checksums carry a valid
+  signature from the ani-gui release key built into the app, and the
+  download matches them.
+- It replaces `~/.local/bin/ani-gui` in place. The new version runs the next
+  time you start ani-gui, or straight away with **Restart now**.
+- Turn off **Install updates automatically** to only be told about new
+  versions.
+
+It never asks for root. A system-wide install such as `/usr/local`, or a
+build run from the source tree (`cargo run`, `target/release/`), only tells
+you when an update is out. Update those with `git pull && make && make install`
+(add `sudo` and `PREFIX=...` for a system-wide install).
+
+### Uninstall
 
 ```sh
-sh packaging/macos/make-app.sh    # builds dist/ani-gui.app
+make uninstall                       # or: sudo make uninstall PREFIX=/usr/local
 ```
 
-Running `ani-gui` starts a local server and opens `http://127.0.0.1:17390` in
-your browser. Options: `--port`, `--host`, `--no-browser` (or `ANI_GUI_PORT`).
+This removes the binary, the desktop entry and the icons. Your library and
+settings stay where they are (see below); delete those folders too for a
+clean slate.
 
-> ani-gui is a **localhost** tool — it opens a player on the machine running it,
-> so it isn't a shared website. See [DISTRIBUTION.md](DISTRIBUTION.md).
+## macOS
 
-## Uninstall / teardown
+ani-gui also runs on macOS 11 or later, on Apple Silicon and Intel Macs. It
+comes as an `ani-gui.app` bundle.
 
-Remove ani-gui the same way you installed it:
+### Prerequisites
+
+Install the tools with [Homebrew](https://brew.sh):
 
 ```sh
-pipx uninstall ani-gui          # installed with pipx
-pip3 uninstall ani-gui          # installed with pip
-brew uninstall ani-gui          # installed via the Homebrew tap
-# from source: just delete the cloned folder
+brew install mpv ani-cli yt-dlp ffmpeg
 ```
 
-ani-gui keeps a little state next to ani-cli's, under
-`~/.local/state/ani-cli/` (or `$XDG_STATE_HOME/ani-cli`). Remove the files
-**ani-gui** created — this leaves ani-cli's own watch history untouched:
+`mpv` provides libmpv, which plays the video. ani-gui finds it in
+Homebrew's `/opt/homebrew/lib` (Apple Silicon) or `/usr/local/lib` (Intel).
+It also finds `ani-cli` and the other tools in Homebrew's `bin` folders, even
+when the app is started from Finder. **Settings → Diagnostics** shows what
+it found.
+
+### From a release
+
+Download `ani-gui-<version>-aarch64-apple-darwin.tar.gz` (Apple Silicon) or
+`...-x86_64-apple-darwin.tar.gz` (Intel) from the
+[latest release](https://github.com/SweetTooth05/ani-gui/releases/latest),
+then unpack it into an Applications folder:
 
 ```sh
-rm -f ~/.local/state/ani-cli/ani-gui-settings.json   # your saved download dir
-rm -f ~/.local/state/ani-cli/ani-downloads.json      # ani-gui's download log
+mkdir -p ~/Applications
+tar -xzf ani-gui-*-apple-darwin.tar.gz -C ~/Applications
 ```
 
-Downloaded videos stay wherever you saved them (your chosen download directory,
-or the folder you launched from) — delete those yourself if you want.
+Use `/Applications` instead of `~/Applications` to install it for every user.
 
-To also remove ani-cli and the player (full teardown):
+### From source
+
+You need [rustup](https://rustup.rs) and the Xcode Command Line Tools
+(`xcode-select --install`). Then:
 
 ```sh
-rm -rf ~/.local/state/ani-cli         # ani-cli watch history + ani-gui state
-sudo rm -f /usr/local/bin/ani-cli     # if installed via the curl snippet above
-# Debian/Ubuntu:  sudo apt remove mpv
-# Fedora:         sudo dnf remove mpv
-# Arch:           sudo pacman -R mpv
+git clone https://github.com/SweetTooth05/ani-gui.git
+cd ani-gui
+make app
+cp -R target/release/ani-gui.app ~/Applications/
 ```
 
-## Use
+`make app` builds the release binary and wraps it in
+`target/release/ani-gui.app`, with its icon, signed ad hoc.
 
-**Search tab**
+### The first launch (Gatekeeper)
 
-1. Type a search and hit **Search** (toggle **Sub/Dub** as needed).
-2. Click a series to load its episodes (cover art shown for each result).
-3. Click an episode, pick a quality, then **Play** (or **Download**).
+The app is signed ad hoc, not with an Apple Developer ID, and it is not
+notarized by Apple. When you download it in a browser, macOS can block it the
+first time with a message that it "cannot be opened" or "cannot be
+verified". To allow it:
 
-**Continue Watching tab**
+- On macOS 14 and earlier, right-click `ani-gui.app` in Finder and choose
+  **Open**, then **Open** again.
+- On macOS 15 and later, try to open it once, then go to **System Settings →
+  Privacy & Security** and click **Open Anyway**.
+- On any version, you can instead remove the download quarantine flag in
+  Terminal:
 
-Reads ani-cli's watch history and shows each series with its cover and the
-next unwatched episode. **Resume** plays that next episode in one click.
-Series you're caught up on are shown but disabled.
+  ```sh
+  xattr -dr com.apple.quarantine ~/Applications/ani-gui.app
+  ```
 
-Playback opens in your usual ani-cli player. Downloads go to ani-cli's
-download directory (`ANI_CLI_DOWNLOAD_DIR`, defaults to the current dir).
+You only need to do this once. A copy you built yourself, or downloaded with
+`curl` rather than a browser, carries no quarantine flag and opens straight
+away.
 
-## How it works
+### Updates on macOS
 
-- `GET /api/search` and `GET /api/episodes` call the AllAnime GraphQL API
-  directly. Covers are proxied through `GET /api/cover` (with a Wikipedia
-  fallback when the API provides no artwork). Results are filtered/ordered
-  to match ani-cli's own `-S` numbering.
-- `GET /api/continue` parses ani-cli's history file
-  (`$ANI_CLI_HIST_DIR` or `~/.local/state/ani-cli/ani-hsts`) and resolves
-  each show's cover + next episode.
-- `POST /api/play` runs `ani-cli -S <n> -e <ep> -q <quality> [--dub] [-v] "<query>"`
-  with stdin closed, so ani-cli resolves the stream, launches the player
-  detached, then exits cleanly. Pass `player: "vlc"` for VLC.
-- `POST /api/resume` looks up the show's search position by id (so the `-S`
-  number is correct) and plays the next episode.
-- `GET /api/version` reports ani-gui / ani-cli versions, whether an update is
-  available, and which players are installed.
-- `GET /docs` serves the project landing page with install instructions and
-  links back to the app.
+ani-gui updates the whole `ani-gui.app` bundle in place, with the same
+signature checks as on Linux. It needs to be able to write to the folder that
+holds the app:
+
+- In `~/Applications`, automatic updates work without an administrator
+  account.
+- In `/Applications`, they work only if your account can write there (on a
+  standard Mac, administrator accounts can). Otherwise ani-gui only tells you
+  when a new version is out.
+- An app started from the download folder before you move it (macOS then
+  runs it from a read-only copy) or from `target/release/` also only tells
+  you.
+
+On macOS, your library and settings live in
+`~/Library/Application Support/ani-gui/` and the cache in
+`~/Library/Caches/ani-gui/`. Downloads go to `~/Movies/ani-gui` by default.
+ani-cli's watch history is in the same place as on Linux. To uninstall, drag
+`ani-gui.app` to the Bin.
+
+## Connecting MyAnimeList and AniList
+
+Connect either account, or both, in **Settings → Accounts**. ani-gui then:
+
+- imports your anime list when you connect, when the app starts (at most every
+  half hour) and when you press **Sync now**, and shows it on My List grouped
+  by status. Episodes up to your list's progress count as watched on show
+  pages, and shows you're watching appear in Continue Watching;
+- updates your progress on each connected service when you finish an episode
+  (marking the show completed after its final episode), and offers a 1–10
+  rating then and in the show page's **Your list** section;
+- keeps changes it couldn't send (offline, server down) and retries them on the
+  next sync. When both lists have the same show, the most recently updated one
+  wins.
+
+There are no built-in developer keys: you register your own (free) API client
+with each service and paste its client ID into Settings. Client IDs aren't
+secret. Sign-in tokens are stored only in your system keychain (Secret Service,
+such as GNOME Keyring or KWallet, on Linux; the Keychain on macOS), never in
+ani-gui's files. Without a working keychain, connecting fails with an
+explanation rather than saving tokens anywhere else.
+
+### MyAnimeList
+
+1. Sign in at [myanimelist.net/apiconfig](https://myanimelist.net/apiconfig)
+   and choose **Create ID**.
+2. Set **App Type** to **other**, and **App Redirect URL** to exactly:
+   ```
+   http://localhost:53682/callback
+   ```
+   Fill in the other required fields (name, description, homepage) however you
+   like.
+3. Copy the **Client ID** (not the secret: "other" apps don't have one) into
+   Settings → Accounts → MyAnimeList, and press **Connect**.
+4. Approve access in the browser that opens. ani-gui listens on
+   `127.0.0.1:53682` for up to five minutes to receive the redirect; when the
+   page says you can close the tab, you're connected.
+
+The sign-in uses OAuth 2 with PKCE, and the token refreshes itself. If port
+53682 is taken by another program, close it and try again.
+
+### AniList
+
+1. Go to [anilist.co/settings/developer](https://anilist.co/settings/developer)
+   and choose **Create New Client**.
+2. Set the **Redirect URL** to exactly:
+   ```
+   https://anilist.co/api/v2/oauth/pin
+   ```
+3. Copy the client's **ID** (a number) into Settings → Accounts → AniList, and
+   press **Connect**.
+4. Approve access in the browser. AniList then shows a token: copy all of it,
+   paste it into the field ani-gui shows, and press **Save token**.
+
+AniList tokens last a year. When one expires or you revoke access, ani-gui
+marks the account disconnected and asks you to connect again.
+
+**Disconnect** removes the token from the keychain and forgets the imported
+list; your lists on MyAnimeList and AniList are untouched.
+
+## Where your data lives
+
+| What | Where |
+|---|---|
+| Library, watch progress, My List, downloads list, settings, imported MyAnimeList/AniList lists (SQLite) | `~/.local/share/ani-gui/ani-gui.db` (`$XDG_DATA_HOME/ani-gui/`) |
+| MyAnimeList / AniList sign-in tokens | Your system keychain (service `ani-gui`) |
+| Cover art and the helper scripts ani-cli calls | `~/.cache/ani-gui/` (`$XDG_CACHE_HOME/ani-gui/`) |
+| Downloaded episodes | `~/Videos/ani-gui` by default; change it in Settings |
+| Watch history shared with ani-cli | `~/.local/state/ani-cli/ani-hsts` (ani-cli's own file; `$ANI_CLI_HIST_DIR` and `$XDG_STATE_HOME` are honoured) |
+
+The paths above are for Linux. For macOS, see [macOS](#macos). The cache is
+safe to delete at any time.
 
 ## Troubleshooting
 
-- **"ani-cli isn't installed"** — install it (`brew install ani-cli` or see the
-  upstream repo) and make sure it's on your `PATH`, then reload.
-- **"No video player found"** — install `mpv` or `iina`.
-- **Play does nothing / black screen** — a specific source may be down. Try a
-  different quality, or pick another search result. (Same behavior as ani-cli.)
-- **Continue tab is slow** — it makes one API call per history entry; large
-  histories take a moment.
+Start with **Settings → Diagnostics**. It shows whether ani-cli (and its
+version), libmpv, yt-dlp, ffmpeg and curl were found. Click **Check again**
+after installing something.
 
-## FAQ
+- **"Install libmpv2" when you press Play**: the app couldn't load
+  `libmpv.so.2`. Install `libmpv2` (Debian/Ubuntu) or your distro's mpv library
+  package.
+- **An episode won't start, or shows ani-cli's error**: run
+  `ani-cli <show name>` in a terminal. If that fails too, the problem is
+  upstream; update ani-cli (`ani-cli -U`) or check its
+  [issues](https://github.com/pystardust/ani-cli/issues).
+- **"Which one is it?" on a show page**: ani-cli's search returned several
+  similar titles. Pick the right one once and ani-gui remembers it for that
+  show.
+- **Downloads fail straight away**: check that `yt-dlp` and `ffmpeg` are
+  installed, and that the download folder in Settings is writable.
+- **The window doesn't open**: run `ani-gui` from a terminal to see the error.
+  GPUI needs a working Vulkan driver (`vulkaninfo` from `vulkan-tools` will
+  tell you).
+- **Rows on Home are empty**: AniList may be rate-limiting you, or you're
+  offline. Cached rows still show; the rest come back on the next refresh.
 
-**Can I host this so people use it from a browser, like a website?**
-Not as-is. ani-gui launches a local player (mpv / iina) on the machine running
-the server, so if you host it remotely the video opens on the *server*, not the
-visitor's screen. It's designed as a localhost tool — each person runs it on
-their own computer. See `DISTRIBUTION.md` for packaging options and what a
-truly hosted, in-browser-playback version would require.
+## Development
 
-## Contributing
+```sh
+cargo run                                     # debug build
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
 
-Issues and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) and the
-[Code of Conduct](CODE_OF_CONDUCT.md).
-
-## Files
-
-- `ani_gui/server.py` — zero-dependency Python backend
-- `ani_gui/index.html` — single-file frontend
-- `ani-gui` — source launcher (`python3 -m ani_gui`)
-- `pyproject.toml` — packaging / console entry point
-- `Formula/ani-gui.rb` — Homebrew formula template
-- `packaging/macos/make-app.sh` — builds a double-clickable `.app`
-- `docs/index.html` — project homepage (GitHub Pages)
+See [CONTRIBUTING.md](CONTRIBUTING.md). The logo files and their usage rules
+are in [`assets/brand/`](assets/brand/README.md).
 
 ## License
 
-[GPL-3.0](LICENSE), matching upstream ani-cli (ani-gui replicates ani-cli's
-public AllAnime API constants and mirrors its result ordering).
-
-ani-gui is an independent front-end and is not affiliated with the ani-cli
-project. It streams nothing itself — playback is delegated to ani-cli.
+[GPL-3.0](LICENSE). ani-gui is a front end for ani-cli and doesn't host any
+content.

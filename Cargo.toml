@@ -1,0 +1,40 @@
+[package]
+name = "ani-gui"
+version = "1.0.0"
+edition = "2024"
+description = "Native Linux desktop client for ani-cli"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+anyhow = "1.0.105"
+ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
+flate2 = "1.1.11"
+futures = "0.3.34"
+getrandom = "0.3.4"
+gpui = "0.2.2"
+image = { version = "0.25.10", default-features = false }
+# OS keychain for MyAnimeList/AniList tokens: Secret Service (pure-Rust zbus,
+# no libdbus needed) on Linux, Apple Keychain on macOS. No plaintext store.
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "async-secret-service", "async-io", "crypto-rust"] }
+libloading = "0.8.9"
+nix = { version = "0.31.4", features = ["fs", "process", "signal", "term"] }
+regex = "1.13.2"
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = { version = "0.10.9", default-features = false }
+tar = { version = "0.4.46", default-features = false }
+unicode-segmentation = "1.13.3"
+ureq = { version = "3.5.2", features = ["json"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Session-bus screen-saver inhibition while video plays (already in the tree via gpui).
+zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# CFStrings for the IOKit power assertion that keeps the display awake
+# (already in the tree via gpui).
+core-foundation = "0.10.0"
+
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }

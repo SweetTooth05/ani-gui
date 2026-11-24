@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=ani-gui
+GenericName=Anime Player
+Comment=Browse and watch anime with ani-cli
+Exec=ani-gui
+Icon=io.github.sweettooth05.AniGui
+Terminal=false
+Categories=AudioVideo;Video;Player;
+Keywords=anime;ani-cli;video;stream;
+StartupNotify=true
+StartupWMClass=io.github.sweettooth05.AniGui
