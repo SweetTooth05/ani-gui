@@ -38,6 +38,38 @@ jobs:
       - name: test
         run: cargo test
 
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      # libmpv for the playback tests (they skip without it); ffmpeg comes
+      # with it and makes their test clip.
+      - name: Install mpv
+        run: brew install mpv
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test
+
+      - name: make app
+        run: |
+          make app
+          plutil -lint target/release/ani-gui.app/Contents/Info.plist
+          codesign --verify --strict --verbose=2 target/release/ani-gui.app
+          file target/release/ani-gui.app/Contents/MacOS/ani-gui
+
   packaging:
     runs-on: ubuntu-latest
     steps:
@@ -49,7 +81,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends shellcheck desktop-file-utils
 
       - name: shellcheck
-        run: shellcheck install.sh
+        run: shellcheck install.sh packaging/macos/build-app.sh
 
       - name: desktop-file-validate
         run: desktop-file-validate assets/ani-gui.desktop

@@ -107,11 +107,16 @@ gh secret list --env release --repo SweetTooth05/ani-gui
    - **Check the tag matches Cargo.toml**
    - **Build x86_64-unknown-linux-gnu**: `cargo test`, the release build,
      then packaging (on ubuntu-22.04, for an older glibc)
+   - **Build aarch64-apple-darwin** (macos-14) and **Build
+     x86_64-apple-darwin** (macos-15-intel): the same, packaged as an
+     ad hoc signed `ani-gui.app` (`make app`)
    - **Sign and publish**: waits for your approval if you set up the
      environment. Approve only tags you pushed yourself.
 7. The release contains:
    - `ani-gui-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz`: `bin/ani-gui`, the
      desktop entry and icons, laid out as an install prefix
+   - `ani-gui-X.Y.Z-aarch64-apple-darwin.tar.gz` and
+     `ani-gui-X.Y.Z-x86_64-apple-darwin.tar.gz`: `ani-gui.app` at the top
    - `SHA256SUMS`
    - `SHA256SUMS.sig`
 
@@ -155,13 +160,16 @@ sha256sum --check --ignore-missing SHA256SUMS
 
 Both commands must succeed: `Signature Verified Successfully`, then `OK`.
 
-## Adding macOS
+## macOS builds
 
-The build job is a matrix. A macOS entry (`aarch64-apple-darwin` on
-`macos-14`, `x86_64-apple-darwin` on `macos-13`) needs a packaging step that
-writes `dist/ani-gui-<version>-<target>.tar.gz`. The comment in the workflow
-marks the spot. The release job signs every archive it receives, and the
-updater picks its asset by the target triple it was built for (`build.rs`).
+The build job is a matrix: Linux, `aarch64-apple-darwin` on `macos-14` and
+`x86_64-apple-darwin` on `macos-15-intel`. Each writes
+`dist/ani-gui-<version>-<target>.tar.gz`; the release job signs every archive
+it receives, and the updater picks its asset by the target triple it was
+built for (`build.rs`). On macOS the updater replaces the whole
+`ani-gui.app`, so the archive must hold exactly `ani-gui.app/` at its top
+with `Contents/MacOS/ani-gui` inside. The app is signed ad hoc, not with a
+Developer ID, and isn't notarized.
 
 ## Rotating the key
 
