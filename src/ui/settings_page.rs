@@ -13,6 +13,7 @@ use gpui::{
 use crate::app::AppState;
 use crate::diagnostics::{self, Report};
 use crate::model::{Mode, Settings};
+use crate::ui::accounts::AccountsSection;
 use crate::ui::components::button::{ButtonKind, button, segmented};
 use crate::ui::components::icon::icon;
 use crate::ui::components::text_input::{Changed, TextInput};
@@ -37,6 +38,7 @@ pub struct SettingsPage {
     check_task: Option<Task<()>>,
     scroll: ScrollHandle,
     _dir_changes: Subscription,
+    accounts: Entity<AccountsSection>,
 }
 
 impl SettingsPage {
@@ -63,6 +65,7 @@ impl SettingsPage {
             check_task: None,
             scroll: ScrollHandle::new(),
             _dir_changes: dir_changes,
+            accounts: cx.new(AccountsSection::new),
         };
         page.check(cx);
         if let Some(updates) = updater::model(cx) {
@@ -414,6 +417,13 @@ impl SettingsPage {
             .into_any_element()
     }
 
+    /// MyAnimeList and AniList (`ui::accounts`).
+    fn render_accounts(&self) -> AnyElement {
+        section("Accounts")
+            .child(self.accounts.clone())
+            .into_any_element()
+    }
+
     fn render_diagnostics(&self, cx: &mut Context<Self>) -> AnyElement {
         let heading = div()
             .flex()
@@ -485,6 +495,7 @@ impl Render for SettingsPage {
                     .child(self.render_playback(cx))
                     .child(self.render_downloads(cx))
                     .child(self.render_updates(cx))
+                    .child(self.render_accounts())
                     .child(self.render_diagnostics(cx)),
             )
     }

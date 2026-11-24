@@ -9,6 +9,7 @@ mod downloads;
 mod history;
 mod images;
 mod keep_awake;
+mod lists;
 mod model;
 mod net;
 mod paths;

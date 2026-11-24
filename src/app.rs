@@ -214,6 +214,7 @@ impl Root {
             downloads_changed,
         });
         crate::updater::init(cx);
+        crate::ui::accounts::start(cx);
         self.phase = Phase::Ready;
         self.navigate(Route::Home, cx);
     }

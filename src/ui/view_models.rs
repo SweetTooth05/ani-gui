@@ -6,12 +6,15 @@ use serde::{Deserialize, Serialize};
 use crate::anicli::normalize_title;
 use crate::db::{self, Db, lock};
 use crate::history::HistoryEntry;
+use crate::lists::{self, ListEntry};
 use crate::model::{AniListMedia, Mode, Progress, ShowRecord, ShowSummary, valid_episode};
 use crate::progress;
 
 /// How many shows Continue Watching considers from each source.
 const PROGRESS_SHOWS: usize = 20;
 const HISTORY_ENTRIES: usize = 12;
+/// "Watching" shows from MyAnimeList/AniList not played here.
+const REMOTE_ENTRIES: usize = 8;
 const MAX_ITEMS: usize = 20;
 
 /// One Continue Watching card.
@@ -39,7 +42,9 @@ pub trait Catalog {
 
 /// Shows to pick up again, newest first: the app's own progress, then
 /// ani-cli history entries (newest lines last in its file) for shows without
-/// app progress, matched by title. `mode` applies to history entries, which
+/// app progress, matched by title, then shows the user is watching on
+/// MyAnimeList/AniList, at the episode after the list's progress. `mode`
+/// applies to history and list entries, which
 /// do not record one. `misses` holds (mode, normalized title) pairs no search
 /// matched; keep it for the session so they are not searched again. Blocks on
 /// `catalog`; run it off the UI thread.
@@ -105,8 +110,69 @@ pub fn continue_items(
         };
         items.push(item_for(db, catalog, record, mode, ep, 0.0, 0.0));
     }
+    for entry in lists::watching(db).iter().take(REMOTE_ENTRIES) {
+        if items.len() >= MAX_ITEMS {
+            break;
+        }
+        let Some(record) = match_remote(db, catalog, entry, mode, misses) else {
+            continue;
+        };
+        if !seen.insert(record.summary.id.clone())
+            || show_titles(db, &record.summary)
+                .iter()
+                .any(|t| seen_titles.contains(t))
+        {
+            continue;
+        }
+        let episodes = catalog.episodes(&record.summary, mode);
+        let next = match entry.progress {
+            0 => episodes.first().cloned(),
+            n => progress::next_after(&n.to_string(), &episodes),
+        };
+        if let Some(ep) = next {
+            items.push(item_for(db, catalog, record, mode, ep, 0.0, 0.0));
+        }
+    }
     items.truncate(MAX_ITEMS);
     items
+}
+
+/// The AllAnime show for a MyAnimeList/AniList "watching" entry: one
+/// stored with its AniList id, else a search result carrying that id.
+fn match_remote(
+    db: &Mutex<Db>,
+    catalog: &impl Catalog,
+    entry: &ListEntry,
+    mode: Mode,
+    misses: &mut HashSet<(Mode, String)>,
+) -> Option<ShowRecord> {
+    if let Ok(Some(record)) = lock(db).show_by_anilist_id(entry.anilist_id) {
+        return Some(record);
+    }
+    let wanted = normalize_title(&entry.title);
+    if wanted.is_empty() || misses.contains(&(mode, wanted.clone())) {
+        return None;
+    }
+    let results = catalog
+        .search(&entry.title, mode)
+        .inspect_err(|err| eprintln!("ani-gui: searching AllAnime for {:?}: {err:#}", entry.title))
+        .ok()?;
+    let Some(found) = results
+        .into_iter()
+        .find(|s| s.anilist_id == Some(entry.anilist_id))
+    else {
+        misses.insert((mode, wanted));
+        return None;
+    };
+    let record = ShowRecord {
+        summary: found,
+        media: None,
+        updated_at: db::now(),
+    };
+    if let Err(err) = lock(db).upsert_show(&record) {
+        eprintln!("ani-gui: saving show {}: {err:#}", record.summary.id);
+    }
+    Some(record)
 }
 
 fn item_for(
@@ -412,12 +478,16 @@ pub struct ShowPageModel {
 }
 
 impl ShowPageModel {
-    /// `progress` is this show's progress in `mode`.
+    /// `progress` is this show's progress in `mode`. `remote_progress` is
+    /// how many episodes the user's MyAnimeList/AniList list says they
+    /// watched: episodes numbered up to it count as watched, and Play
+    /// starts after it unless local progress is further along.
     pub fn build(
         show: &ShowSummary,
         media: Option<&AniListMedia>,
         episodes: Option<&[String]>,
         progress: &[Progress],
+        remote_progress: Option<u32>,
         mode: Mode,
     ) -> ShowPageModel {
         let Some(episodes) = episodes else {
@@ -438,12 +508,27 @@ impl ShowPageModel {
                 episodes: Vec::new(),
             };
         }
-        let latest = progress.iter().max_by_key(|p| p.updated_at);
-        let play_target = match latest {
-            Some(latest) => progress::continue_point(latest, episodes)
-                .or_else(|| Some((episodes[0].clone(), 0.0))),
-            None => Some((episodes[0].clone(), 0.0)),
+        let remote = remote_progress.filter(|&n| n > 0);
+        let remote_watched = |ep: &str| {
+            remote.is_some_and(|n| {
+                ep.parse::<f64>()
+                    .is_ok_and(|e| e > 0.0 && e <= f64::from(n))
+            })
         };
+        let latest = progress.iter().max_by_key(|p| p.updated_at);
+        let local_target = latest.and_then(|latest| progress::continue_point(latest, episodes));
+        // The episode after the list's progress (None once it's all watched).
+        let remote_target = remote.map(|n| progress::next_after(&n.to_string(), episodes));
+        let play_target = match (local_target, remote_target) {
+            // Local progress wins unless the list is already past it.
+            (Some((ep, start)), Some(next)) if remote_watched(&ep) => {
+                next.map(|ep| (ep, 0.0)).or(Some((ep, start)))
+            }
+            (Some(local), _) => Some(local),
+            (None, Some(Some(next))) => Some((next, 0.0)),
+            _ => None,
+        }
+        .or_else(|| Some((episodes[0].clone(), 0.0)));
         let play_label = play_target
             .as_ref()
             .map(|(ep, start)| play_label(ep, *start))
@@ -453,12 +538,18 @@ impl ShowPageModel {
             .map(|ep| {
                 let watched = progress.iter().find(|p| p.ep == *ep);
                 let meta = media.and_then(|m| episode_meta(m, ep));
-                let completed = watched.is_some_and(progress::is_completed);
+                let on_list = remote_watched(ep);
+                let completed = watched.is_some_and(progress::is_completed) || on_list;
+                let fraction = if on_list {
+                    1.0
+                } else {
+                    watched.map_or(0.0, watched_fraction)
+                };
                 EpisodeRow {
                     ep: ep.clone(),
                     title: meta.and_then(|(title, _)| title).map(str::to_string),
                     thumb: meta.map(|(_, thumb)| thumb.to_string()),
-                    fraction: watched.map_or(0.0, watched_fraction),
+                    fraction,
                     completed,
                     start: watched.filter(|_| !completed).map_or(0.0, |p| p.position),
                 }
@@ -666,7 +757,7 @@ mod tests {
             progress("s1", "4", 1400.0, 1400.0, 10),
             progress("s1", "5", 560.0, 1400.0, 20),
         ];
-        let model = ShowPageModel::build(&s, None, Some(&eps(10)), &watched, Mode::Sub);
+        let model = ShowPageModel::build(&s, None, Some(&eps(10)), &watched, None, Mode::Sub);
         assert_eq!(model.play_label, "Resume E5");
         assert_eq!(model.play_target, Some(("5".into(), 560.0)));
         assert_eq!(model.episodes.len(), 10);
@@ -686,7 +777,7 @@ mod tests {
             )],
             ..Default::default()
         };
-        let model = ShowPageModel::build(&s, Some(&media), Some(&eps(3)), &[], Mode::Sub);
+        let model = ShowPageModel::build(&s, Some(&media), Some(&eps(3)), &[], None, Mode::Sub);
         assert_eq!(model.play_label, "Play E1");
         assert_eq!(model.play_target, Some(("1".into(), 0.0)));
         assert_eq!(model.episodes[0].thumb, None);
@@ -703,7 +794,7 @@ mod tests {
     #[test]
     fn show_page_model_no_episodes_in_mode() {
         let s = show("s1", "Frieren", None);
-        let model = ShowPageModel::build(&s, None, Some(&[]), &[], Mode::Dub);
+        let model = ShowPageModel::build(&s, None, Some(&[]), &[], None, Mode::Dub);
         assert_eq!(model.play_label, "No dub episodes");
         assert_eq!(model.play_target, None);
         assert_eq!(model.other_mode, Some(Mode::Sub));
@@ -713,7 +804,7 @@ mod tests {
     #[test]
     fn show_page_model_episode_list_failed() {
         let s = show("s1", "Frieren", None);
-        let model = ShowPageModel::build(&s, None, None, &[], Mode::Sub);
+        let model = ShowPageModel::build(&s, None, None, &[], None, Mode::Sub);
         assert_eq!(model.play_label, "Couldn't load episodes");
         assert_eq!(model.play_target, None);
         assert_eq!(model.other_mode, None);
@@ -728,9 +819,53 @@ mod tests {
             progress("s1", "4", 1400.0, 1400.0, 10),
             progress("s1", "5", 560.0, 1400.0, 20),
         ];
-        let model = ShowPageModel::build(&s, None, Some(&eps(6)), &watched, Mode::Sub);
+        let model = ShowPageModel::build(&s, None, Some(&eps(6)), &watched, None, Mode::Sub);
         let starts: Vec<f64> = model.episodes.iter().map(|r| r.start).collect();
         assert_eq!(starts, [0.0, 100.0, 0.0, 0.0, 560.0, 0.0]);
+    }
+
+    #[test]
+    fn remote_progress_marks_episodes_watched() {
+        let s = show("s1", "Frieren", None);
+        let list: Vec<String> = ["1", "2", "2.5", "3", "4", "5"].map(String::from).into();
+        // Watched up to 3 elsewhere, nothing played here.
+        let model = ShowPageModel::build(&s, None, Some(&list), &[], Some(3), Mode::Sub);
+        let done: Vec<bool> = model.episodes.iter().map(|r| r.completed).collect();
+        assert_eq!(done, [true, true, true, true, false, false]);
+        assert_eq!(model.episodes[0].fraction, 1.0);
+        assert_eq!(model.episodes[4].fraction, 0.0);
+        assert_eq!(model.play_target, Some(("4".into(), 0.0)));
+        assert_eq!(model.play_label, "Play E4");
+        // No local playback rows are invented for them.
+        assert!(model.episodes.iter().all(|r| r.start == 0.0));
+        assert_eq!(
+            default_download_range(&model.episodes),
+            Some(("4".into(), "5".into()))
+        );
+    }
+
+    #[test]
+    fn remote_progress_and_local_progress_combine() {
+        let s = show("s1", "Frieren", None);
+        // Local resume point already watched on the list: start after it.
+        let behind = [progress("s1", "2", 300.0, 1400.0, 5)];
+        let model = ShowPageModel::build(&s, None, Some(&eps(6)), &behind, Some(4), Mode::Sub);
+        assert_eq!(model.play_target, Some(("5".into(), 0.0)));
+        assert!(model.episodes[1].completed);
+        assert_eq!(model.episodes[1].start, 0.0);
+        // Local progress ahead of the list wins.
+        let ahead = [progress("s1", "5", 300.0, 1400.0, 5)];
+        let model = ShowPageModel::build(&s, None, Some(&eps(6)), &ahead, Some(2), Mode::Sub);
+        assert_eq!(model.play_target, Some(("5".into(), 300.0)));
+        assert!((model.episodes[4].fraction - 300.0 / 1400.0).abs() < 1e-6);
+        assert!(!model.episodes[4].completed);
+        // All watched on the list: Play E1 again, everything marked.
+        let model = ShowPageModel::build(&s, None, Some(&eps(6)), &[], Some(6), Mode::Sub);
+        assert_eq!(model.play_target, Some(("1".into(), 0.0)));
+        assert!(model.episodes.iter().all(|r| r.completed));
+        // Zero is no progress at all.
+        let model = ShowPageModel::build(&s, None, Some(&eps(3)), &[], Some(0), Mode::Sub);
+        assert!(model.episodes.iter().all(|r| !r.completed));
     }
 
     #[test]
@@ -741,13 +876,13 @@ mod tests {
             progress("s1", "2", 1400.0, 1400.0, 6),
             progress("s1", "3", 300.0, 1400.0, 7),
         ];
-        let model = ShowPageModel::build(&s, None, Some(&eps(6)), &watched, Mode::Sub);
+        let model = ShowPageModel::build(&s, None, Some(&eps(6)), &watched, None, Mode::Sub);
         assert_eq!(
             default_download_range(&model.episodes),
             Some(("3".into(), "6".into()))
         );
         let all = [progress("s1", "1", 1400.0, 1400.0, 5)];
-        let model = ShowPageModel::build(&s, None, Some(&eps(1)), &all, Mode::Sub);
+        let model = ShowPageModel::build(&s, None, Some(&eps(1)), &all, None, Mode::Sub);
         assert_eq!(
             default_download_range(&model.episodes),
             Some(("1".into(), "1".into()))
@@ -929,6 +1064,80 @@ mod tests {
         let history = [history("1", "Nothing Like It")];
         assert!(continue_items(&db, &history, Mode::Sub, &catalog, &mut misses).is_empty());
         assert!(continue_items(&db, &history, Mode::Sub, &catalog, &mut misses).is_empty());
+        assert_eq!(catalog.searches.borrow().len(), 1);
+    }
+
+    fn watching_entry(db: &Mutex<Db>, anilist_id: i64, title: &str, progress: u32) {
+        use crate::lists::{ListStatus, RemoteEntry, Service};
+        db.lock()
+            .unwrap()
+            .upsert_list_entry(&RemoteEntry {
+                service: Service::AniList,
+                remote_id: anilist_id,
+                anilist_id: Some(anilist_id),
+                mal_id: None,
+                status: ListStatus::Watching,
+                progress,
+                score: None,
+                episodes: Some(5),
+                title: title.into(),
+                cover_url: String::new(),
+                updated_at: 10,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn continue_items_adds_list_shows_not_played_here() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        // Stored already (opened once): no search needed.
+        let mut stored = show("aa1", "Sousou no Frieren", Some("Frieren"));
+        stored.anilist_id = Some(154587);
+        store(&db, &stored);
+        watching_entry(&db, 154587, "Frieren", 2);
+        // Not stored: found by searching, matched on the AniList id.
+        let mut found = show("aa2", "Dandadan", None);
+        found.anilist_id = Some(171018);
+        watching_entry(&db, 171018, "Dandadan", 0);
+        // Finished on the list: no next episode, no card.
+        let mut done = show("aa3", "Done", None);
+        done.anilist_id = Some(3);
+        store(&db, &done);
+        watching_entry(&db, 3, "Done", 5);
+        let catalog = FakeCatalog {
+            results: vec![show("wrong", "Dandadan", None), found],
+            ..Default::default()
+        };
+        let mut misses = HashSet::new();
+        let items = continue_items(&db, &[], Mode::Sub, &catalog, &mut misses);
+        let got: Vec<(&str, &str, f64)> = items
+            .iter()
+            .map(|i| (i.show_id.as_str(), i.ep.as_str(), i.start))
+            .collect();
+        assert_eq!(got, [("aa1", "3", 0.0), ("aa2", "1", 0.0)]);
+        assert_eq!(*catalog.searches.borrow(), ["Dandadan"]);
+        assert!(db.lock().unwrap().get_show("aa2").unwrap().is_some());
+    }
+
+    #[test]
+    fn continue_items_prefers_local_progress_over_the_list() {
+        let db = Mutex::new(Db::open_in_memory().unwrap());
+        let mut stored = show("aa1", "Sousou no Frieren", Some("Frieren"));
+        stored.anilist_id = Some(154587);
+        store(&db, &stored);
+        db.lock()
+            .unwrap()
+            .save_progress(&progress("aa1", "4", 300.0, 1200.0, 50))
+            .unwrap();
+        watching_entry(&db, 154587, "Frieren", 1);
+        watching_entry(&db, 99, "Nowhere", 1);
+        let catalog = FakeCatalog::default();
+        let mut misses = HashSet::new();
+        let items = continue_items(&db, &[], Mode::Sub, &catalog, &mut misses);
+        assert_eq!(items.len(), 1);
+        assert_eq!((items[0].ep.as_str(), items[0].start), ("4", 300.0));
+        // The unmatched list show is searched once, then remembered.
+        continue_items(&db, &[], Mode::Sub, &catalog, &mut misses);
         assert_eq!(catalog.searches.borrow().len(), 1);
     }
 

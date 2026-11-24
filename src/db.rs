@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -7,6 +8,7 @@ use anyhow::{Context, Result};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, ToSql, params};
 
+use crate::lists::{Account, ListStatus, PendingPush, RemoteEntry, Service};
 use crate::model::{DlStatus, DownloadRecord, Mode, Progress, Settings, ShowRecord, ShowSummary};
 
 const SCHEMA_V1: &str = "
@@ -73,6 +75,66 @@ CREATE TABLE provider_titles (
 );
 ";
 
+/// MyAnimeList / AniList accounts (`crate::lists`). Tokens are not here:
+/// they live in the OS keychain.
+/// - `list_accounts`: client ID and sign-in state per service.
+/// - `list_entries`: each service's list as last imported or pushed, keyed
+///   by the service's own media id.
+/// - `list_id_map`: MAL id to AniList id (NULL: AniList has no match).
+/// - `list_pending`: pushes that failed, retried on the next sync; one per
+///   (service, show), holding the whole desired entry.
+/// - `list_rating_prompts`: finished shows the user hasn't rated yet.
+const SCHEMA_V3: &str = "
+CREATE TABLE list_accounts (
+    service TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL DEFAULT '',
+    user_id INTEGER,
+    user_name TEXT,
+    connected_at INTEGER,
+    last_sync INTEGER,
+    last_error TEXT
+);
+CREATE TABLE list_entries (
+    service TEXT NOT NULL,
+    remote_id INTEGER NOT NULL,
+    anilist_id INTEGER,
+    mal_id INTEGER,
+    status TEXT NOT NULL,
+    progress INTEGER NOT NULL DEFAULT 0,
+    score REAL,
+    episodes INTEGER,
+    title TEXT NOT NULL DEFAULT '',
+    cover_url TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (service, remote_id)
+);
+CREATE INDEX list_entries_anilist ON list_entries (anilist_id);
+CREATE TABLE list_id_map (
+    mal_id INTEGER PRIMARY KEY,
+    anilist_id INTEGER,
+    checked_at INTEGER NOT NULL
+);
+CREATE INDEX list_id_map_anilist ON list_id_map (anilist_id);
+CREATE TABLE list_pending (
+    service TEXT NOT NULL,
+    anilist_id INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    progress INTEGER NOT NULL,
+    score REAL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (service, anilist_id)
+);
+CREATE TABLE list_rating_prompts (
+    anilist_id INTEGER PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
+";
+
+const ENTRY_COLUMNS: &str = "service, remote_id, anilist_id, mal_id, status, progress, score, \
+    episodes, title, cover_url, updated_at";
+
 pub struct Db {
     conn: Connection,
 }
@@ -96,7 +158,7 @@ impl Db {
 
     fn init(mut conn: Connection) -> Result<Db> {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        for (target, schema) in [(1, SCHEMA_V1), (2, SCHEMA_V2)] {
+        for (target, schema) in [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3)] {
             if version < target {
                 let tx = conn.transaction()?;
                 tx.execute_batch(schema)?;
@@ -451,6 +513,309 @@ impl Db {
         Ok(())
     }
 
+    pub fn list_accounts(&self) -> Result<Vec<Account>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT service, client_id, user_name, connected_at, last_sync, last_error
+             FROM list_accounts ORDER BY service",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Account {
+                service: r.get(0)?,
+                client_id: r.get(1)?,
+                user_name: r.get(2)?,
+                connected_at: r.get(3)?,
+                last_sync: r.get(4)?,
+                last_error: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The account row, or an empty one when none was saved.
+    pub fn list_account(&self, service: Service) -> Result<Account> {
+        Ok(self
+            .list_accounts()?
+            .into_iter()
+            .find(|a| a.service == service)
+            .unwrap_or_else(|| Account::empty(service)))
+    }
+
+    /// The service's user id (AniList's list query needs it).
+    pub fn list_user_id(&self, service: Service) -> Result<Option<i64>> {
+        let id = self
+            .conn
+            .query_row(
+                "SELECT user_id FROM list_accounts WHERE service = ?1",
+                [service],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(id.flatten())
+    }
+
+    pub fn set_list_client_id(&self, service: Service, client_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO list_accounts (service, client_id) VALUES (?1, ?2)
+             ON CONFLICT(service) DO UPDATE SET client_id = excluded.client_id",
+            params![service, client_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_list_connected(
+        &self,
+        service: Service,
+        client_id: &str,
+        user_id: i64,
+        user_name: &str,
+        at: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO list_accounts (service, client_id, user_id, user_name, connected_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(service) DO UPDATE SET
+                 client_id = excluded.client_id, user_id = excluded.user_id,
+                 user_name = excluded.user_name, connected_at = excluded.connected_at,
+                 last_error = NULL",
+            params![service, client_id, user_id, user_name, at],
+        )?;
+        Ok(())
+    }
+
+    /// Marks the account signed out, keeping its imported list (it is
+    /// still the user's list; reconnecting refreshes it).
+    pub fn set_list_disconnected(&self, service: Service, error: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO list_accounts (service, last_error) VALUES (?1, ?2)
+             ON CONFLICT(service) DO UPDATE SET
+                 connected_at = NULL, last_error = excluded.last_error",
+            params![service, error],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets everything about the account but its client ID.
+    pub fn forget_list_account(&self, service: Service) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE list_accounts SET user_id = NULL, user_name = NULL, connected_at = NULL,
+                 last_sync = NULL, last_error = NULL
+             WHERE service = ?1",
+            [service],
+        )?;
+        tx.execute("DELETE FROM list_entries WHERE service = ?1", [service])?;
+        tx.execute("DELETE FROM list_pending WHERE service = ?1", [service])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_list_synced(&self, service: Service, at: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE list_accounts SET last_sync = ?2, last_error = NULL WHERE service = ?1",
+            params![service, at],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_list_error(&self, service: Service, error: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE list_accounts SET last_error = ?2 WHERE service = ?1",
+            params![service, error],
+        )?;
+        Ok(())
+    }
+
+    /// Replaces the service's whole list with a fresh import.
+    pub fn replace_list_entries(&self, service: Service, entries: &[RemoteEntry]) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM list_entries WHERE service = ?1", [service])?;
+        for entry in entries.iter().filter(|e| e.service == service) {
+            insert_list_entry(&tx, entry)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn upsert_list_entry(&self, entry: &RemoteEntry) -> Result<()> {
+        insert_list_entry(&self.conn, entry)
+    }
+
+    pub fn list_entries(&self) -> Result<Vec<RemoteEntry>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ENTRY_COLUMNS} FROM list_entries ORDER BY updated_at DESC, service"
+        ))?;
+        let rows = stmt.query_map([], entry_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn list_entries_for(&self, anilist_id: i64) -> Result<Vec<RemoteEntry>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {ENTRY_COLUMNS} FROM list_entries WHERE anilist_id = ?1 ORDER BY service"
+        ))?;
+        let rows = stmt.query_map([anilist_id], entry_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn list_entry(&self, service: Service, anilist_id: i64) -> Result<Option<RemoteEntry>> {
+        let entry = self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {ENTRY_COLUMNS} FROM list_entries
+                     WHERE service = ?1 AND anilist_id = ?2 LIMIT 1"
+                ),
+                params![service, anilist_id],
+                entry_from_row,
+            )
+            .optional()?;
+        Ok(entry)
+    }
+
+    /// Cached mappings for `mal_ids`: Some(None) means AniList has no match.
+    pub fn cached_anilist_ids(&self, mal_ids: &[i64]) -> Result<HashMap<i64, Option<i64>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT anilist_id FROM list_id_map WHERE mal_id = ?1")?;
+        let mut found = HashMap::new();
+        for &mal_id in mal_ids {
+            if let Some(anilist_id) = stmt
+                .query_row([mal_id], |r| r.get::<_, Option<i64>>(0))
+                .optional()?
+            {
+                found.insert(mal_id, anilist_id);
+            }
+        }
+        Ok(found)
+    }
+
+    pub fn put_id_mapping(&self, mal_id: i64, anilist_id: Option<i64>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO list_id_map (mal_id, anilist_id, checked_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(mal_id) DO UPDATE SET
+                 anilist_id = excluded.anilist_id, checked_at = excluded.checked_at",
+            params![mal_id, anilist_id, now()],
+        )?;
+        Ok(())
+    }
+
+    /// The MAL id known for an AniList id, from the map or any list entry.
+    pub fn mal_id_for(&self, anilist_id: i64) -> Result<Option<i64>> {
+        let id = self
+            .conn
+            .query_row(
+                "SELECT mal_id FROM list_id_map WHERE anilist_id = ?1
+                 UNION ALL
+                 SELECT mal_id FROM list_entries WHERE anilist_id = ?1 AND mal_id IS NOT NULL
+                 LIMIT 1",
+                [anilist_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(id)
+    }
+
+    /// Queues a push, replacing any queued one for the same show and
+    /// service (a queued score survives a push without one).
+    pub fn queue_list_push(&self, push: &PendingPush) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO list_pending (service, anilist_id, status, progress, score, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(service, anilist_id) DO UPDATE SET
+                 status = excluded.status, progress = excluded.progress,
+                 score = COALESCE(excluded.score, list_pending.score)",
+            params![
+                push.service,
+                push.anilist_id,
+                push.status,
+                push.progress,
+                push.score.map(f64::from),
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Oldest first.
+    pub fn pending_list_pushes(&self, service: Service) -> Result<Vec<PendingPush>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT service, anilist_id, status, progress, score FROM list_pending
+             WHERE service = ?1 ORDER BY created_at, rowid",
+        )?;
+        let rows = stmt.query_map([service], |r| {
+            Ok(PendingPush {
+                service: r.get(0)?,
+                anilist_id: r.get(1)?,
+                status: r.get(2)?,
+                progress: r.get(3)?,
+                score: r.get::<_, Option<f64>>(4)?.map(|s| s as f32),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn delete_list_push(&self, service: Service, anilist_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM list_pending WHERE service = ?1 AND anilist_id = ?2",
+            params![service, anilist_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_push_failed(&self, service: Service, anilist_id: i64, error: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE list_pending SET attempts = attempts + 1, last_error = ?3
+             WHERE service = ?1 AND anilist_id = ?2",
+            params![service, anilist_id, error],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_rating_prompt(&self, anilist_id: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO list_rating_prompts (anilist_id, created_at) VALUES (?1, ?2)
+             ON CONFLICT(anilist_id) DO NOTHING",
+            params![anilist_id, now()],
+        )?;
+        Ok(())
+    }
+
+    pub fn rating_prompt(&self, anilist_id: i64) -> Result<bool> {
+        let found = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM list_rating_prompts WHERE anilist_id = ?1",
+                [anilist_id],
+                |_| Ok(()),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    pub fn clear_rating_prompt(&self, anilist_id: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM list_rating_prompts WHERE anilist_id = ?1",
+            [anilist_id],
+        )?;
+        Ok(())
+    }
+
+    /// The most recently stored AllAnime show for an AniList id.
+    pub fn show_by_anilist_id(&self, anilist_id: i64) -> Result<Option<ShowRecord>> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM shows WHERE anilist_id = ?1
+                 ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                [anilist_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match id {
+            Some(id) => self.get_show(&id),
+            None => Ok(None),
+        }
+    }
+
     fn cache_put_at(&self, key: &str, json: &str, fetched_at: i64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO api_cache (key, json, fetched_at) VALUES (?1, ?2, ?3)
@@ -486,6 +851,51 @@ fn progress_from_row(r: &Row<'_>) -> rusqlite::Result<Progress> {
     })
 }
 
+fn insert_list_entry(conn: &Connection, e: &RemoteEntry) -> Result<()> {
+    conn.execute(
+        &format!(
+            "INSERT INTO list_entries ({ENTRY_COLUMNS})
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(service, remote_id) DO UPDATE SET
+                 anilist_id = excluded.anilist_id, mal_id = excluded.mal_id,
+                 status = excluded.status, progress = excluded.progress,
+                 score = excluded.score, episodes = excluded.episodes,
+                 title = excluded.title, cover_url = excluded.cover_url,
+                 updated_at = excluded.updated_at"
+        ),
+        params![
+            e.service,
+            e.remote_id,
+            e.anilist_id,
+            e.mal_id,
+            e.status,
+            e.progress,
+            e.score.map(f64::from),
+            e.episodes,
+            e.title,
+            e.cover_url,
+            e.updated_at,
+        ],
+    )?;
+    Ok(())
+}
+
+fn entry_from_row(r: &Row<'_>) -> rusqlite::Result<RemoteEntry> {
+    Ok(RemoteEntry {
+        service: r.get(0)?,
+        remote_id: r.get(1)?,
+        anilist_id: r.get(2)?,
+        mal_id: r.get(3)?,
+        status: r.get(4)?,
+        progress: r.get(5)?,
+        score: r.get::<_, Option<f64>>(6)?.map(|s| s as f32),
+        episodes: r.get(7)?,
+        title: r.get(8)?,
+        cover_url: r.get(9)?,
+        updated_at: r.get(10)?,
+    })
+}
+
 fn parse_text<T: FromStr<Err = anyhow::Error>>(value: ValueRef<'_>) -> FromSqlResult<T> {
     value
         .as_str()?
@@ -512,6 +922,30 @@ impl ToSql for DlStatus {
 }
 
 impl FromSql for DlStatus {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        parse_text(value)
+    }
+}
+
+impl ToSql for Service {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+
+impl FromSql for Service {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        parse_text(value)
+    }
+}
+
+impl ToSql for ListStatus {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(self.as_str().into())
+    }
+}
+
+impl FromSql for ListStatus {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         parse_text(value)
     }
@@ -546,7 +980,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         for table in [
             "shows",
             "progress",
@@ -555,6 +989,11 @@ mod tests {
             "settings",
             "api_cache",
             "provider_titles",
+            "list_accounts",
+            "list_entries",
+            "list_id_map",
+            "list_pending",
+            "list_rating_prompts",
         ] {
             let n: i64 = db
                 .conn
@@ -583,12 +1022,236 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert_eq!(db.my_list().unwrap(), ["a"]);
         db.set_provider_title("a", "Frieren").unwrap();
         assert_eq!(
             db.get_provider_title("a").unwrap().as_deref(),
             Some("Frieren")
+        );
+    }
+
+    #[test]
+    fn migrate_v2_to_v3_keeps_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute(
+            "INSERT INTO my_list (show_id, added_at) VALUES ('a', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO provider_titles (show_id, title) VALUES ('a', 'Frieren')",
+            [],
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+        assert_eq!(db.my_list().unwrap(), ["a"]);
+        assert_eq!(
+            db.get_provider_title("a").unwrap().as_deref(),
+            Some("Frieren")
+        );
+        assert!(db.list_accounts().unwrap().is_empty());
+        db.set_list_client_id(Service::Mal, "abc").unwrap();
+        assert_eq!(db.list_account(Service::Mal).unwrap().client_id, "abc");
+        // Opening again doesn't re-run the migration.
+        let conn = db.conn;
+        let db = Db::init(conn).unwrap();
+        assert_eq!(db.list_account(Service::Mal).unwrap().client_id, "abc");
+    }
+
+    fn remote(service: Service, remote_id: i64, anilist_id: Option<i64>) -> RemoteEntry {
+        RemoteEntry {
+            service,
+            remote_id,
+            anilist_id,
+            mal_id: (service == Service::Mal).then_some(remote_id),
+            status: ListStatus::Watching,
+            progress: 3,
+            score: Some(7.5),
+            episodes: Some(12),
+            title: "Frieren".into(),
+            cover_url: "https://img/c.jpg".into(),
+            updated_at: 100,
+        }
+    }
+
+    #[test]
+    fn list_accounts_lifecycle() {
+        let db = db();
+        assert_eq!(
+            db.list_account(Service::AniList).unwrap(),
+            Account::empty(Service::AniList)
+        );
+        db.set_list_client_id(Service::AniList, "123").unwrap();
+        db.set_list_connected(Service::AniList, "123", 42, "kev", 1000)
+            .unwrap();
+        db.set_list_synced(Service::AniList, 2000).unwrap();
+        let a = db.list_account(Service::AniList).unwrap();
+        assert!(a.connected());
+        assert_eq!(
+            (a.user_name.as_deref(), a.last_sync, a.client_id.as_str()),
+            (Some("kev"), Some(2000), "123")
+        );
+        assert_eq!(db.list_user_id(Service::AniList).unwrap(), Some(42));
+        assert_eq!(db.list_user_id(Service::Mal).unwrap(), None);
+
+        db.upsert_list_entry(&remote(Service::AniList, 7, Some(7)))
+            .unwrap();
+        db.queue_list_push(&PendingPush {
+            service: Service::AniList,
+            anilist_id: 7,
+            status: ListStatus::Watching,
+            progress: 4,
+            score: None,
+        })
+        .unwrap();
+
+        // Signed out by the server: the list stays, the error shows.
+        db.set_list_disconnected(Service::AniList, Some("expired"))
+            .unwrap();
+        let a = db.list_account(Service::AniList).unwrap();
+        assert!(!a.connected());
+        assert_eq!(a.last_error.as_deref(), Some("expired"));
+        assert_eq!(db.list_entries().unwrap().len(), 1);
+
+        // Disconnected by the user: everything but the client ID goes.
+        db.forget_list_account(Service::AniList).unwrap();
+        let a = db.list_account(Service::AniList).unwrap();
+        assert_eq!(
+            a,
+            Account {
+                client_id: "123".into(),
+                ..Account::empty(Service::AniList)
+            }
+        );
+        assert!(db.list_entries().unwrap().is_empty());
+        assert!(db.pending_list_pushes(Service::AniList).unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_entries_replace_and_lookup() {
+        let db = db();
+        let mal = remote(Service::Mal, 52991, Some(154587));
+        let anilist = remote(Service::AniList, 154587, Some(154587));
+        let unmapped = remote(Service::Mal, 99, None);
+        db.replace_list_entries(
+            Service::Mal,
+            &[mal.clone(), unmapped.clone(), anilist.clone()],
+        )
+        .unwrap();
+        // Only the service's own entries are stored by a replace.
+        assert_eq!(db.list_entries().unwrap().len(), 2);
+        db.replace_list_entries(Service::AniList, std::slice::from_ref(&anilist))
+            .unwrap();
+        assert_eq!(
+            db.list_entries_for(154587).unwrap(),
+            [anilist.clone(), mal.clone()]
+        );
+        assert_eq!(
+            db.list_entry(Service::Mal, 154587).unwrap(),
+            Some(mal.clone())
+        );
+        assert_eq!(db.list_entry(Service::Mal, 1).unwrap(), None);
+
+        // A fresh import drops entries no longer on the list.
+        db.replace_list_entries(Service::Mal, std::slice::from_ref(&mal))
+            .unwrap();
+        assert_eq!(db.list_entries().unwrap().len(), 2);
+
+        let pushed = RemoteEntry {
+            progress: 12,
+            status: ListStatus::Completed,
+            score: None,
+            updated_at: 500,
+            ..mal
+        };
+        db.upsert_list_entry(&pushed).unwrap();
+        assert_eq!(db.list_entry(Service::Mal, 154587).unwrap(), Some(pushed));
+    }
+
+    #[test]
+    fn id_map_and_mal_lookup() {
+        let db = db();
+        db.put_id_mapping(52991, Some(154587)).unwrap();
+        db.put_id_mapping(1, None).unwrap();
+        let cached = db.cached_anilist_ids(&[52991, 1, 2]).unwrap();
+        assert_eq!(cached.get(&52991), Some(&Some(154587)));
+        assert_eq!(cached.get(&1), Some(&None));
+        assert_eq!(cached.get(&2), None);
+        assert_eq!(db.mal_id_for(154587).unwrap(), Some(52991));
+        assert_eq!(db.mal_id_for(5).unwrap(), None);
+        // A list entry's MAL id counts too.
+        db.upsert_list_entry(&RemoteEntry {
+            mal_id: Some(777),
+            ..remote(Service::AniList, 5, Some(5))
+        })
+        .unwrap();
+        assert_eq!(db.mal_id_for(5).unwrap(), Some(777));
+    }
+
+    #[test]
+    fn pending_pushes_coalesce_per_show() {
+        let db = db();
+        let push = |progress, score| PendingPush {
+            service: Service::Mal,
+            anilist_id: 7,
+            status: ListStatus::Watching,
+            progress,
+            score,
+        };
+        db.queue_list_push(&push(3, Some(8.0))).unwrap();
+        db.queue_list_push(&push(4, None)).unwrap();
+        db.queue_list_push(&PendingPush {
+            anilist_id: 9,
+            ..push(1, None)
+        })
+        .unwrap();
+        let pending = db.pending_list_pushes(Service::Mal).unwrap();
+        assert_eq!(pending.len(), 2);
+        // The newer progress, keeping the queued score.
+        assert_eq!(pending[0], push(4, Some(8.0)));
+        assert!(db.pending_list_pushes(Service::AniList).unwrap().is_empty());
+        db.list_push_failed(Service::Mal, 7, "offline").unwrap();
+        db.delete_list_push(Service::Mal, 7).unwrap();
+        let pending = db.pending_list_pushes(Service::Mal).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].anilist_id, 9);
+    }
+
+    #[test]
+    fn rating_prompts_and_show_by_anilist_id() {
+        let db = db();
+        assert!(!db.rating_prompt(7).unwrap());
+        db.add_rating_prompt(7).unwrap();
+        db.add_rating_prompt(7).unwrap();
+        assert!(db.rating_prompt(7).unwrap());
+        db.clear_rating_prompt(7).unwrap();
+        assert!(!db.rating_prompt(7).unwrap());
+
+        assert_eq!(db.show_by_anilist_id(154587).unwrap(), None);
+        let record = |id: &str, updated_at| ShowRecord {
+            summary: ShowSummary {
+                id: id.into(),
+                title: "Frieren".into(),
+                anilist_id: Some(154587),
+                ..Default::default()
+            },
+            media: None,
+            updated_at,
+        };
+        db.upsert_show(&record("old", 1)).unwrap();
+        db.upsert_show(&record("new", 2)).unwrap();
+        assert_eq!(
+            db.show_by_anilist_id(154587).unwrap().map(|r| r.summary.id),
+            Some("new".into())
         );
     }
 
