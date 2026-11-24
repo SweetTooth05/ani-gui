@@ -15,11 +15,14 @@ use crate::db::{self, Db, lock};
 use crate::downloads::DownloadManager;
 use crate::model::{AniListMedia, DlStatus, Mode, Progress, ShowRecord, ShowSummary};
 use crate::ui::components::button::{ButtonKind, button, segmented};
+use crate::ui::components::icon::icon;
 use crate::ui::components::image::{remote_image, rounded_image, shimmer};
 use crate::ui::components::pick_dialog::pick_dialog;
 use crate::ui::components::poster::progress_bar;
 use crate::ui::components::text_input::TextInput;
 use crate::ui::components::toast;
+use crate::ui::metadata::ShowMeta;
+use crate::ui::reviews::ReviewsSection;
 use crate::ui::theme;
 use crate::ui::view_models::{self, EpisodeRow, ShowPageModel, media_title, mode_label};
 use crate::{allanime, catalog, playback};
@@ -97,6 +100,8 @@ pub struct ShowPage {
     range_from: Entity<TextInput>,
     range_to: Entity<TextInput>,
     range_error: Option<String>,
+    /// Public reviews, once the show's AniList entry is known.
+    reviews: Option<Entity<ReviewsSection>>,
     scroll: ScrollHandle,
     _downloads_changed: Option<Subscription>,
 }
@@ -133,6 +138,7 @@ impl ShowPage {
             range_from: cx.new(|cx| TextInput::new("From", cx).compact()),
             range_to: cx.new(|cx| TextInput::new("To", cx).compact()),
             range_error: None,
+            reviews: None,
             scroll: ScrollHandle::new(),
             _downloads_changed: subscription,
         };
@@ -182,6 +188,7 @@ impl ShowPage {
                         page.loaded = Some(loaded);
                         page.downloads = downloads;
                         page.rebuild(cx);
+                        page.ensure_reviews(cx);
                     }
                     Err(err) if page.loaded.is_some() => {
                         toast::error(cx, format!("Couldn't load {mode} episodes: {err:#}"));
@@ -216,6 +223,24 @@ impl ShowPage {
             .and_then(|(ep, _)| l.episodes.iter().position(|e| e == ep))
             .unwrap_or(0);
         self.page = target_index / EPISODE_PAGE;
+    }
+
+    /// Starts the Reviews section for the loaded show's AniList entry, once
+    /// per show (switching Sub/Dub keeps it).
+    fn ensure_reviews(&mut self, cx: &mut Context<Self>) {
+        let Some(media) = self.loaded.as_ref().and_then(|l| l.media.as_ref()) else {
+            self.reviews = None;
+            return;
+        };
+        let (id, mal_id) = (media.id, media.id_mal);
+        if self
+            .reviews
+            .as_ref()
+            .is_some_and(|r| r.read(cx).anilist_id() == id)
+        {
+            return;
+        }
+        self.reviews = Some(cx.new(|cx| ReviewsSection::new(id, mal_id, cx)));
     }
 
     fn sync_downloads(&mut self, cx: &mut Context<Self>) {
@@ -527,16 +552,18 @@ impl ShowPage {
             .map(|m| m.cover_url.clone())
             .filter(|c| !c.is_empty())
             .or_else(|| loaded.map(|l| l.show.cover_url.clone()));
-        let mut meta: Vec<String> = Vec::new();
-        if let Some(m) = media {
-            meta.extend(m.year.map(|y| y.to_string()));
-            meta.extend(m.format.clone());
-            meta.extend(m.episodes.map(|n| format!("{n} episodes")));
-            meta.extend(m.score.map(|s| format!("Score {s}")));
-            meta.extend(m.status.as_deref().map(status_label));
-        }
+        let ShowMeta {
+            score,
+            score_rank,
+            strip,
+            status,
+            airing,
+            facts,
+        } = media
+            .map(|m| ShowMeta::from_media(m, db::now()))
+            .unwrap_or_default();
         let synopsis = media.and_then(|m| m.synopsis.clone());
-        let genres = media.map(|m| m.genres.clone()).unwrap_or_default();
+        let genres = media.map(|m| m.genres.join(", ")).unwrap_or_default();
 
         div()
             .flex()
@@ -606,26 +633,19 @@ impl ShowPage {
                                     .line_clamp(2)
                                     .child(title),
                             )
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap(px(14.))
-                                    .text_size(px(theme::SMALL))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::text_dim())
-                                    .children(meta.into_iter().map(|m| div().child(m)))
-                                    .children(genres.into_iter().take(5).map(|g| {
-                                        div()
-                                            .px(px(10.))
-                                            .py(px(3.))
-                                            .rounded(px(6.))
-                                            .border_1()
-                                            .border_color(theme::line())
-                                            .child(g)
-                                    })),
-                            )
+                            .children(score_line(score, score_rank))
+                            .when(!strip.is_empty() || status.is_some(), |col| {
+                                col.child(metadata_strip(strip, status, airing))
+                            })
+                            .when(!genres.is_empty(), |col| {
+                                col.child(
+                                    div()
+                                        .text_size(px(theme::SMALL))
+                                        .text_color(theme::text_dim())
+                                        .truncate()
+                                        .child(genres),
+                                )
+                            })
                             .children(synopsis.map(|s| {
                                 div()
                                     .max_w(px(720.))
@@ -641,6 +661,7 @@ impl ShowPage {
                             .child(self.render_controls(cx)),
                     ),
             )
+            .when(!facts.is_empty(), |header| header.child(facts_block(facts)))
             .into_any_element()
     }
 
@@ -1095,6 +1116,7 @@ impl Render for ShowPage {
                 .flex_col()
                 .child(self.render_header(cx))
                 .child(self.render_episodes(cx))
+                .children(self.reviews.clone())
                 .into_any_element(),
         };
         div()
@@ -1112,15 +1134,101 @@ impl Render for ShowPage {
     }
 }
 
-fn status_label(status: &str) -> String {
-    match status {
-        "RELEASING" => "Airing".into(),
-        "FINISHED" => "Finished".into(),
-        "NOT_YET_RELEASED" => "Upcoming".into(),
-        "CANCELLED" => "Cancelled".into(),
-        "HIATUS" => "On hiatus".into(),
-        other => other.to_string(),
-    }
+/// The amber score and its headline rank, e.g. "★ 9.0  #1 highest rated
+/// all time".
+fn score_line(score: Option<String>, rank: Option<String>) -> Option<gpui::Div> {
+    let score = score?;
+    Some(
+        div()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_color(theme::accent())
+                    .font_family(theme::DISPLAY_FONT)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(px(24.))
+                    .line_height(px(24.))
+                    .child(icon("star").size(px(18.)).text_color(theme::accent()))
+                    .child(score),
+            )
+            .children(rank.map(|rank| {
+                div()
+                    .text_size(px(theme::SMALL))
+                    .text_color(theme::text_dim())
+                    .child(rank)
+            })),
+    )
+}
+
+/// Format, season and length as quiet outlined badges, then the status;
+/// an airing show's status is tinted amber, with its countdown.
+fn metadata_strip(strip: Vec<String>, status: Option<String>, airing: bool) -> gpui::Div {
+    let badge = |text: String| {
+        div()
+            .px(px(9.))
+            .py(px(3.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme::line())
+            .child(text)
+    };
+    div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap(px(8.))
+        .text_size(px(theme::SMALL))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::text_dim())
+        .children(strip.into_iter().map(badge))
+        .children(status.map(|status| {
+            let accent: gpui::Hsla = theme::accent().into();
+            badge(status).when(airing, |b| {
+                b.flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .border_color(accent.opacity(0.35))
+                    .bg(accent.opacity(0.1))
+                    .text_color(theme::accent())
+                    .child(icon("clock").size(px(13.)).text_color(theme::accent()))
+            })
+        }))
+}
+
+/// Studio, source, dates and popularity as label-over-value pairs in one
+/// row under the hero.
+fn facts_block(facts: Vec<(&'static str, String)>) -> gpui::Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_x(px(44.))
+        .gap_y(px(16.))
+        .px(theme::gutter())
+        .pt(px(36.))
+        .children(facts.into_iter().map(|(label, value)| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.))
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme::text_muted())
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::text())
+                        .child(value),
+                )
+        }))
 }
 
 /// The AllAnime show (resolved from AniList when only that is known), its
