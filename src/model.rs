@@ -85,6 +85,59 @@ pub struct AniListMedia {
     pub next_airing: Option<(u32, i64)>,
     /// (title, thumbnail url)
     pub episode_thumbs: Vec<(String, String)>,
+
+    // Fields below arrived after `AniListMedia` was first stored as JSON
+    // (`shows.media_json`, `api_cache`); each must default so old rows load.
+    /// The MyAnimeList id, for Jikan lookups.
+    #[serde(default)]
+    pub id_mal: Option<i64>,
+    /// Plain mean of user scores (0–100); `score` is AniList's weighted one.
+    #[serde(default)]
+    pub mean_score: Option<u8>,
+    /// Users with the show on their list.
+    #[serde(default)]
+    pub popularity: Option<u32>,
+    #[serde(default)]
+    pub favourites: Option<u32>,
+    /// "WINTER", "SPRING", "SUMMER" or "FALL".
+    #[serde(default)]
+    pub season: Option<String>,
+    #[serde(default)]
+    pub start_date: Option<FuzzyDate>,
+    #[serde(default)]
+    pub end_date: Option<FuzzyDate>,
+    /// Minutes per episode.
+    #[serde(default)]
+    pub duration: Option<u32>,
+    /// What it was adapted from ("MANGA", "LIGHT_NOVEL", "ORIGINAL", …).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Main studios, in AniList's order.
+    #[serde(default)]
+    pub studios: Vec<String>,
+    #[serde(default)]
+    pub rankings: Vec<Ranking>,
+}
+
+/// An AniList date, any part of which may be unknown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FuzzyDate {
+    pub year: Option<i32>,
+    pub month: Option<u8>,
+    pub day: Option<u8>,
+}
+
+/// One of AniList's chart positions, e.g. #12 most popular all time.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ranking {
+    pub rank: u32,
+    /// Ranked by score ("highest rated") rather than by popularity.
+    pub rated: bool,
+    pub all_time: bool,
+    pub season: Option<String>,
+    pub year: Option<u16>,
+    /// AniList's wording, e.g. "most popular all time".
+    pub context: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

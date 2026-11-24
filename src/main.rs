@@ -14,6 +14,7 @@ mod paths;
 mod playback;
 mod player;
 mod progress;
+mod reviews;
 mod ui;
 
 use gpui::{

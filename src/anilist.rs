@@ -3,17 +3,25 @@ use std::collections::HashSet;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::model::{Airing, AniListMedia};
+use crate::model::{Airing, AniListMedia, FuzzyDate, Ranking};
 use crate::net;
 
 pub const API: &str = "https://graphql.anilist.co";
 
-const CARD_FRAGMENT: &str = "fragment card on Media { id title { romaji english } \
+/// What every card needs. Keep it lean: it is fetched for whole rows and
+/// schedules. Detail-only fields go in `MEDIA_GQL`.
+const CARD_FRAGMENT: &str = "fragment card on Media { id idMal title { romaji english } \
     coverImage { extraLarge large } bannerImage description genres averageScore \
     seasonYear format status episodes isAdult nextAiringEpisode { episode airingAt } }";
 
 const MEDIA_GQL: &str = "query ($id: Int) { Media(id: $id, type: ANIME) { \
-    ...card streamingEpisodes { title thumbnail } } }";
+    ...card streamingEpisodes { title thumbnail } meanScore popularity favourites season \
+    startDate { year month day } endDate { year month day } duration source \
+    studios(isMain: true) { nodes { name } } \
+    rankings { rank type allTime season year context } } }";
+
+const CARDS_GQL: &str = "query ($ids: [Int]) { Page(perPage: 50) { \
+    media(id_in: $ids, type: ANIME) { ...card } } }";
 
 const TRENDING_GQL: &str = "query ($n: Int) { Page(perPage: $n) { \
     media(type: ANIME, sort: TRENDING_DESC, isAdult: false) { ...card } } }";
@@ -29,8 +37,15 @@ const RECOMMENDATIONS_GQL: &str = "query ($ids: [Int]) { Page(perPage: 50) { \
 
 const SCHEDULE_MAX_PAGES: i64 = 3;
 
+/// Runs `gql`, which uses the `card` fragment.
 fn query(gql: &str, variables: Value) -> Result<Value> {
-    let body = json!({ "query": format!("{gql} {CARD_FRAGMENT}"), "variables": variables });
+    query_plain(&format!("{gql} {CARD_FRAGMENT}"), variables)
+}
+
+/// Runs a complete query. GraphQL rejects unused fragments, so queries
+/// without `...card` come here directly.
+pub fn query_plain(gql: &str, variables: Value) -> Result<Value> {
+    let body = json!({ "query": gql, "variables": variables });
     let v = net::post_json(API, &body, &[])?;
     if let Some(err) = v["errors"].as_array().and_then(|e| e.first()) {
         bail!(
@@ -82,12 +97,51 @@ pub fn parse_media(v: &Value) -> AniListMedia {
                     .collect()
             })
             .unwrap_or_default(),
+        id_mal: v["idMal"].as_i64().filter(|&id| id > 0),
+        mean_score: num(&v["meanScore"]),
+        popularity: num(&v["popularity"]),
+        favourites: num(&v["favourites"]),
+        season: text(&v["season"]),
+        start_date: fuzzy_date(&v["startDate"]),
+        end_date: fuzzy_date(&v["endDate"]),
+        duration: num::<u32>(&v["duration"]).filter(|&d| d > 0),
+        source: text(&v["source"]),
+        studios: v["studios"]["nodes"]
+            .as_array()
+            .map(|n| n.iter().filter_map(|s| text(&s["name"])).collect())
+            .unwrap_or_default(),
+        rankings: v["rankings"]
+            .as_array()
+            .map(|r| r.iter().filter_map(parse_ranking).collect())
+            .unwrap_or_default(),
     }
 }
 
-/// Plain text from AniList's HTML description: `<br>` becomes a line break,
-/// other tags are dropped, runs of blank lines collapse to one.
-fn strip_html(html: &str) -> Option<String> {
+/// A date with at least its year known.
+fn fuzzy_date(v: &Value) -> Option<FuzzyDate> {
+    let date = FuzzyDate {
+        year: num(&v["year"]),
+        month: num::<u8>(&v["month"]).filter(|m| (1..=12).contains(m)),
+        day: num::<u8>(&v["day"]).filter(|d| (1..=31).contains(d)),
+    };
+    date.year.map(|_| date)
+}
+
+fn parse_ranking(v: &Value) -> Option<Ranking> {
+    Some(Ranking {
+        rank: num::<u32>(&v["rank"]).filter(|&r| r > 0)?,
+        rated: v["type"].as_str()? == "RATED",
+        all_time: v["allTime"].as_bool() == Some(true),
+        season: text(&v["season"]),
+        year: num(&v["year"]),
+        context: text(&v["context"])?,
+    })
+}
+
+/// Plain text from AniList's HTML: `<br>` and block tags (`<p>`, `<hr>`,
+/// headings, …) become line breaks, other tags are dropped, runs of blank
+/// lines collapse to one. Nothing here is ever rendered as HTML.
+pub fn strip_html(html: &str) -> Option<String> {
     let mut plain = String::with_capacity(html.len());
     let mut rest = html;
     while let Some(open) = rest.find('<') {
@@ -101,7 +155,23 @@ fn strip_html(html: &str) -> Option<String> {
             .split(|c: char| !c.is_ascii_alphanumeric())
             .next()
             .unwrap_or_default();
-        if name.eq_ignore_ascii_case("br") {
+        const BREAKS: [&str; 14] = [
+            "br",
+            "p",
+            "hr",
+            "div",
+            "li",
+            "blockquote",
+            "center",
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "ul",
+        ];
+        if BREAKS.iter().any(|b| name.eq_ignore_ascii_case(b)) {
             plain.push('\n');
         }
         rest = &rest[open + len + 1..];
@@ -195,6 +265,25 @@ pub fn media(id: i64) -> Result<AniListMedia> {
     Ok(parse_media(media))
 }
 
+/// Card data for `ids` (at most 50 are asked for), in no particular order.
+/// Ids AniList doesn't know, or marks adult, are left out.
+pub fn cards(ids: &[i64]) -> Result<Vec<AniListMedia>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ids = &ids[..ids.len().min(50)];
+    let v = query(CARDS_GQL, json!({ "ids": ids }))?;
+    Ok(v["data"]["Page"]["media"]
+        .as_array()
+        .map(|m| {
+            m.iter()
+                .filter(|m| is_listable(m))
+                .map(parse_media)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 pub fn trending(n: usize) -> Result<Vec<AniListMedia>> {
     let v = query(TRENDING_GQL, json!({ "n": n.clamp(1, 50) }))?;
     let media = v["data"]["Page"]["media"]
@@ -271,6 +360,35 @@ mod tests {
         assert_eq!(m.next_airing, None);
         assert_eq!(m.episode_thumbs.len(), 3);
         assert_eq!(m.episode_thumbs[0].0, "Episode 1 - The Journey's End");
+        assert_eq!(m.id_mal, Some(52991));
+        assert_eq!(m.mean_score, Some(90));
+        assert_eq!(m.popularity, Some(501_920));
+        assert_eq!(m.favourites, Some(57_272));
+        assert_eq!(m.season.as_deref(), Some("FALL"));
+        let date = |year, month, day| FuzzyDate {
+            year: Some(year),
+            month: Some(month),
+            day: Some(day),
+        };
+        assert_eq!(m.start_date, Some(date(2023, 9, 29)));
+        assert_eq!(m.end_date, Some(date(2024, 3, 22)));
+        assert_eq!(m.duration, Some(24));
+        assert_eq!(m.source.as_deref(), Some("MANGA"));
+        assert_eq!(m.studios, ["MADHOUSE"]);
+        assert_eq!(m.rankings.len(), 3);
+        assert_eq!(
+            m.rankings[1],
+            Ranking {
+                rank: 50,
+                rated: false,
+                all_time: true,
+                season: None,
+                year: None,
+                context: "most popular all time".into(),
+            }
+        );
+        assert!(m.rankings[0].rated);
+        assert_eq!(m.rankings[2].season.as_deref(), Some("FALL"));
 
         let m = parse_media(&json!({
             "id": 1,
@@ -288,6 +406,63 @@ mod tests {
             parse_media(&json!({ "description": " <br> " })).synopsis,
             None
         );
+    }
+
+    #[test]
+    fn parse_media_tolerates_missing_and_odd_detail_fields() {
+        let m = parse_media(&json!({
+            "id": 2,
+            "idMal": 0,
+            "duration": 0,
+            "startDate": { "year": null, "month": 4, "day": 1 },
+            "endDate": { "year": 2025, "month": 13, "day": null },
+            "studios": { "nodes": [{ "name": "" }, { "name": "Bones" }] },
+            "rankings": [
+                { "rank": 0, "type": "RATED", "context": "x" },
+                { "rank": 3, "type": "POPULAR" },
+                { "rank": 4, "type": "RATED", "allTime": false, "year": 2025, "context": "highest rated" }
+            ]
+        }));
+        assert_eq!(m.id_mal, None);
+        assert_eq!(m.duration, None);
+        assert_eq!(m.start_date, None);
+        assert_eq!(
+            m.end_date,
+            Some(FuzzyDate {
+                year: Some(2025),
+                month: None,
+                day: None
+            })
+        );
+        assert_eq!(m.studios, ["Bones"]);
+        assert_eq!(m.rankings.len(), 1);
+        assert_eq!(m.rankings[0].year, Some(2025));
+
+        let bare = parse_media(&json!({ "id": 3 }));
+        assert!(bare.studios.is_empty() && bare.rankings.is_empty());
+        assert_eq!((bare.popularity, bare.source), (None, None));
+    }
+
+    #[test]
+    fn media_stored_before_detail_fields_still_loads() {
+        // A `shows.media_json` row written by an older build.
+        let old = r#"{"id":1,"title_romaji":"R","title_english":null,"cover_url":"c",
+            "banner_url":null,"synopsis":null,"genres":["Drama"],"score":80,"year":2020,
+            "format":"TV","status":"FINISHED","episodes":12,"next_airing":null,
+            "episode_thumbs":[]}"#;
+        let m: AniListMedia = serde_json::from_str(old).unwrap();
+        assert_eq!((m.id, m.score, m.id_mal), (1, Some(80), None));
+        assert!(m.studios.is_empty() && m.rankings.is_empty());
+        assert_eq!(m.start_date, None);
+    }
+
+    #[test]
+    fn detail_query_keeps_heavy_fields_out_of_cards() {
+        for heavy in ["studios", "rankings", "startDate", "popularity", "source"] {
+            assert!(MEDIA_GQL.contains(heavy), "{heavy}");
+            assert!(!CARD_FRAGMENT.contains(heavy), "{heavy}");
+        }
+        assert!(CARD_FRAGMENT.contains("idMal"));
     }
 
     #[test]
