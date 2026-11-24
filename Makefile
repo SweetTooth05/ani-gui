@@ -4,11 +4,18 @@
 #   make install                  install into ~/.local (no root needed)
 #   make install PREFIX=/usr/local
 #   make uninstall                remove exactly what install put there
+#
+# The release workflow stages its tarball with
+#   make install DESTDIR=<stage> PREFIX= DESKTOP_EXEC=ani-gui BIN=<binary>
+# so the archive is a prefix tree (bin/, share/) whose launcher entry runs
+# ani-gui from PATH wherever it is unpacked.
 
 PREFIX  ?= $(HOME)/.local
 DESTDIR ?=
 APP_ID  := io.github.sweettooth05.AniGui
 BIN     := target/release/ani-gui
+# What the launcher entry runs.
+DESKTOP_EXEC ?= $(PREFIX)/bin/ani-gui
 
 ROOT     = $(DESTDIR)$(PREFIX)
 BINDIR   = $(ROOT)/bin
@@ -37,9 +44,9 @@ $(BIN):
 install: $(BIN)
 	install -Dm755 $(BIN) $(BINDIR)/ani-gui
 	install -Dm644 assets/ani-gui.desktop $(APPSDIR)/$(APP_ID).desktop
-	@# An absolute Exec (never with DESTDIR): ~/.local/bin is often not on
-	@# the desktop session's PATH.
-	sed -i 's|^Exec=ani-gui$$|Exec=$(PREFIX)/bin/ani-gui|' $(APPSDIR)/$(APP_ID).desktop
+	@# An absolute Exec by default (never with DESTDIR): ~/.local/bin is
+	@# often not on the desktop session's PATH.
+	sed -i 's|^Exec=ani-gui$$|Exec=$(DESKTOP_EXEC)|' $(APPSDIR)/$(APP_ID).desktop
 	@for icon in $(ICONS); do \
 		echo "install -Dm644 assets/icons/hicolor/$$icon $(ICONDIR)/$$icon"; \
 		install -Dm644 assets/icons/hicolor/$$icon $(ICONDIR)/$$icon || exit 1; \

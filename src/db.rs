@@ -350,6 +350,11 @@ impl Db {
                         settings.autoplay_next = on;
                     }
                 }
+                "auto_update" => {
+                    if let Ok(on) = value.parse() {
+                        settings.auto_update = on;
+                    }
+                }
                 _ => {}
             }
         }
@@ -369,6 +374,7 @@ impl Db {
                 "autoplay_next",
                 if s.autoplay_next { "true" } else { "false" },
             ),
+            ("auto_update", if s.auto_update { "true" } else { "false" }),
         ];
         let tx = self.conn.unchecked_transaction()?;
         for (key, value) in entries {
@@ -898,6 +904,7 @@ mod tests {
         assert_eq!(defaults.mode, Mode::Sub);
         assert_eq!(defaults.quality, "best");
         assert!(defaults.autoplay_next);
+        assert!(defaults.auto_update);
         assert_eq!(defaults.download_dir, crate::paths::default_download_dir());
 
         let custom = Settings {
@@ -905,6 +912,7 @@ mod tests {
             quality: "720".into(),
             download_dir: PathBuf::from("/tmp/anime"),
             autoplay_next: false,
+            auto_update: false,
         };
         db.save_settings(&custom).unwrap();
         assert_eq!(db.load_settings().unwrap(), custom);

@@ -90,6 +90,29 @@ libmpv isn't needed to build, because the app loads it at runtime.
 
 ## Install
 
+### From the latest release (recommended)
+
+One command, no root and no build tools. It installs into `~/.local`:
+
+```sh
+v=$(curl -fsSL https://api.github.com/repos/SweetTooth05/ani-gui/releases/latest \
+      | sed -n 's/.*"tag_name": *"v\([0-9.]*\)".*/\1/p') &&
+  [ -n "$v" ] && mkdir -p ~/.local &&
+  curl -fL "https://github.com/SweetTooth05/ani-gui/releases/download/v$v/ani-gui-$v-x86_64-unknown-linux-gnu.tar.gz" \
+    | tar -xz -C ~/.local --strip-components=1 &&
+  sed -i "s|^Exec=ani-gui\$|Exec=$HOME/.local/bin/ani-gui|" \
+    ~/.local/share/applications/io.github.sweettooth05.AniGui.desktop
+```
+
+The tarball is laid out like an install prefix (`bin/`, `share/`), so this
+puts the binary, the launcher entry and the icons in the same places as
+`make install` below. The last step points the launcher entry at
+`~/.local/bin/ani-gui`, because that folder is often missing from the desktop
+session's `PATH`. To check a download's signature by hand first, see
+[docs/releasing.md](docs/releasing.md#verifying-a-release-by-hand).
+
+### From source
+
 ```sh
 git clone https://github.com/SweetTooth05/ani-gui.git
 cd ani-gui
@@ -103,10 +126,8 @@ This installs into `~/.local` and needs no root:
 - `~/.local/share/applications/io.github.sweettooth05.AniGui.desktop`
 - `~/.local/share/icons/hicolor/*/apps/io.github.sweettooth05.AniGui*` (PNG sizes 16–512, scalable and symbolic SVG)
 
-ani-gui then shows up in your app launcher. The launcher entry runs `ani-gui`
-from your `PATH`, so `~/.local/bin` needs to be on it. Most distros add it at
-login once the folder exists; if the entry doesn't start after your first
-install, log out and back in.
+ani-gui then shows up in your app launcher. The launcher entry runs
+`~/.local/bin/ani-gui` by its full path.
 
 To install system-wide instead, build as your user and install as root, so cargo
 never runs as root:
@@ -119,13 +140,26 @@ sudo make install PREFIX=/usr/local
 `./install.sh` does the same as `make && make install` after checking that the
 build tools and libraries are there.
 
-### Update
+### Updates
 
-```sh
-git pull
-make
-make install
-```
+ani-gui updates itself when it is installed in `~/.local`, from the release
+tarball or with `make install`:
+
+- It checks GitHub's latest release a few seconds after it starts, at most
+  once every six hours. **Settings → Updates → Check now** checks straight
+  away.
+- It installs a newer version only if the release's checksums carry a valid
+  signature from the ani-gui release key built into the app, and the
+  download matches them.
+- It replaces `~/.local/bin/ani-gui` in place. The new version runs the next
+  time you start ani-gui, or straight away with **Restart now**.
+- Turn off **Install updates automatically** to only be told about new
+  versions.
+
+It never asks for root. A system-wide install such as `/usr/local`, or a
+build run from the source tree (`cargo run`, `target/release/`), only tells
+you when an update is out. Update those with `git pull && make && make install`
+(add `sudo` and `PREFIX=...` for a system-wide install).
 
 ### Uninstall
 

@@ -14,11 +14,13 @@ use crate::app::AppState;
 use crate::diagnostics::{self, Report};
 use crate::model::{Mode, Settings};
 use crate::ui::components::button::{ButtonKind, button, segmented};
+use crate::ui::components::icon::icon;
 use crate::ui::components::text_input::{Changed, TextInput};
 use crate::ui::components::toast;
 use crate::ui::files::{display_path, open_folder};
 use crate::ui::show::QUALITIES;
 use crate::ui::theme;
+use crate::updater::{self, Status};
 
 const CONTENT_W: f32 = 780.;
 
@@ -63,6 +65,9 @@ impl SettingsPage {
             _dir_changes: dir_changes,
         };
         page.check(cx);
+        if let Some(updates) = updater::model(cx) {
+            cx.observe(&updates, |_, _, cx| cx.notify()).detach();
+        }
         page
     }
 
@@ -295,6 +300,120 @@ impl SettingsPage {
             .into_any_element()
     }
 
+    fn toggle_auto_update(&mut self, cx: &mut Context<Self>) {
+        let settings = Settings {
+            auto_update: !self.settings.auto_update,
+            ..self.settings.clone()
+        };
+        self.apply(settings, cx);
+    }
+
+    fn render_updates(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(updates) = updater::model(cx) else {
+            return div().into_any_element();
+        };
+        let u = updates.read(cx);
+        let on = self.settings.auto_update;
+        let auto_help = match &u.install_path {
+            Ok(_) => "Downloads signed releases from GitHub and installs them. \
+                      The new version runs the next time you start ani-gui."
+                .to_string(),
+            Err(why) => format!(
+                "{} ani-gui will tell you when a new version is out.",
+                why.explain()
+            ),
+        };
+        let last = match (u.saved.last_check, &u.saved.result) {
+            (Some(at), Some(result)) => {
+                format!("Last checked {}: {result}", updater::ago(at, unix_now()))
+            }
+            (Some(at), None) => format!("Last checked {}", updater::ago(at, unix_now())),
+            _ => "Not checked yet".to_string(),
+        };
+        let busy = u.busy();
+        let can_install = u.install_path.is_ok();
+        let status = match &u.status {
+            Status::Available(release) => Some(update_notice(
+                format!("ani-gui v{} is available.", release.version),
+                false,
+                Some(release.page_url()),
+                can_install.then_some(("Install", Notice::Install)),
+            )),
+            Status::Installing(version) => Some(update_notice(
+                format!("Installing v{version}…"),
+                false,
+                None,
+                None,
+            )),
+            Status::Installed(version) => Some(update_notice(
+                format!("Updated to v{version} — restart to use it."),
+                false,
+                None,
+                Some(("Restart now", Notice::Restart)),
+            )),
+            Status::Failed { error, release } => Some(update_notice(
+                error.clone(),
+                true,
+                release.as_ref().map(|r| r.page_url()),
+                release
+                    .as_ref()
+                    .filter(|_| can_install)
+                    .map(|_| ("Try again", Notice::Install)),
+            )),
+            Status::Idle | Status::Checking | Status::UpToDate => None,
+        };
+        section("Updates")
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(32.))
+                    .py(px(18.))
+                    .border_b_1()
+                    .border_color(theme::line())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(label_block("Install updates automatically", auto_help)),
+                    )
+                    .child(
+                        switch("settings-auto-update", on)
+                            .on_click(cx.listener(|page, _, _, cx| page.toggle_auto_update(cx))),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(32.))
+                    .py(px(18.))
+                    .border_b_1()
+                    .border_color(theme::line())
+                    .child(div().flex_1().min_w_0().child(label_block(
+                        "Version",
+                        format!("ani-gui {}. {last}", updater::CURRENT),
+                    )))
+                    .child(
+                        button(
+                            "settings-update-check",
+                            if matches!(u.status, Status::Checking) {
+                                "Checking…"
+                            } else {
+                                "Check now"
+                            },
+                        )
+                        .kind(ButtonKind::Secondary)
+                        .disabled(busy)
+                        .on_click(|_, _, cx| updater::check_now(cx)),
+                    ),
+            )
+            .children(status)
+            .into_any_element()
+    }
+
     fn render_diagnostics(&self, cx: &mut Context<Self>) -> AnyElement {
         let heading = div()
             .flex()
@@ -365,6 +484,7 @@ impl Render for SettingsPage {
                     )
                     .child(self.render_playback(cx))
                     .child(self.render_downloads(cx))
+                    .child(self.render_updates(cx))
                     .child(self.render_diagnostics(cx)),
             )
     }
@@ -458,6 +578,104 @@ fn check_row(check: Check) -> impl IntoElement {
                 })
                 .child(if check.ok { "Ready" } else { "Missing" }),
         )
+}
+
+/// An on/off switch, styled like the autoplay one.
+fn switch(id: &'static str, on: bool) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .w(px(48.))
+        .h(px(28.))
+        .p(px(3.))
+        .rounded_full()
+        .cursor_pointer()
+        .bg(if on { theme::accent() } else { theme::raised() })
+        .when(on, |d| d.justify_end())
+        .child(div().size(px(22.)).rounded_full().bg(if on {
+            theme::on_accent()
+        } else {
+            theme::text_dim()
+        }))
+}
+
+#[derive(Clone, Copy)]
+enum Notice {
+    Install,
+    Restart,
+}
+
+/// The line under the Updates rows: what was found or went wrong, a link
+/// to the release page, and the one action that fits.
+fn update_notice(
+    message: String,
+    error: bool,
+    page: Option<String>,
+    action: Option<(&'static str, Notice)>,
+) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .py(px(14.))
+        .border_b_1()
+        .border_color(theme::line())
+        .child(
+            icon(match (error, action) {
+                (true, _) => "circle-alert",
+                (false, Some((_, Notice::Restart))) => "check",
+                _ => "download",
+            })
+            .size(px(18.))
+            .text_color(if error {
+                theme::danger()
+            } else {
+                theme::accent()
+            }),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(px(theme::SMALL))
+                .line_height(relative(1.5))
+                .text_color(if error {
+                    theme::danger()
+                } else {
+                    theme::text()
+                })
+                .child(message),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .gap(px(8.))
+                .children(page.map(|url| {
+                    button("settings-update-page", "Release notes")
+                        .kind(ButtonKind::Ghost)
+                        .compact()
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                }))
+                .children(action.map(|(label, notice)| {
+                    button("settings-update-action", label)
+                        .kind(ButtonKind::Secondary)
+                        .compact()
+                        .on_click(move |_, _, cx| match notice {
+                            Notice::Install => updater::install_now(cx),
+                            Notice::Restart => updater::restart(cx),
+                        })
+                })),
+        )
+        .into_any_element()
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 fn section_title(title: &'static str) -> impl IntoElement {
