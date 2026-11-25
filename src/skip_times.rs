@@ -204,29 +204,41 @@ pub fn aniskip_episode(ep: &str) -> Option<u32> {
     trimmed.parse::<u32>().ok().filter(|&n| n > 0)
 }
 
-/// Fetches AniSkip entries for `(mal_id, ep)`, cached in `api_cache`.
-/// Returns an empty list on 404, non-integer episodes, or network errors when
-/// no stale cache exists. Call off the UI thread.
-pub fn fetch_aniskip(db: &Mutex<Db>, mal_id: i64, ep: &str) -> Vec<AniSkipEntry> {
-    if mal_id <= 0 {
-        return Vec::new();
-    }
-    let Some(ep_num) = aniskip_episode(ep) else {
+/// Fetches AniSkip entries for `(mal_id, ep)` at this stream's `duration`,
+/// cached in `api_cache`. Empty on 404, non-integer episodes, an unknown
+/// duration, or network errors with nothing cached. Call off the UI thread.
+pub fn fetch_aniskip(db: &Mutex<Db>, mal_id: i64, ep: &str, duration: f64) -> Vec<AniSkipEntry> {
+    let Some(key) = cache_key(mal_id, ep, duration) else {
         return Vec::new();
     };
-    let key = format!("{CACHE_KEY_PREFIX}:{mal_id}:{ep_num}");
-    catalog::fetch_cached(db, &key, CACHE_TTL_SECS, || {
-        fetch_aniskip_http(mal_id, ep_num)
+    let (ep_num, secs) = (key.1, key.2);
+    catalog::fetch_cached(db, &key.0, CACHE_TTL_SECS, || {
+        fetch_aniskip_http(mal_id, ep_num, secs)
     })
     .unwrap_or_default()
 }
 
-fn fetch_aniskip_http(mal_id: i64, ep_num: u32) -> Result<Vec<AniSkipEntry>> {
-    // episodeLength=0 disables server-side length filtering so one cached call
-    // returns every candidate (op/ed/mixed-op/mixed-ed) with its recorded
-    // episodeLength, and we pick the best match once mpv reports duration.
+/// The `api_cache` key, episode number and whole-second length for one
+/// lookup. AniSkip only returns times submitted for an episode length close
+/// to the one asked for (other cuts of an episode shift every timestamp), so
+/// the length is part of the key: replays of the same stream hit, a
+/// different provider's cut asks again.
+fn cache_key(mal_id: i64, ep: &str, duration: f64) -> Option<(String, u32, u32)> {
+    if mal_id <= 0 || !duration.is_finite() || duration < 1.0 || duration > 86_400.0 {
+        return None;
+    }
+    let ep_num = aniskip_episode(ep)?;
+    let secs = duration.round() as u32;
+    Some((
+        format!("{CACHE_KEY_PREFIX}:{mal_id}:{ep_num}:{secs}"),
+        ep_num,
+        secs,
+    ))
+}
+
+fn fetch_aniskip_http(mal_id: i64, ep_num: u32, secs: u32) -> Result<Vec<AniSkipEntry>> {
     let url = format!(
-        "{ANISKIP_API}/{mal_id}/{ep_num}?types=op&types=ed&types=mixed-op&types=mixed-ed&episodeLength=0"
+        "{ANISKIP_API}/{mal_id}/{ep_num}?types=op&types=ed&types=mixed-op&types=mixed-ed&episodeLength={secs}"
     );
     let mut resp = AGENT
         .get(&url)
@@ -234,6 +246,7 @@ fn fetch_aniskip_http(mal_id: i64, ep_num: u32) -> Result<Vec<AniSkipEntry>> {
         .call()
         .with_context(|| format!("GET {url}"))?;
     let status = resp.status().as_u16();
+    // "No skip times found" is a 404 with a JSON body.
     if status == 404 {
         return Ok(Vec::new());
     }
@@ -242,6 +255,8 @@ fn fetch_aniskip_http(mal_id: i64, ep_num: u32) -> Result<Vec<AniSkipEntry>> {
     }
     let v: Value = resp
         .body_mut()
+        .with_config()
+        .limit(MAX_RESPONSE_BYTES)
         .read_json()
         .with_context(|| format!("decoding JSON from {url}"))?;
     Ok(parse_aniskip(&v))
