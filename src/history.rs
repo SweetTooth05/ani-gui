@@ -41,6 +41,44 @@ pub fn read(path: &Path) -> Vec<HistoryEntry> {
         .collect()
 }
 
+/// Records `entry` as ani-cli's `update_history` would: replaces the line
+/// for the same id, else appends one. For episodes found ahead of time with
+/// [`crate::anicli::resolve_unrecorded`], once the user really plays them.
+pub fn record(path: &Path, entry: &HistoryEntry) -> io::Result<()> {
+    let old = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err),
+    };
+    let new_line = format!("{}\t{}\t{}", entry.ep, entry.id, entry.title);
+    let mut lines: Vec<&[u8]> = old.split(|&b| b == b'\n').collect();
+    if lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    let same_id = |line: &[u8]| line.split(|&b| b == b'\t').nth(1) == Some(entry.id.as_bytes());
+    let mut out = Vec::with_capacity(old.len() + new_line.len() + 1);
+    let mut replaced = false;
+    for line in lines {
+        if !replaced && same_id(line) {
+            out.extend_from_slice(new_line.as_bytes());
+            replaced = true;
+        } else {
+            out.extend_from_slice(line);
+        }
+        out.push(b'\n');
+    }
+    if !replaced {
+        out.extend_from_slice(new_line.as_bytes());
+        out.push(b'\n');
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(dir)?;
+    // Not ani-cli's own `ani-hsts.new`, which a running ani-cli may be using.
+    let tmp = dir.join(".ani-hsts.ani-gui");
+    fs::write(&tmp, out)?;
+    fs::rename(&tmp, path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +124,38 @@ mod tests {
                 entry("1", "trailing-1", "No final newline"),
             ]
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn record_replaces_the_shows_line_or_appends() {
+        let dir = std::env::temp_dir().join(format!("ani-gui-hist-rec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("state/ani-cli/ani-hsts");
+
+        // No file (or directory) yet: created with the one line.
+        record(&path, &entry("1", "frieren-1", "Frieren")).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "1\tfrieren-1\tFrieren\n"
+        );
+
+        fs::write(
+            &path,
+            "5\tchiikawa-948\tChiikawa\n2\tfrieren-1\tFrieren\n7\tx\ty",
+        )
+        .unwrap();
+        record(&path, &entry("3", "frieren-1", "Frieren")).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "5\tchiikawa-948\tChiikawa\n3\tfrieren-1\tFrieren\n7\tx\ty\n"
+        );
+        record(&path, &entry("1", "akane-241", "Akane-banashi")).unwrap();
+        assert_eq!(
+            read(&path).last(),
+            Some(&entry("1", "akane-241", "Akane-banashi"))
+        );
+        assert_eq!(read(&path).len(), 4);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

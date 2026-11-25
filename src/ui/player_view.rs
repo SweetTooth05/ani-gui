@@ -220,7 +220,7 @@ pub struct PlayerView {
     resolves: ResolveScope,
     /// Background pre-resolve for the next episode near the end of the current one.
     prefetch_ep: Option<String>,
-    prefetch_task: Option<Task<Option<Stream>>>,
+    prefetch_task: Option<Task<bool>>,
     prefetch_scope: ResolveScope,
     leaving: bool,
     /// Holds off screen blanking while video actually plays.
@@ -547,7 +547,7 @@ impl PlayerView {
         &mut self,
         chosen: Option<String>,
         load_resume: bool,
-        inflight_prefetch: Option<Task<Option<Stream>>>,
+        inflight_prefetch: Option<Task<bool>>,
         cx: &mut Context<Self>,
     ) {
         self.phase = Phase::Resolving { pick: None };
@@ -577,7 +577,7 @@ impl PlayerView {
                 if let Some(path) = playback::downloaded_file(&records, &show.id, mode, &ep) {
                     return Ok(EpisodeLoad::Local { path, start });
                 }
-                if let Some(stream) = playback::cached_stream(&show.id, mode, &ep, &quality) {
+                if let Some(stream) = playback::play_cached(&show.id, mode, &ep, &quality) {
                     return Ok(EpisodeLoad::Stream {
                         stream,
                         from_cache: true,
@@ -585,7 +585,8 @@ impl PlayerView {
                     });
                 }
                 if let Some(prefetch) = inflight_prefetch
-                    && let Some(stream) = prefetch.await
+                    && prefetch.await
+                    && let Some(stream) = playback::play_cached(&show.id, mode, &ep, &quality)
                 {
                     return Ok(EpisodeLoad::Stream {
                         stream,
@@ -824,11 +825,11 @@ impl PlayerView {
                 .map(|d| d.snapshot().into_iter().map(|(record, _)| record).collect())
                 .unwrap_or_default();
             if playback::downloaded_file(&records, &show.id, mode, &ep).is_some() {
-                return None;
+                return false;
             }
-            playback::pre_resolve(&db, &shims, &show, &ep, mode, &quality, &owner)
-                .ok()
-                .flatten()
+            playback::resolve_ahead(&db, &shims, &show, &ep, mode, &quality, &owner)
+                .inspect_err(|err| eprintln!("ani-gui: finding episode {ep} ahead: {err:#}"))
+                .unwrap_or(false)
         }));
     }
 

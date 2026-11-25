@@ -17,6 +17,7 @@ use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use sha2::{Digest, Sha256};
 
+use crate::history::{self, HistoryEntry};
 use crate::model::{EpisodeRequest, Mode, ShowSummary, Stream, valid_episode};
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1049,40 +1050,44 @@ pub fn resolve(
     resolve_with(&program, req, shims, &[], RESOLVE_TIMEOUT, Some(owner))
 }
 
-/// Like [`resolve`], for background pre-resolving of an upcoming episode the
-/// user has not chosen to watch yet. Passes `--exit-after-play`, disables
-/// syslog logging (`ANI_CLI_LOG=0`), and redirects `ANI_CLI_HIST_DIR` to a
-/// throwaway directory so ani-cli can never record an unwatched episode in the
-/// user's history.
-pub fn resolve_silent(
+/// [`resolve`] for an episode the user has not chosen to watch yet (the next
+/// one, found ahead of time). ani-cli runs as usual but with its history in
+/// a throwaway directory and syslog logging off, so nothing is recorded; the
+/// history line ani-cli would have written comes back instead, for
+/// [`history::record`] once the episode really plays.
+pub fn resolve_unrecorded(
     req: &EpisodeRequest,
     shims: &Path,
     owner: &ResolveHandle,
-) -> Result<ResolveOutcome> {
+) -> Result<(ResolveOutcome, Option<HistoryEntry>)> {
     let program = find().with_context(not_installed)?;
-    resolve_silent_with(&program, req, shims, RESOLVE_TIMEOUT, Some(owner))
+    resolve_unrecorded_with(&program, req, shims, RESOLVE_TIMEOUT, Some(owner))
 }
 
-fn resolve_silent_with(
+fn resolve_unrecorded_with(
     program: &Path,
     req: &EpisodeRequest,
     shims: &Path,
     timeout: Duration,
     owner: Option<&ResolveHandle>,
-) -> Result<ResolveOutcome> {
+) -> Result<(ResolveOutcome, Option<HistoryEntry>)> {
+    /// Removed however the run ends.
     struct TempDir(PathBuf);
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
-    let hist_dir = TempDir(temp_name(shims, "prefetch-hist"));
-    fs::create_dir_all(&hist_dir.0)?;
-    let extra_env = [
-        ("ANI_CLI_HIST_DIR", hist_dir.0.as_os_str().to_owned()),
+    let hist = TempDir(temp_name(shims, "unrecorded-hist"));
+    fs::create_dir_all(&hist.0)?;
+    let env = [
+        ("ANI_CLI_HIST_DIR", hist.0.as_os_str().to_owned()),
         ("ANI_CLI_LOG", OsString::from("0")),
     ];
-    resolve_with_mode(program, req, shims, &extra_env, timeout, owner, true)
+    let outcome = resolve_with(program, req, shims, &env, timeout, owner)?;
+    // ani-cli started from an empty file, so its one line is this episode.
+    let entry = history::read(&hist.0.join("ani-hsts")).pop();
+    Ok((outcome, entry))
 }
 
 /// [`resolve`] with a given ani-cli and extra environment. When the search
@@ -1096,27 +1101,7 @@ pub(crate) fn resolve_with(
     timeout: Duration,
     owner: Option<&ResolveHandle>,
 ) -> Result<ResolveOutcome> {
-    resolve_with_mode(program, req, shims, extra_env, timeout, owner, false)
-}
-
-fn resolve_with_mode(
-    program: &Path,
-    req: &EpisodeRequest,
-    shims: &Path,
-    extra_env: &[(&str, OsString)],
-    timeout: Duration,
-    owner: Option<&ResolveHandle>,
-    exit_after_play: bool,
-) -> Result<ResolveOutcome> {
-    match resolve_once(
-        program,
-        req,
-        shims,
-        extra_env,
-        timeout,
-        owner,
-        exit_after_play,
-    )? {
+    match resolve_once(program, req, shims, extra_env, timeout, owner)? {
         Attempt::Done(outcome) => Ok(outcome),
         Attempt::NoResults(err) => {
             let romaji = req.want_titles.last().filter(|t| **t != req.query);
@@ -1126,15 +1111,7 @@ fn resolve_with_mode(
                         query: title.clone(),
                         ..req.clone()
                     };
-                    match resolve_once(
-                        program,
-                        &retry,
-                        shims,
-                        extra_env,
-                        timeout,
-                        owner,
-                        exit_after_play,
-                    )? {
+                    match resolve_once(program, &retry, shims, extra_env, timeout, owner)? {
                         Attempt::Done(outcome) => Ok(outcome),
                         Attempt::NoResults(err) => Err(err),
                     }
@@ -1157,14 +1134,8 @@ fn resolve_once(
     extra_env: &[(&str, OsString)],
     timeout: Duration,
     owner: Option<&ResolveHandle>,
-    exit_after_play: bool,
 ) -> Result<Attempt> {
-    let flag = if exit_after_play {
-        "--exit-after-play"
-    } else {
-        "--no-detach"
-    };
-    let mut cmd = vec![program.as_os_str().to_owned(), flag.into()];
+    let mut cmd = vec![program.as_os_str().to_owned(), "--no-detach".into()];
     cmd.extend(episode_args(req)?);
     let menu_out = menu_out_path(shims);
     let mut env = shim_env(req, shims, &menu_out);
@@ -1437,7 +1408,7 @@ fn run_capture(
             let _ = forget(&mut child, true);
             break None;
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(25));
     };
     let stdout = stdout.finish();
     let stderr = stderr.finish();
@@ -2157,53 +2128,46 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
     }
 
     #[test]
-    fn resolve_silent_does_not_write_user_history() {
-        let dir = temp_dir("silent-hist");
+    fn resolve_unrecorded_keeps_the_users_history_untouched() {
+        let dir = temp_dir("unrecorded");
         let shims = ensure_shims(&dir.join("cache"), &std::env::current_exe().unwrap()).unwrap();
-        let user_hist = dir.join("user-hist");
-        fs::create_dir_all(&user_hist).unwrap();
-        let user_hist_file = user_hist.join("ani-hsts");
-        fs::write(&user_hist_file, "1\tfrieren-1\tFrieren\n").unwrap();
-        let seen_args = dir.join("args.log");
-        // Models ani-cli: writes history to $ANI_CLI_HIST_DIR/ani-hsts even if
-        // --exit-after-play were ignored, and records args/env for assertions.
+        let seen = dir.join("seen-env");
+        // Like ani-cli: logs to syslog unless ANI_CLI_LOG=0, plays, then
+        // appends the episode to $ANI_CLI_HIST_DIR/ani-hsts.
         let fake = script(
             &dir.join("bin/ani-cli"),
             &format!(
-                r#"printf '%s\n' "$1" "$ANI_CLI_LOG" "$ANI_CLI_HIST_DIR" > '{}'
-mkdir -p "$ANI_CLI_HIST_DIR"
-printf '2\tfrieren-1\tFrieren\n' >> "$ANI_CLI_HIST_DIR/ani-hsts"
-$ANI_CLI_PLAYER --referrer="https://zokoanime.video/" --force-media-title="Frieren: Beyond Journey's End Episode 2" "https://hls.dramahot.top/p/0a1b/master.m3u8""#,
-                seen_args.display()
+                r#"printf '%s\n' "$ANI_CLI_LOG" "$ANI_CLI_HIST_DIR" > '{}'
+$ANI_CLI_PLAYER --referrer="https://zokoanime.video/" --force-media-title="Frieren: Beyond Journey's End Episode 2" "https://hls.dramahot.top/p/0a1b/master.m3u8"
+printf '2\tReHMC7TQnch3C6z8j\tFrieren: Beyond Journey'"'"'s End\n' >> "$ANI_CLI_HIST_DIR/ani-hsts""#,
+                seen.display()
             ),
         );
         let req = build_request(&frieren(), None, "2", Mode::Sub, "best");
-        let scope = ResolveScope::default();
-        let handle = scope.handle();
-        let outcome =
-            resolve_silent_with(&fake, &req, &shims, Duration::from_secs(10), Some(&handle))
-                .unwrap();
+
+        let (outcome, entry) =
+            resolve_unrecorded_with(&fake, &req, &shims, Duration::from_secs(10), None).unwrap();
+
         let ResolveOutcome::Stream(stream) = outcome else {
-            panic!("expected stream, got {outcome:?}");
+            panic!("expected a stream, got {outcome:?}");
         };
         assert_eq!(stream.url, "https://hls.dramahot.top/p/0a1b/master.m3u8");
-        let logged: Vec<String> = fs::read_to_string(&seen_args)
-            .unwrap()
-            .lines()
-            .map(str::to_string)
-            .collect();
-        assert_eq!(logged[0], "--exit-after-play");
-        assert_eq!(logged[1], "0");
-        assert_ne!(Path::new(&logged[2]), user_hist);
-        assert!(
-            !Path::new(&logged[2]).exists(),
-            "temporary prefetch hist dir must be cleaned up"
-        );
         assert_eq!(
-            fs::read_to_string(&user_hist_file).unwrap(),
-            "1\tfrieren-1\tFrieren\n",
-            "user's real history must stay untouched"
+            entry,
+            Some(HistoryEntry {
+                ep: "2".into(),
+                id: "ReHMC7TQnch3C6z8j".into(),
+                title: "Frieren: Beyond Journey's End".into(),
+            })
         );
+        let seen = fs::read_to_string(&seen).unwrap();
+        let mut seen = seen.lines();
+        assert_eq!(seen.next(), Some("0"), "syslog logging must be off");
+        // Not the user's history (wherever their environment puts it) but a
+        // run-private directory, gone afterwards.
+        let used = PathBuf::from(seen.next().unwrap());
+        assert!(used.starts_with(&shims), "{}", used.display());
+        assert!(!used.exists(), "the throwaway history dir is removed");
         fs::remove_dir_all(&dir).unwrap();
     }
 

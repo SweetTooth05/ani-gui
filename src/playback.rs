@@ -10,20 +10,22 @@ use anyhow::Result;
 use crate::anicli::{self, ResolveHandle, ResolveOutcome};
 use crate::db::{Db, lock};
 use crate::downloads::DownloadManager;
+use crate::history::{self, HistoryEntry};
 use crate::model::{DlStatus, DownloadRecord, EpisodeRequest, Mode, Progress, ShowSummary, Stream};
+use crate::paths;
 use crate::player::PlaybackState;
 use crate::progress;
 
 /// Seconds of playback movement between progress saves.
 const SAVE_EVERY: f64 = 5.0;
-/// How long a resolved stream URL stays reusable for replay / pre-resolve.
-/// Signed HLS URLs expire eventually, so keep this short; the player also
-/// evicts and retries fresh if mpv fails to open a cached URL.
+/// How long a resolved stream URL stays reusable for replaying or for the
+/// next episode found ahead of time. Providers sign their URLs, so keep it
+/// short; the player also re-resolves once when mpv can't open a cached URL.
 const STREAM_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 const STREAM_CACHE_MAX: usize = 32;
-/// How many seconds before the outro (or before EOF) to start pre-resolving
-/// the next episode in the background.
+/// Find the next episode this long before the current one's ending...
 const PREFETCH_LEAD_SECS: f64 = 30.0;
+/// ...or, without one, this long before its end.
 const PREFETCH_REMAINING_SECS: f64 = 120.0;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -45,80 +47,93 @@ impl StreamKey {
     }
 }
 
+struct Cached {
+    stream: Stream,
+    /// The history line ani-cli would have written, for an episode found
+    /// ahead of time and not played yet; see [`play_cached`].
+    unrecorded: Option<HistoryEntry>,
+    stored_at: Instant,
+}
+
+#[derive(Default)]
 struct StreamCache {
-    entries: HashMap<StreamKey, (Stream, Instant)>,
+    entries: HashMap<StreamKey, Cached>,
 }
 
 impl StreamCache {
-    fn new() -> Self {
-        StreamCache {
-            entries: HashMap::new(),
-        }
-    }
-
-    fn get(&mut self, key: &StreamKey, now: Instant) -> Option<Stream> {
-        let (stream, stored_at) = self.entries.get(key)?;
-        if now.saturating_duration_since(*stored_at) < STREAM_CACHE_TTL {
-            Some(stream.clone())
-        } else {
+    /// A fresh entry's stream, handing over (once) its unrecorded history.
+    fn take(&mut self, key: &StreamKey, now: Instant) -> Option<(Stream, Option<HistoryEntry>)> {
+        let cached = self.entries.get_mut(key)?;
+        if now.saturating_duration_since(cached.stored_at) >= STREAM_CACHE_TTL {
             self.entries.remove(key);
-            None
+            return None;
         }
+        Some((cached.stream.clone(), cached.unrecorded.take()))
     }
 
-    fn insert(&mut self, key: StreamKey, stream: Stream, now: Instant) {
+    fn insert(
+        &mut self,
+        key: StreamKey,
+        stream: Stream,
+        unrecorded: Option<HistoryEntry>,
+        now: Instant,
+    ) {
         self.entries
-            .retain(|_, (_, t)| now.saturating_duration_since(*t) < STREAM_CACHE_TTL);
+            .retain(|_, c| now.saturating_duration_since(c.stored_at) < STREAM_CACHE_TTL);
         if self.entries.len() >= STREAM_CACHE_MAX
             && !self.entries.contains_key(&key)
             && let Some(oldest) = self
                 .entries
                 .iter()
-                .min_by_key(|(_, (_, t))| *t)
+                .min_by_key(|(_, c)| c.stored_at)
                 .map(|(k, _)| k.clone())
         {
             self.entries.remove(&oldest);
         }
-        self.entries.insert(key, (stream, now));
-    }
-
-    fn evict(&mut self, key: &StreamKey) {
-        self.entries.remove(key);
-    }
-
-    fn evict_show(&mut self, show_id: &str) {
-        self.entries.retain(|k, _| k.show_id != show_id);
+        let cached = Cached {
+            stream,
+            unrecorded,
+            stored_at: now,
+        };
+        self.entries.insert(key, cached);
     }
 }
 
-static STREAM_CACHE: LazyLock<Mutex<StreamCache>> =
-    LazyLock::new(|| Mutex::new(StreamCache::new()));
+static STREAM_CACHE: LazyLock<Mutex<StreamCache>> = LazyLock::new(Mutex::default);
 
 fn stream_cache() -> MutexGuard<'static, StreamCache> {
     STREAM_CACHE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A recently resolved stream for this episode, if still fresh.
-pub fn cached_stream(show_id: &str, mode: Mode, ep: &str, quality: &str) -> Option<Stream> {
+/// A recently resolved stream for this episode, if still fresh, to play now.
+/// When it was found ahead of time, this is when the user really watches it,
+/// so ani-cli's history gets the line ani-cli held back.
+pub fn play_cached(show_id: &str, mode: Mode, ep: &str, quality: &str) -> Option<Stream> {
     if repick().contains(show_id) {
         return None;
     }
-    stream_cache().get(&StreamKey::new(show_id, mode, ep, quality), Instant::now())
+    let key = StreamKey::new(show_id, mode, ep, quality);
+    let (stream, unrecorded) = stream_cache().take(&key, Instant::now())?;
+    if let Some(entry) = unrecorded {
+        let path = paths::ani_cli_history_path();
+        if let Err(err) = history::record(&path, &entry) {
+            eprintln!("ani-gui: recording {}: {err}", path.display());
+        }
+    }
+    Some(stream)
 }
 
-/// Remembers a resolved stream briefly so replaying or advancing to a
-/// pre-resolved episode skips running ani-cli again.
+/// Remembers a stream ani-cli resolved (and recorded) so replaying the
+/// episode soon after skips running ani-cli again.
 pub fn cache_stream(show_id: &str, mode: Mode, ep: &str, quality: &str, stream: Stream) {
-    stream_cache().insert(
-        StreamKey::new(show_id, mode, ep, quality),
-        stream,
-        Instant::now(),
-    );
+    let key = StreamKey::new(show_id, mode, ep, quality);
+    stream_cache().insert(key, stream, None, Instant::now());
 }
 
-/// Drops one cached stream (e.g. when mpv could not open a stale URL).
+/// Drops one cached stream (when mpv could not open it).
 pub fn evict_stream(show_id: &str, mode: Mode, ep: &str, quality: &str) {
-    stream_cache().evict(&StreamKey::new(show_id, mode, ep, quality));
+    let key = StreamKey::new(show_id, mode, ep, quality);
+    stream_cache().entries.remove(&key);
 }
 
 /// Whether playback is close enough to the end of the episode to start
@@ -266,7 +281,7 @@ fn repick() -> MutexGuard<'static, BTreeSet<String>> {
 pub fn forget_provider_title(db: &Mutex<Db>, show_id: &str) -> Result<()> {
     lock(db).clear_provider_title(show_id)?;
     repick().insert(show_id.to_string());
-    stream_cache().evict_show(show_id);
+    stream_cache().entries.retain(|k, _| k.show_id != show_id);
     Ok(())
 }
 
@@ -300,9 +315,9 @@ fn title_request(
 }
 
 /// Resolves `ep` of `show` with ani-cli (which records it in its history);
-/// see [`title_request`] for `chosen`. Reuses a freshly cached stream URL when
-/// available. Killed if `owner` is cancelled. Blocks on ani-cli: call it off
-/// the UI thread.
+/// see [`title_request`] for `chosen`. Plays a freshly cached stream instead
+/// when there is one (see [`play_cached`]). Killed if `owner` is cancelled.
+/// Blocks on ani-cli: call it off the UI thread.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve(
     db: &Mutex<Db>,
@@ -315,7 +330,7 @@ pub fn resolve(
     owner: &ResolveHandle,
 ) -> Result<ResolveOutcome> {
     if chosen.is_none()
-        && let Some(stream) = cached_stream(&show.id, mode, ep, quality)
+        && let Some(stream) = play_cached(&show.id, mode, ep, quality)
     {
         return Ok(ResolveOutcome::Stream(stream));
     }
@@ -327,11 +342,13 @@ pub fn resolve(
     Ok(outcome)
 }
 
-/// Silently pre-resolves `ep` in the background without touching ani-cli's
-/// history file. Returns `Ok(None)` if the show needs a manual title pick.
-/// Killed if `owner` is cancelled. Call off the UI thread.
-#[allow(clippy::too_many_arguments)]
-pub fn pre_resolve(
+/// Finds `ep` ahead of time, before the user chooses to watch it, so playing
+/// it next needs no wait: ani-cli runs without recording it (see
+/// [`anicli::resolve_unrecorded`]) and the stream waits in the cache for
+/// [`play_cached`]. Gives up (`false`) when the show's title needs picking.
+/// Killed if `owner` is cancelled. Blocks on ani-cli: call it off the UI
+/// thread.
+pub fn resolve_ahead(
     db: &Mutex<Db>,
     shims: &Path,
     show: &ShowSummary,
@@ -339,20 +356,26 @@ pub fn pre_resolve(
     mode: Mode,
     quality: &str,
     owner: &ResolveHandle,
-) -> Result<Option<Stream>> {
-    if let Some(stream) = cached_stream(&show.id, mode, ep, quality) {
-        return Ok(Some(stream));
+) -> Result<bool> {
+    let key = StreamKey::new(&show.id, mode, ep, quality);
+    let now = Instant::now();
+    if stream_cache()
+        .entries
+        .get(&key)
+        .is_some_and(|c| now.saturating_duration_since(c.stored_at) < STREAM_CACHE_TTL)
+    {
+        return Ok(true);
     }
     let req = title_request(db, show, ep, mode, quality, None)?;
     if req.want_titles.is_empty() {
-        return Ok(None);
+        return Ok(false);
     }
-    match anicli::resolve_silent(&req, shims, owner)? {
-        ResolveOutcome::Stream(stream) => {
-            cache_stream(&show.id, mode, ep, quality, stream.clone());
-            Ok(Some(stream))
+    match anicli::resolve_unrecorded(&req, shims, owner)? {
+        (ResolveOutcome::Stream(stream), unrecorded) => {
+            stream_cache().insert(key, stream, unrecorded, Instant::now());
+            Ok(true)
         }
-        ResolveOutcome::NeedsPick(_) => Ok(None),
+        (ResolveOutcome::NeedsPick(_), _) => Ok(false),
     }
 }
 
@@ -592,10 +615,9 @@ mod tests {
     }
 
     #[test]
-    fn stream_cache_hits_expires_and_evicts() {
-        let mut cache = StreamCache::new();
+    fn stream_cache_expires_and_hands_over_unrecorded_history_once() {
+        let mut cache = StreamCache::default();
         let t0 = Instant::now();
-        let key = StreamKey::new("show-cache", Mode::Sub, "1", "best");
         let stream = Stream {
             url: "https://example.invalid/1.m3u8".into(),
             referrer: None,
@@ -603,25 +625,24 @@ mod tests {
             sub_file: None,
             title: None,
         };
-        cache.insert(key.clone(), stream.clone(), t0);
-        assert_eq!(cache.get(&key, t0 + Duration::from_secs(60)), Some(stream));
-        // Expires at TTL.
-        assert_eq!(cache.get(&key, t0 + STREAM_CACHE_TTL), None);
+        let replay = StreamKey::new("show", Mode::Sub, "1", "best");
+        cache.insert(replay.clone(), stream.clone(), None, t0);
+        let soon = t0 + Duration::from_secs(60);
+        assert_eq!(cache.take(&replay, soon), Some((stream.clone(), None)));
+        assert_eq!(cache.take(&replay, t0 + STREAM_CACHE_TTL), None);
+        assert!(cache.entries.is_empty(), "expired entries are dropped");
 
-        // Evicting a show drops all its episodes without touching others.
-        let other = StreamKey::new("other-show", Mode::Sub, "1", "best");
-        let s2 = Stream {
-            url: "https://example.invalid/2.m3u8".into(),
-            referrer: None,
-            audio_file: None,
-            sub_file: None,
-            title: None,
+        // Found ahead of time: the first play gets the held-back history
+        // line, replays don't record it again.
+        let ahead = StreamKey::new("show", Mode::Sub, "2", "best");
+        let line = HistoryEntry {
+            ep: "2".into(),
+            id: "show-provider-id".into(),
+            title: "Show".into(),
         };
-        cache.insert(key.clone(), s2.clone(), t0);
-        cache.insert(other.clone(), s2.clone(), t0);
-        cache.evict_show("show-cache");
-        assert_eq!(cache.get(&key, t0), None);
-        assert_eq!(cache.get(&other, t0), Some(s2));
+        cache.insert(ahead.clone(), stream.clone(), Some(line.clone()), t0);
+        assert_eq!(cache.take(&ahead, soon), Some((stream.clone(), Some(line))));
+        assert_eq!(cache.take(&ahead, soon), Some((stream, None)));
     }
 
     #[test]
