@@ -14,6 +14,7 @@ use std::thread::{self, JoinHandle};
 use std::{iter, ptr};
 
 use crate::model::Stream;
+use crate::skip_times::{self, Chapter};
 use ffi::{Api, MpvEventEndFile, MpvEventProperty, MpvHandle, MpvRenderContext, MpvRenderParam};
 
 /// libmpv's file names, tried in order. On macOS the bare names go through
@@ -37,7 +38,7 @@ const MAX_SIDE: u32 = 16384;
 const STRIDE_ALIGN: usize = 64;
 
 /// Observed properties; the index is the `reply_userdata` mpv echoes back.
-const PROPERTIES: [(&CStr, c_int); 7] = [
+const PROPERTIES: [(&CStr, c_int); 8] = [
     (c"time-pos", ffi::MPV_FORMAT_DOUBLE),
     (c"duration", ffi::MPV_FORMAT_DOUBLE),
     (c"pause", ffi::MPV_FORMAT_FLAG),
@@ -45,6 +46,7 @@ const PROPERTIES: [(&CStr, c_int); 7] = [
     (c"paused-for-cache", ffi::MPV_FORMAT_FLAG),
     (c"volume", ffi::MPV_FORMAT_DOUBLE),
     (c"sub-visibility", ffi::MPV_FORMAT_FLAG),
+    (c"chapter-list", ffi::MPV_FORMAT_STRING),
 ];
 
 pub struct Frame {
@@ -142,6 +144,7 @@ struct Shared {
     api: Api,
     mpv: Handle,
     state: Mutex<PlaybackState>,
+    chapters: Mutex<Vec<Chapter>>,
     frame: Mutex<FrameSlot>,
     last_error: Mutex<Option<String>>,
     render_size: Mutex<(u32, u32)>,
@@ -277,6 +280,7 @@ impl MpvPlayer {
             api,
             mpv: Handle(mpv),
             state: Mutex::new(PlaybackState::default()),
+            chapters: Mutex::new(Vec::new()),
             frame: Mutex::new(FrameSlot::default()),
             last_error: Mutex::new(None),
             render_size: Mutex::new(DEFAULT_SIZE),
@@ -335,9 +339,10 @@ impl MpvPlayer {
     /// Failures to open it arrive later through `last_error`.
     pub fn load(&self, s: &Stream, start_secs: f64) -> Result<(), PlayerError> {
         *lock(&self.shared.last_error) = None;
+        lock(&self.shared.chapters).clear();
         {
             let mut slot = lock(&self.shared.frame);
-            slot.generation += 1;
+            slot.clear();
             slot.live = true;
         }
         let opts = loadfile_options(s, start_secs);
@@ -403,6 +408,7 @@ impl MpvPlayer {
 
     pub fn stop(&self) {
         let _ = self.shared.command(&["stop"]);
+        lock(&self.shared.chapters).clear();
         let mut slot = lock(&self.shared.frame);
         slot.clear();
         slot.live = false;
@@ -429,6 +435,12 @@ impl MpvPlayer {
 
     pub fn state(&self) -> PlaybackState {
         *lock(&self.shared.state)
+    }
+
+    /// Chapters reported by mpv for the loaded file (empty when the stream has
+    /// none). Used as a fallback for opening/ending skip times.
+    pub fn chapters(&self) -> Vec<Chapter> {
+        lock(&self.shared.chapters).clone()
     }
 
     /// Called from the player's threads after every new frame or state change.
@@ -488,6 +500,14 @@ fn init(api: &Api, mpv: *mut MpvHandle, hwdec: &CStr) -> Result<RenderCtx, Playe
         // Prefer English when falling back to embedded/multi-track subtitles;
         // external `--sub-file` tracks still take precedence automatically.
         (c"slang", c"en,eng,english"),
+        // Measured on HLS streams: skips ytdl probing, renders the first frame
+        // without waiting for the cache fill threshold, keeps 20 s buffered
+        // ahead for seeks, and selects the top HLS variant directly.
+        (c"ytdl", c"no"),
+        (c"cache", c"yes"),
+        (c"cache-pause-initial", c"no"),
+        (c"demuxer-readahead-secs", c"20"),
+        (c"hls-bitrate", c"max"),
     ] {
         // SAFETY: valid handle and static C strings.
         check(unsafe { (api.set_option_string)(mpv, name.as_ptr(), value.as_ptr()) })?;
@@ -685,7 +705,25 @@ fn event_loop(shared: &Shared) {
             ffi::MPV_EVENT_PROPERTY_CHANGE if !event.data.is_null() => {
                 // SAFETY: PROPERTY_CHANGE carries an mpv_event_property.
                 let prop = unsafe { &*(event.data as *const MpvEventProperty) };
-                apply_property(&mut lock(&shared.state), event.reply_userdata, prop);
+                if event.reply_userdata == 7 {
+                    let chapters = if !prop.data.is_null() && prop.format == ffi::MPV_FORMAT_STRING
+                    {
+                        // SAFETY: MPV_FORMAT_STRING delivers a `const char**`.
+                        let cstr = unsafe { *(prop.data as *const *const c_char) };
+                        if cstr.is_null() {
+                            Vec::new()
+                        } else {
+                            // SAFETY: non-null NUL-terminated string valid for this event.
+                            let json = unsafe { CStr::from_ptr(cstr) }.to_string_lossy();
+                            skip_times::parse_chapters(&json)
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    *lock(&shared.chapters) = chapters;
+                } else {
+                    apply_property(&mut lock(&shared.state), event.reply_userdata, prop);
+                }
                 shared.notify();
             }
             _ => {}
@@ -1188,6 +1226,70 @@ mod tests {
             );
         }
 
+        drop(player);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_chapters_from_local_file() {
+        let dir =
+            std::env::temp_dir().join(format!("ani-gui-player-chapters-{}", std::process::id()));
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let meta = dir.join("chapters.txt");
+        std::fs::write(
+            &meta,
+            ";FFMETADATA1\n\
+             [CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=500\ntitle=Intro\n\
+             [CHAPTER]\nTIMEBASE=1/1000\nSTART=500\nEND=2000\ntitle=Opening\n\
+             [CHAPTER]\nTIMEBASE=1/1000\nSTART=2000\nEND=3000\ntitle=Ending\n",
+        )
+        .unwrap();
+        let clip = dir.join("chapters.mkv");
+        let ok = Command::new("ffmpeg")
+            .args([
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=64x64:d=3",
+                "-i",
+            ])
+            .arg(&meta)
+            .args(["-map_metadata", "1", "-y"])
+            .arg(&clip)
+            .stdin(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let Some(player) = test_player() else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let stream = Stream {
+            url: clip.to_string_lossy().into_owned(),
+            referrer: None,
+            audio_file: None,
+            sub_file: None,
+            title: None,
+        };
+        player.load(&stream, 0.0).expect("load");
+        assert!(
+            wait_for(Duration::from_secs(5), || player.chapters().len() == 3),
+            "expected 3 chapters, got {:?}",
+            player.chapters()
+        );
+        let chapters = player.chapters();
+        assert_eq!(chapters[0].title, "Intro");
+        assert_eq!(chapters[1].title, "Opening");
+        assert_eq!(chapters[2].title, "Ending");
+        player.stop();
+        assert!(player.chapters().is_empty());
         drop(player);
         let _ = std::fs::remove_dir_all(&dir);
     }

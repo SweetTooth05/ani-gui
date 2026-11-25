@@ -15,6 +15,7 @@ pub struct MpvRenderContext {
     _private: [u8; 0],
 }
 
+pub const MPV_FORMAT_STRING: c_int = 1;
 pub const MPV_FORMAT_FLAG: c_int = 3;
 pub const MPV_FORMAT_DOUBLE: c_int = 5;
 
