@@ -8,18 +8,28 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak, mpsc};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
+use sha2::{Digest, Sha256};
 
 use crate::model::{EpisodeRequest, Mode, ShowSummary, Stream, valid_episode};
 
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(60);
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
+const SUBTITLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Hard cap on downloaded/read subtitle files (network data is untrusted).
+const MAX_SUBTITLE_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SUB_CANDIDATES: usize = 6;
+const MAX_CACHED_SUBS: usize = 32;
+const SUBS_DIR: &str = "subs";
+/// Matches ani-cli's browser UA so subtitle CDNs don't reject the fetch.
+const SUBTITLE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+    AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 /// How much of ani-cli's output an error message carries.
 const DETAIL_CHARS: usize = 240;
 const SHIMS_DIR: &str = "shims";
@@ -237,11 +247,21 @@ pub fn menu_main(
 
 /// Reads what ani-cli handed the capture shim: one argument per line, among
 /// ani-cli's own status lines. The URL is the last line starting with `http`.
+/// When several `--sub-file=` arguments are present, prefers English full
+/// subtitle tracks over signs/non-English/thumbnail tracks.
+#[allow(dead_code)]
 pub fn parse_capture(stdout: &str) -> Result<Stream> {
+    Ok(parse_capture_with_subs(stdout)?.0)
+}
+
+/// Like [`parse_capture`], also returning every `--sub-file=` argument in the
+/// order ani-cli passed them (deduplicated) so [`prepare_subtitles`] can
+/// inspect, repair and compare candidates off the UI thread.
+fn parse_capture_with_subs(stdout: &str) -> Result<(Stream, Vec<String>)> {
     let mut url = None;
     let mut referrer = None;
     let mut audio_file = None;
-    let mut sub_file = None;
+    let mut sub_files: Vec<String> = Vec::new();
     let mut title = None;
     for line in strip_ansi(stdout).lines().map(str::trim) {
         let value = |flag: &str| {
@@ -254,20 +274,688 @@ pub fn parse_capture(stdout: &str) -> Result<Stream> {
         } else if line.starts_with("--audio-file=") {
             audio_file = value("--audio-file=");
         } else if line.starts_with("--sub-file=") {
-            sub_file = value("--sub-file=");
+            if let Some(sub) = value("--sub-file=")
+                && !sub_files.contains(&sub)
+            {
+                sub_files.push(sub);
+            }
         } else if line.starts_with("--force-media-title=") {
             title = value("--force-media-title=");
         } else if line.starts_with("http") {
             url = Some(line.to_string());
         }
     }
-    Ok(Stream {
-        url: url.context("ani-cli returned no stream URL")?,
-        referrer,
-        audio_file,
-        sub_file,
-        title,
-    })
+    let sub_file = select_best_sub_url(&sub_files).map(str::to_string);
+    Ok((
+        Stream {
+            url: url.context("ani-cli returned no stream URL")?,
+            referrer,
+            audio_file,
+            sub_file,
+            title,
+        },
+        sub_files,
+    ))
+}
+
+static SUBTITLE_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(SUBTITLE_TIMEOUT))
+        .user_agent(SUBTITLE_USER_AGENT)
+        .build()
+        .into()
+});
+
+/// Language tier inferred from a subtitle URL/path: English > opaque/unknown >
+/// clearly non-English.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LangTier {
+    Other = 0,
+    Unknown = 1,
+    English = 2,
+}
+
+/// Splits `s` into lowercase ASCII alphanumeric tokens for language/role hints.
+fn url_tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn classify_lang_tokens(tokens: &[String]) -> Option<LangTier> {
+    const ENGLISH: &[&str] = &["en", "eng", "english"];
+    const OTHER: &[&str] = &[
+        "ar",
+        "ara",
+        "arabic",
+        "fr",
+        "fre",
+        "fra",
+        "french",
+        "de",
+        "ger",
+        "deu",
+        "german",
+        "it",
+        "ita",
+        "italian",
+        "pt",
+        "por",
+        "portuguese",
+        "ru",
+        "rus",
+        "russian",
+        "es",
+        "spa",
+        "spanish",
+        "id",
+        "ind",
+        "indonesian",
+        "th",
+        "tha",
+        "thai",
+        "vi",
+        "vie",
+        "vietnamese",
+        "zh",
+        "chi",
+        "zho",
+        "chinese",
+        "ko",
+        "kor",
+        "korean",
+        "ja",
+        "jpn",
+        "japanese",
+        "tr",
+        "tur",
+        "turkish",
+        "pl",
+        "pol",
+        "polish",
+    ];
+    if tokens.iter().any(|t| ENGLISH.contains(&t.as_str())) {
+        Some(LangTier::English)
+    } else if tokens.iter().any(|t| OTHER.contains(&t.as_str())) {
+        Some(LangTier::Other)
+    } else {
+        None
+    }
+}
+
+fn is_thumbnail_tokens(tokens: &[String]) -> bool {
+    const THUMB: &[&str] = &[
+        "thumb",
+        "thumbs",
+        "thumbnail",
+        "thumbnails",
+        "sprite",
+        "sprites",
+        "storyboard",
+        "bif",
+    ];
+    tokens.iter().any(|t| THUMB.contains(&t.as_str()))
+}
+
+fn is_signs_tokens(tokens: &[String]) -> bool {
+    const SIGNS: &[&str] = &["sign", "signs", "songs", "forced"];
+    tokens.iter().any(|t| SIGNS.contains(&t.as_str()))
+}
+
+/// Language tier and offline URL preference for one subtitle URL/path.
+/// Checks the filename before parent directories/query so a path like
+/// `/en/subs/spanish.vtt` is classified as Spanish rather than English.
+fn sub_url_meta(url: &str) -> (LangTier, bool, bool) {
+    let without_frag = url.split('#').next().unwrap_or(url);
+    let (path, query) = without_frag
+        .split_once('?')
+        .map_or((without_frag, ""), |(p, q)| (p, q));
+    let filename = path.rsplit('/').next().unwrap_or(path);
+    let file_tokens = url_tokens(filename);
+    let query_tokens = url_tokens(query);
+    let path_tokens = url_tokens(path);
+
+    let thumb = is_thumbnail_tokens(&file_tokens) || is_thumbnail_tokens(&path_tokens);
+    let signs = is_signs_tokens(&file_tokens) || is_signs_tokens(&query_tokens);
+    let lang = classify_lang_tokens(&file_tokens)
+        .or_else(|| classify_lang_tokens(&query_tokens))
+        .or_else(|| classify_lang_tokens(&path_tokens))
+        .unwrap_or(LangTier::Unknown);
+    (lang, signs, thumb)
+}
+
+fn sub_url_rank(url: &str) -> i32 {
+    let (lang, signs, thumb) = sub_url_meta(url);
+    if thumb {
+        return -100;
+    }
+    let mut score = match lang {
+        LangTier::English => 30,
+        LangTier::Unknown => 0,
+        LangTier::Other => -30,
+    };
+    if signs {
+        score -= 15;
+    }
+    score
+}
+
+/// Offline URL-only pick among `--sub-file=` candidates (first highest-ranked).
+fn select_best_sub_url(urls: &[String]) -> Option<&str> {
+    urls.iter()
+        .enumerate()
+        .max_by(|(ia, a), (ib, b)| sub_url_rank(a).cmp(&sub_url_rank(b)).then(ib.cmp(ia)))
+        .map(|(_, u)| u.as_str())
+}
+
+/// Result of repairing a WebVTT file for FFmpeg/libmpv's `webvtt` demuxer.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SanitizedVtt {
+    pub content: String,
+    pub cue_count: usize,
+    pub last_end_secs: f64,
+    pub is_thumbnail: bool,
+    pub repaired_orphans: usize,
+}
+
+/// Parses `MM:SS.mmm`, `HH:MM:SS.mmm` (or SRT `,` decimals / 1–2 digit ms)
+/// into whole milliseconds.
+fn parse_vtt_timestamp_ms(s: &str) -> Option<u64> {
+    let (time, frac) = s.split_once('.').or_else(|| s.split_once(','))?;
+    if frac.is_empty() || frac.len() > 3 || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let ms: u64 = match frac.len() {
+        1 => frac.parse::<u64>().ok()? * 100,
+        2 => frac.parse::<u64>().ok()? * 10,
+        _ => frac.parse::<u64>().ok()?,
+    };
+    let mut parts = time.split(':');
+    let first = parts.next()?;
+    let second = parts.next()?;
+    let third = parts.next();
+    if parts.next().is_some() {
+        return None;
+    }
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    let (h, m, sec) = match third {
+        Some(s_part) => {
+            if !digits(first) || second.len() != 2 || s_part.len() != 2 {
+                return None;
+            }
+            let h: u64 = first.parse().ok()?;
+            let m: u64 = second.parse().ok()?;
+            let sec: u64 = s_part.parse().ok()?;
+            if m >= 60 || sec >= 60 {
+                return None;
+            }
+            (h, m, sec)
+        }
+        None => {
+            if !digits(first) || second.len() != 2 {
+                return None;
+            }
+            let m: u64 = first.parse().ok()?;
+            let sec: u64 = second.parse().ok()?;
+            if sec >= 60 {
+                return None;
+            }
+            (0, m, sec)
+        }
+    };
+    h.checked_mul(3_600_000)?
+        .checked_add(m.checked_mul(60_000)?)?
+        .checked_add(sec.checked_mul(1_000)?)?
+        .checked_add(ms)
+}
+
+fn format_vtt_timestamp_ms(total_ms: u64) -> String {
+    let hours = total_ms / 3_600_000;
+    let mins = (total_ms / 60_000) % 60;
+    let secs = (total_ms / 1_000) % 60;
+    let ms = total_ms % 1_000;
+    if hours > 0 {
+        format!("{hours:02}:{mins:02}:{secs:02}.{ms:03}")
+    } else {
+        format!("{mins:02}:{secs:02}.{ms:03}")
+    }
+}
+
+/// Parses a WebVTT cue timing line (`start --> end [settings]`), normalizing
+/// timestamps to dot-decimal `MM:SS.mmm` / `HH:MM:SS.mmm` and clamping
+/// inverted ranges (`end < start`).
+fn parse_vtt_timing_line(line: &str) -> Option<(String, f64, f64)> {
+    let (left, right) = line.split_once("-->")?;
+    let start_ms = parse_vtt_timestamp_ms(left.trim())?;
+    let right = right.trim_start();
+    let end_len = right
+        .find(|c: char| c.is_ascii_whitespace())
+        .unwrap_or(right.len());
+    let (end_token, settings) = right.split_at(end_len);
+    let end_ms = parse_vtt_timestamp_ms(end_token)?.max(start_ms);
+    let timing = format!(
+        "{} --> {}{settings}",
+        format_vtt_timestamp_ms(start_ms),
+        format_vtt_timestamp_ms(end_ms)
+    );
+    Some((timing, start_ms as f64 / 1000.0, end_ms as f64 / 1000.0))
+}
+
+/// Repairs WebVTT subtitles so FFmpeg's `webvtt` demuxer (used by libmpv) does
+/// not silently truncate mid-episode.
+///
+/// Upstream ASS→VTT converters frequently emit blank lines inside multi-line
+/// signs/titles (e.g. `18:09.650 --> 18:12.610\n<b>Edible\n\nReadings</b>`).
+/// Web browsers skip non-cue blocks per the WebVTT spec, but FFmpeg's
+/// `webvtt_read_header` treats any non-header block lacking a timestamp as EOF
+/// and silently drops every remaining cue in the episode. Reattaching orphan
+/// blocks to the preceding cue restores both the multi-line sign and the rest
+/// of the file.
+pub(crate) fn sanitize_webvtt(raw: &str) -> SanitizedVtt {
+    let normalized = raw
+        .strip_prefix('\u{feff}')
+        .unwrap_or(raw)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    let mut cur: Vec<&str> = Vec::new();
+    for line in normalized.split('\n') {
+        if line.trim().is_empty() {
+            if !cur.is_empty() {
+                blocks.push(std::mem::take(&mut cur));
+            }
+        } else {
+            cur.push(line);
+        }
+    }
+    if !cur.is_empty() {
+        blocks.push(cur);
+    }
+
+    let (header, body_start) = match blocks.first() {
+        Some(first) if first[0].trim_start().starts_with("WEBVTT") => (
+            first.iter().map(|l| (*l).to_string()).collect::<Vec<_>>(),
+            1,
+        ),
+        _ => (vec!["WEBVTT".to_string()], 0),
+    };
+
+    enum Entry {
+        Meta(Vec<String>),
+        Cue {
+            id: Option<String>,
+            timing: String,
+            end_secs: f64,
+            lines: Vec<String>,
+        },
+    }
+
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut last_cue: Option<usize> = None;
+    let mut repaired_orphans = 0usize;
+
+    for block in &blocks[body_start..] {
+        let first = block[0].trim();
+        if first == "STYLE" || first == "REGION" {
+            entries.push(Entry::Meta(
+                block.iter().map(|l| (*l).to_string()).collect(),
+            ));
+            last_cue = None;
+            continue;
+        }
+        if first == "NOTE" || first.starts_with("NOTE ") || first.starts_with("NOTE\t") {
+            last_cue = None;
+            continue;
+        }
+
+        let first_timing = block
+            .iter()
+            .position(|l| parse_vtt_timing_line(l).is_some());
+        let Some(pos) = first_timing else {
+            // Orphan block with no timestamp: continuation lines separated by a
+            // stray blank line inside the previous cue.
+            if let Some(idx) = last_cue
+                && let Entry::Cue { lines, .. } = &mut entries[idx]
+            {
+                lines.extend(block.iter().map(|l| (*l).to_string()));
+                repaired_orphans += 1;
+            }
+            continue;
+        };
+
+        let mut first_id = if pos == 1 {
+            Some(block[0].to_string())
+        } else {
+            if pos >= 2
+                && let Some(idx) = last_cue
+                && let Entry::Cue { lines, .. } = &mut entries[idx]
+            {
+                lines.extend(block[..pos].iter().map(|l| (*l).to_string()));
+                repaired_orphans += 1;
+            }
+            None
+        };
+
+        for (offset, line) in block[pos..].iter().enumerate() {
+            if let Some((timing, _start, end_secs)) = parse_vtt_timing_line(line) {
+                entries.push(Entry::Cue {
+                    id: if offset == 0 { first_id.take() } else { None },
+                    timing,
+                    end_secs,
+                    lines: Vec::new(),
+                });
+                last_cue = Some(entries.len() - 1);
+            } else if let Some(idx) = last_cue
+                && let Entry::Cue { lines, .. } = &mut entries[idx]
+            {
+                lines.push((*line).to_string());
+            }
+        }
+    }
+
+    let mut out_blocks: Vec<String> = Vec::with_capacity(entries.len() + 1);
+    out_blocks.push(header.join("\n"));
+    let mut cue_count = 0usize;
+    let mut thumb_cues = 0usize;
+    let mut last_end_secs = 0.0f64;
+
+    for entry in entries {
+        match entry {
+            Entry::Meta(lines) => out_blocks.push(lines.join("\n")),
+            Entry::Cue {
+                id,
+                timing,
+                end_secs,
+                lines,
+            } => {
+                if !lines.iter().any(|l| !l.trim().is_empty()) {
+                    continue;
+                }
+                cue_count += 1;
+                if end_secs > last_end_secs {
+                    last_end_secs = end_secs;
+                }
+                if lines.iter().all(|l| l.contains("#xywh=")) {
+                    thumb_cues += 1;
+                }
+                let mut parts = Vec::with_capacity(lines.len() + 2);
+                if let Some(id) = id {
+                    parts.push(id);
+                }
+                parts.push(timing);
+                parts.extend(lines);
+                out_blocks.push(parts.join("\n"));
+            }
+        }
+    }
+
+    let is_thumbnail = cue_count > 0 && thumb_cues * 5 >= cue_count * 4;
+    let mut content = out_blocks.join("\n\n");
+    content.push('\n');
+    SanitizedVtt {
+        content,
+        cue_count,
+        last_end_secs,
+        is_thumbnail,
+        repaired_orphans,
+    }
+}
+
+/// Counts `Dialogue:` events and finds the latest end timestamp in ASS/SSA.
+fn ass_stats(text: &str) -> (usize, f64) {
+    let mut count = 0usize;
+    let mut last_end = 0.0f64;
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("Dialogue:") else {
+            continue;
+        };
+        count += 1;
+        if let Some(end_str) = rest.split(',').nth(2)
+            && let Some(ms) = parse_vtt_timestamp_ms(end_str.trim())
+        {
+            last_end = last_end.max(ms as f64 / 1000.0);
+        }
+    }
+    (count, last_end)
+}
+
+fn looks_like_html(trimmed: &str) -> bool {
+    let head = trimmed.get(..16).unwrap_or(trimmed).to_ascii_lowercase();
+    head.starts_with("<!doctype") || head.starts_with("<html")
+}
+
+fn url_extension(url: &str) -> &str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.rsplit('/')
+        .next()
+        .and_then(|name| name.rsplit_once('.'))
+        .map_or("", |(_, ext)| ext)
+}
+
+struct PreparedSub {
+    url: String,
+    bytes: Vec<u8>,
+    ext: &'static str,
+    lang: LangTier,
+    url_rank: i32,
+    cue_count: usize,
+    last_end_secs: f64,
+}
+
+impl PreparedSub {
+    fn score(&self) -> (LangTier, bool, u32, usize, i32) {
+        // Substantive tracks (>=20 cues) beat sparse signs-only tracks; bucket
+        // last cue time to whole minutes so full-episode tracks beat truncated
+        // ones while ties break by cue count and URL heuristics.
+        let substantive = self.cue_count >= 20;
+        let last_min = (self.last_end_secs / 60.0).max(0.0) as u32;
+        (
+            self.lang,
+            substantive,
+            last_min,
+            self.cue_count,
+            self.url_rank,
+        )
+    }
+}
+
+/// Downloads (or reads, for local paths) a subtitle candidate, enforcing a size
+/// cap and passing `referrer` on HTTP requests.
+fn fetch_subtitle_bytes(source: &str, referrer: Option<&str>) -> Option<Vec<u8>> {
+    if source.starts_with("http://") || source.starts_with("https://") {
+        let mut req = SUBTITLE_AGENT.get(source);
+        if let Some(r) = referrer
+            && !r.is_empty()
+            && r.bytes().all(|b| (0x20..=0x7e).contains(&b))
+        {
+            req = req.header("Referer", r);
+        }
+        return req
+            .call()
+            .ok()?
+            .body_mut()
+            .with_config()
+            .limit(MAX_SUBTITLE_BYTES)
+            .read_to_vec()
+            .ok();
+    }
+    let path = Path::new(source);
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_SUBTITLE_BYTES {
+        return None;
+    }
+    fs::read(path).ok()
+}
+
+fn inspect_subtitle(source: &str, raw: Vec<u8>) -> Option<PreparedSub> {
+    let text = String::from_utf8_lossy(&raw);
+    let trimmed = text.strip_prefix('\u{feff}').unwrap_or(&text).trim_start();
+    if trimmed.is_empty() || looks_like_html(trimmed) {
+        return None;
+    }
+    let (lang, _, _) = sub_url_meta(source);
+    let url_rank = sub_url_rank(source);
+    let ext_hint = url_extension(source).to_ascii_lowercase();
+
+    if trimmed
+        .get(..13)
+        .is_some_and(|h| h.eq_ignore_ascii_case("[script info]"))
+    {
+        let (cue_count, last_end_secs) = ass_stats(trimmed);
+        if cue_count == 0 {
+            return None;
+        }
+        return Some(PreparedSub {
+            url: source.to_string(),
+            bytes: raw,
+            ext: "ass",
+            lang,
+            url_rank,
+            cue_count,
+            last_end_secs,
+        });
+    }
+
+    if trimmed.starts_with("WEBVTT") || (ext_hint == "vtt" && trimmed.contains("-->")) {
+        let sanitized = sanitize_webvtt(&text);
+        if sanitized.is_thumbnail || sanitized.cue_count == 0 {
+            return None;
+        }
+        return Some(PreparedSub {
+            url: source.to_string(),
+            bytes: sanitized.content.into_bytes(),
+            ext: "vtt",
+            lang,
+            url_rank,
+            cue_count: sanitized.cue_count,
+            last_end_secs: sanitized.last_end_secs,
+        });
+    }
+
+    if ext_hint == "srt" && trimmed.contains("-->") {
+        let stats = sanitize_webvtt(&text);
+        if stats.is_thumbnail || stats.cue_count == 0 {
+            return None;
+        }
+        return Some(PreparedSub {
+            url: source.to_string(),
+            bytes: raw,
+            ext: "srt",
+            lang,
+            url_rank,
+            cue_count: stats.cue_count,
+            last_end_secs: stats.last_end_secs,
+        });
+    }
+
+    None
+}
+
+/// Writes a sanitized subtitle into `<cache_dir>/subs/sub-<hash>.<ext>` and
+/// prunes older entries beyond [`MAX_CACHED_SUBS`].
+fn cache_subtitle(shims: &Path, sub: &PreparedSub) -> io::Result<PathBuf> {
+    let dir = shims.parent().unwrap_or(shims).join(SUBS_DIR);
+    fs::create_dir_all(&dir)?;
+    let digest = Sha256::digest(sub.url.as_bytes());
+    let mut hex = String::with_capacity(16);
+    for b in &digest[..8] {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    let name = format!("sub-{hex}.{}", sub.ext);
+    let path = dir.join(&name);
+    let tmp = temp_name(&dir, &name);
+    fs::write(&tmp, &sub.bytes)?;
+    replace(&tmp, &path)?;
+    prune_cached_subs(&dir, &path);
+    Ok(path)
+}
+
+fn prune_cached_subs(dir: &Path, keep: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(SystemTime, PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p != keep
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("sub-"))
+        })
+        .map(|p| {
+            let mtime = fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            (mtime, p)
+        })
+        .collect();
+    if files.len() < MAX_CACHED_SUBS {
+        return;
+    }
+    files.sort_by_key(|(mtime, _)| *mtime);
+    let excess = files.len() + 1 - MAX_CACHED_SUBS;
+    for (_, path) in files.into_iter().take(excess) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Fetches, repairs (for WebVTT) and selects the best subtitle among
+/// `sub_files`, caching it beside `shims` so mpv loads a clean local file.
+/// Falls back to `stream.sub_file`'s original URL on network/IO failure.
+fn prepare_subtitles(
+    stream: &mut Stream,
+    sub_files: &[String],
+    shims: &Path,
+    owner: Option<&ResolveHandle>,
+) {
+    if sub_files.is_empty() {
+        return;
+    }
+    let cancelled = || owner.is_some_and(|o| lock(&o.owner).cancelled);
+    if cancelled() {
+        return;
+    }
+
+    let mut ordered: Vec<&String> = sub_files.iter().collect();
+    ordered.sort_by_key(|a| std::cmp::Reverse(sub_url_rank(a)));
+
+    let mut candidates: Vec<&String> = ordered
+        .iter()
+        .copied()
+        .filter(|u| !sub_url_meta(u).2)
+        .take(MAX_SUB_CANDIDATES)
+        .collect();
+    if candidates.is_empty()
+        && let Some(first) = ordered.first()
+    {
+        candidates.push(first);
+    }
+
+    let mut best: Option<PreparedSub> = None;
+    for source in candidates {
+        if cancelled() {
+            return;
+        }
+        let Some(bytes) = fetch_subtitle_bytes(source, stream.referrer.as_deref()) else {
+            continue;
+        };
+        let Some(prepared) = inspect_subtitle(source, bytes) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|b| prepared.score() > b.score()) {
+            best = Some(prepared);
+        }
+    }
+
+    if let Some(chosen) = best
+        && let Ok(path) = cache_subtitle(shims, &chosen)
+    {
+        stream.sub_file = Some(path.to_string_lossy().into_owned());
+    }
 }
 
 /// Whoever asked for resolves (a page or the player). Dropping it, or
@@ -352,7 +1040,7 @@ pub fn resolve(
 /// [`resolve`] with a given ani-cli and extra environment. When the search
 /// finds nothing, it is retried once with the last (romaji) title, unless
 /// the request already searches for it or picks a result by index.
-fn resolve_with(
+pub(crate) fn resolve_with(
     program: &Path,
     req: &EpisodeRequest,
     shims: &Path,
@@ -416,8 +1104,8 @@ fn resolve_once(
         }
         return Err(err);
     }
-    let stream =
-        parse_capture(&out.stdout).map_err(|err| anyhow!("{err}: {}", error_detail(&output)))?;
+    let (mut stream, sub_files) = parse_capture_with_subs(&out.stdout)
+        .map_err(|err| anyhow!("{err}: {}", error_detail(&output)))?;
     // A lone search result is played without asking the menu, so check it.
     if req.select_index.is_none()
         && let Some(found) = stream.title.as_deref().map(|t| show_title(t, &req.ep))
@@ -433,6 +1121,7 @@ fn resolve_once(
             ])));
         }
     }
+    prepare_subtitles(&mut stream, &sub_files, shims, owner);
     Ok(Attempt::Done(ResolveOutcome::Stream(stream)))
 }
 
@@ -1424,6 +2113,260 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0].ep, "1");
         assert_eq!(entries[0].title, "Frieren: Beyond Journey's End");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_capture_prefers_english_full_over_multiple_sub_files() {
+        let out = "\
+            --referrer=https://zokoanime.video/\n\
+            --sub-file=https://cdn.example/subs/spanish.vtt\n\
+            --sub-file=https://cdn.example/subs/eng-signs.vtt\n\
+            --sub-file=https://cdn.example/subs/eng-2.vtt\n\
+            --sub-file=https://cdn.example/subs/thumbnails.vtt\n\
+            https://cdn.example/master.m3u8\n";
+        let (stream, subs) = parse_capture_with_subs(out).unwrap();
+        assert_eq!(subs.len(), 4);
+        assert_eq!(
+            stream.sub_file.as_deref(),
+            Some("https://cdn.example/subs/eng-2.vtt")
+        );
+
+        // Filename language wins over an `/en/` directory prefix.
+        let path_trap = "\
+            --sub-file=https://cdn.example/en/subs/spanish.vtt\n\
+            --sub-file=https://cdn.example/en/subs/english.vtt\n\
+            --sub-file=https://cdn.example/en/subs/spanish.vtt\n\
+            https://cdn.example/master.m3u8\n";
+        let (stream, subs) = parse_capture_with_subs(path_trap).unwrap();
+        assert_eq!(subs.len(), 2, "duplicate sub URLs are deduplicated");
+        assert_eq!(
+            stream.sub_file.as_deref(),
+            Some("https://cdn.example/en/subs/english.vtt")
+        );
+
+        // Opaque hashes preserve order rather than picking the last one.
+        let opaque = "\
+            --sub-file=https://cdn.example/subs/aaa111.vtt\n\
+            --sub-file=https://cdn.example/subs/bbb222.vtt\n\
+            https://cdn.example/master.m3u8\n";
+        assert_eq!(
+            parse_capture(opaque).unwrap().sub_file.as_deref(),
+            Some("https://cdn.example/subs/aaa111.vtt")
+        );
+    }
+
+    #[test]
+    fn sanitize_webvtt_repairs_blank_lines_inside_cues() {
+        // Makeine ep 9 pattern: blank line inside a multi-line bold sign that
+        // makes FFmpeg's webvtt demuxer stop parsing at 18:09.
+        let ep9_like = "\u{feff}WEBVTT\r\n\r\n\
+            16:41.400 --> 16:44.860\r\n\
+            Before sign\r\n\r\n\
+            18:09.650 --> 18:12.610\r\n\
+            <b>Edible\r\n\r\n\
+            Readings</b>\r\n\r\n\
+            18:20.750 --> 18:22.370\r\n\
+            Yup. Perfect.\r\n\r\n\
+            22:26.280 --> 22:30.030\r\n\
+            Episode 9\r\n";
+        let fixed = sanitize_webvtt(ep9_like);
+        assert_eq!(fixed.cue_count, 4);
+        assert_eq!(fixed.repaired_orphans, 1);
+        assert!((fixed.last_end_secs - 1350.03).abs() < 0.01);
+        assert!(!fixed.is_thumbnail);
+        assert!(
+            fixed
+                .content
+                .contains("18:09.650 --> 18:12.610\n<b>Edible\nReadings</b>\n\n18:20.750"),
+            "{}",
+            fixed.content
+        );
+
+        // Makeine ep 12 pattern: two consecutive orphan paragraphs inside one cue.
+        let ep12_like = "WEBVTT\n\n\
+            10:52.960 --> 11:00.470\n<b>Ediacaran Fauna\n\n\
+            Paragraph two.\n\n\
+            Paragraph three.</b>\n\n\
+            11:05.000 --> 11:08.000\nDialogue resumes.\n";
+        let fixed = sanitize_webvtt(ep12_like);
+        assert_eq!(fixed.cue_count, 2);
+        assert_eq!(fixed.repaired_orphans, 2);
+        assert!(
+            fixed
+                .content
+                .contains("<b>Ediacaran Fauna\nParagraph two.\nParagraph three.</b>"),
+            "{}",
+            fixed.content
+        );
+    }
+
+    #[test]
+    fn sanitize_webvtt_handles_edge_cases_and_thumbnails() {
+        let messy = "WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n\n\
+            STYLE\n::cue { color: white; }\n\n\
+            NOTE ignored comment\n\n\
+            stray preamble\n\n\
+            1\n00:01,5 --> 00:02,55 align:center\nComma decimals\n\n\
+            00:03.000 --> 00:04.000\n\n\
+            After blank line\n\n\
+            00:05.000 --> 00:06.000\n\n\
+            65:10.000 --> 65:09.000\nInverted clamped\n\
+            65:12.000 --> 65:15.000\nMissing blank between cues\n";
+        let fixed = sanitize_webvtt(messy);
+        assert_eq!(fixed.cue_count, 4);
+        assert!((fixed.last_end_secs - 3915.0).abs() < 0.01);
+        assert!(fixed.content.contains("X-TIMESTAMP-MAP=MPEGTS:900000"));
+        assert!(fixed.content.contains("STYLE\n::cue { color: white; }"));
+        assert!(!fixed.content.contains("ignored comment"));
+        assert!(!fixed.content.contains("stray preamble"));
+        assert!(
+            fixed
+                .content
+                .contains("1\n00:01.500 --> 00:02.550 align:center\nComma decimals")
+        );
+        assert!(
+            fixed
+                .content
+                .contains("00:03.000 --> 00:04.000\nAfter blank line")
+        );
+        assert!(
+            !fixed.content.contains("00:05.000 --> 00:06.000"),
+            "empty cue dropped"
+        );
+        assert!(
+            fixed
+                .content
+                .contains("01:05:10.000 --> 01:05:10.000\nInverted clamped")
+        );
+        assert!(
+            fixed
+                .content
+                .contains("01:05:12.000 --> 01:05:15.000\nMissing blank between cues")
+        );
+
+        let sprites = "WEBVTT\n\n\
+            00:00.000 --> 00:05.000\nsprite.jpg#xywh=0,0,160,90\n\n\
+            00:05.000 --> 00:10.000\nsprite.jpg#xywh=160,0,160,90\n";
+        assert!(sanitize_webvtt(sprites).is_thumbnail);
+    }
+
+    #[test]
+    fn resolve_fetches_repairs_and_selects_most_complete_subtitle() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let dir = temp_dir("sub-prepare");
+        let shims = ensure_shims(&dir.join("cache"), &std::env::current_exe().unwrap()).unwrap();
+
+        let mut full_vtt = String::from("WEBVTT\n\n");
+        for i in 0..22 {
+            let m = i;
+            full_vtt.push_str(&format!(
+                "{m:02}:10.000 --> {m:02}:12.000\nDialogue line {i}\n\n"
+            ));
+        }
+        full_vtt.push_str(
+            "18:09.650 --> 18:12.610\n<b>Edible\n\nReadings</b>\n\n\
+             22:26.280 --> 22:30.030\nFinal cue\n",
+        );
+        let short_vtt = "WEBVTT\n\n00:05.000 --> 00:08.000\nSign 1\n\n\
+            01:00.000 --> 01:03.000\nSign 2\n";
+        let thumb_vtt = "WEBVTT\n\n00:00.000 --> 00:05.000\nsprite.jpg#xywh=0,0,160,90\n";
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen_referers: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen_referers);
+        let full_body = full_vtt.clone();
+        let server = thread::spawn(move || {
+            for _ in 0..3 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    break;
+                };
+                let mut reader = BufReader::new(sock.try_clone().unwrap());
+                let mut req_line = String::new();
+                let _ = reader.read_line(&mut req_line);
+                let path = req_line.split_whitespace().nth(1).unwrap_or("");
+                loop {
+                    let mut hdr = String::new();
+                    if reader.read_line(&mut hdr).unwrap_or(0) == 0 || hdr == "\r\n" || hdr == "\n"
+                    {
+                        break;
+                    }
+                    if let Some((k, v)) = hdr.split_once(':')
+                        && k.eq_ignore_ascii_case("referer")
+                    {
+                        lock(&seen_clone).push(v.trim().to_string());
+                    }
+                }
+                let body = match path {
+                    "/subs/short.vtt" => short_vtt,
+                    "/subs/full.vtt" => full_body.as_str(),
+                    "/subs/opaque1.vtt" => thumb_vtt,
+                    _ => "<!DOCTYPE html><html>not found</html>",
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/vtt\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes());
+            }
+        });
+
+        let fake = script(
+            &dir.join("bin/ani-cli"),
+            &format!(
+                r#"$ANI_CLI_PLAYER \
+  --referrer="https://zokoanime.video/" \
+  --sub-file="http://{addr}/subs/short.vtt" \
+  --sub-file="http://{addr}/subs/opaque1.vtt" \
+  --sub-file="http://{addr}/subs/full.vtt" \
+  --force-media-title="Frieren: Beyond Journey's End Episode 1" \
+  "https://hls.dramahot.top/p/test/master.m3u8""#
+            ),
+        );
+        let req = build_request(&frieren(), None, "1", Mode::Sub, "best");
+        let ResolveOutcome::Stream(stream) =
+            resolve_with(&fake, &req, &shims, &[], Duration::from_secs(10), None).unwrap()
+        else {
+            panic!("expected Stream");
+        };
+        let _ = server.join();
+
+        let sub_path = PathBuf::from(stream.sub_file.as_deref().expect("cached sub_file"));
+        assert!(sub_path.starts_with(dir.join("cache").join("subs")));
+        let saved = fs::read_to_string(&sub_path).unwrap();
+        assert!(saved.contains("<b>Edible\nReadings</b>"), "{saved}");
+        assert!(saved.contains("22:26.280 --> 22:30.030\nFinal cue"));
+        assert!(
+            lock(&seen_referers)
+                .iter()
+                .all(|r| r == "https://zokoanime.video/")
+                && !lock(&seen_referers).is_empty(),
+            "Referer header must be sent on subtitle requests: {:?}",
+            *lock(&seen_referers)
+        );
+
+        // Unreachable subtitle URL falls back to the original URL instead of failing.
+        let offline = script(
+            &dir.join("bin/ani-cli-offline"),
+            r#"$ANI_CLI_PLAYER \
+  --referrer="https://zokoanime.video/" \
+  --sub-file="http://127.0.0.1:1/unreachable.vtt" \
+  --force-media-title="Frieren: Beyond Journey's End Episode 1" \
+  "https://hls.dramahot.top/p/test/master.m3u8""#,
+        );
+        let ResolveOutcome::Stream(fallback) =
+            resolve_with(&offline, &req, &shims, &[], Duration::from_secs(10), None).unwrap()
+        else {
+            panic!("expected Stream");
+        };
+        assert_eq!(
+            fallback.sub_file.as_deref(),
+            Some("http://127.0.0.1:1/unreachable.vtt")
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }
