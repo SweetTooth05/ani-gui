@@ -257,10 +257,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --title "ani-gui $VERSION" \
-            --generate-notes \
-            dist/*.tar.gz dist/*.deb dist/*.AppImage dist/*.dmg \
-            dist/SHA256SUMS dist/SHA256SUMS.sig
+          files=(dist/*.tar.gz dist/*.deb dist/*.AppImage dist/*.dmg
+            dist/SHA256SUMS dist/SHA256SUMS.sig)
+          # A release made by hand on GitHub for this tag gets the files
+          # attached rather than failing the run.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${files[@]}"
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "ani-gui $VERSION" \
+              --generate-notes \
+              "${files[@]}"
+          fi
