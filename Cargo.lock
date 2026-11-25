@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "ani-gui"
-version = "1.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "core-foundation 0.10.0",
