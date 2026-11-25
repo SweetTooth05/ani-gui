@@ -17,6 +17,8 @@ const CACHE_KEY_PREFIX: &str = "aniskip:v1";
 /// Skip times rarely change once submitted; cache for a week.
 const CACHE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+/// A real answer is a few hundred bytes; anything near this is not AniSkip.
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 const USER_AGENT: &str = "ani-gui/1.0";
 
 /// How long a floating Skip Intro / Next Episode button stays up while the
@@ -204,41 +206,29 @@ pub fn aniskip_episode(ep: &str) -> Option<u32> {
     trimmed.parse::<u32>().ok().filter(|&n| n > 0)
 }
 
-/// Fetches AniSkip entries for `(mal_id, ep)` at this stream's `duration`,
-/// cached in `api_cache`. Empty on 404, non-integer episodes, an unknown
-/// duration, or network errors with nothing cached. Call off the UI thread.
-pub fn fetch_aniskip(db: &Mutex<Db>, mal_id: i64, ep: &str, duration: f64) -> Vec<AniSkipEntry> {
-    let Some(key) = cache_key(mal_id, ep, duration) else {
+/// Fetches AniSkip entries for `(mal_id, ep)`, cached in `api_cache`. Empty
+/// on 404, non-integer episodes, or network errors with nothing cached. Call
+/// off the UI thread.
+///
+/// Asks with `episodeLength=0`: given a length, AniSkip returns only times
+/// submitted for (nearly) exactly that length, and providers' cuts of an
+/// episode differ by tens of seconds. [`resolve`] picks the entry closest to
+/// the stream's real duration locally, so the request needn't wait for mpv
+/// to report it and one cache entry serves every provider.
+pub fn fetch_aniskip(db: &Mutex<Db>, mal_id: i64, ep: &str) -> Vec<AniSkipEntry> {
+    let Some(ep_num) = aniskip_episode(ep).filter(|_| mal_id > 0) else {
         return Vec::new();
     };
-    let (ep_num, secs) = (key.1, key.2);
-    catalog::fetch_cached(db, &key.0, CACHE_TTL_SECS, || {
-        fetch_aniskip_http(mal_id, ep_num, secs)
+    let key = format!("{CACHE_KEY_PREFIX}:{mal_id}:{ep_num}");
+    catalog::fetch_cached(db, &key, CACHE_TTL_SECS, || {
+        fetch_aniskip_http(mal_id, ep_num)
     })
     .unwrap_or_default()
 }
 
-/// The `api_cache` key, episode number and whole-second length for one
-/// lookup. AniSkip only returns times submitted for an episode length close
-/// to the one asked for (other cuts of an episode shift every timestamp), so
-/// the length is part of the key: replays of the same stream hit, a
-/// different provider's cut asks again.
-fn cache_key(mal_id: i64, ep: &str, duration: f64) -> Option<(String, u32, u32)> {
-    if mal_id <= 0 || !duration.is_finite() || duration < 1.0 || duration > 86_400.0 {
-        return None;
-    }
-    let ep_num = aniskip_episode(ep)?;
-    let secs = duration.round() as u32;
-    Some((
-        format!("{CACHE_KEY_PREFIX}:{mal_id}:{ep_num}:{secs}"),
-        ep_num,
-        secs,
-    ))
-}
-
-fn fetch_aniskip_http(mal_id: i64, ep_num: u32, secs: u32) -> Result<Vec<AniSkipEntry>> {
+fn fetch_aniskip_http(mal_id: i64, ep_num: u32) -> Result<Vec<AniSkipEntry>> {
     let url = format!(
-        "{ANISKIP_API}/{mal_id}/{ep_num}?types=op&types=ed&types=mixed-op&types=mixed-ed&episodeLength={secs}"
+        "{ANISKIP_API}/{mal_id}/{ep_num}?types=op&types=ed&types=mixed-op&types=mixed-ed&episodeLength=0"
     );
     let mut resp = AGENT
         .get(&url)
