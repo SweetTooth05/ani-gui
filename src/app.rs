@@ -269,6 +269,7 @@ impl Root {
             downloads_changed,
         });
         crate::updater::init(cx);
+        crate::ui::downloads_page::watch_toasts(cx);
         crate::ui::accounts::start(cx);
         self.phase = Phase::Ready;
         self.navigate(Route::Home, cx);

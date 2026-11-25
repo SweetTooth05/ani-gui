@@ -23,10 +23,11 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use ed25519_dalek::{Signature, VerifyingKey};
+use futures::StreamExt;
 use gpui::{App, AppContext, Entity, Global};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -63,6 +64,10 @@ const CHECK_EVERY_SECS: i64 = 6 * 60 * 60;
 const STARTUP_DELAY: Duration = Duration::from_secs(5);
 /// How often a long-running app looks whether a check is due.
 const POLL_EVERY: Duration = Duration::from_secs(15 * 60);
+/// How long an error stays in the sidebar before falling back to the check entry.
+const ERROR_FALLBACK_AFTER: Duration = Duration::from_secs(6);
+/// Minimum interval between download progress notifications to the UI thread.
+const PROGRESS_EVERY: Duration = Duration::from_millis(80);
 
 const MAX_JSON: u64 = 1 << 20;
 const MAX_SUMS: u64 = 64 << 10;
@@ -351,8 +356,15 @@ fn get_small(agent: &ureq::Agent, url: &str, limit: u64) -> Result<Vec<u8>> {
         .with_context(|| format!("reading {url}"))
 }
 
-/// Streams `url` into `out` (at most `limit` bytes) and returns its SHA-256.
-fn download(agent: &ureq::Agent, url: &str, out: &mut File, limit: u64) -> Result<[u8; 32]> {
+/// Streams `url` into `out` (at most `limit` bytes), reporting cumulative bytes
+/// written, and returns its SHA-256.
+fn download_with_progress(
+    agent: &ureq::Agent,
+    url: &str,
+    out: &mut File,
+    limit: u64,
+    mut on_bytes: impl FnMut(u64),
+) -> Result<[u8; 32]> {
     let mut response = agent
         .get(url)
         .call()
@@ -360,6 +372,8 @@ fn download(agent: &ureq::Agent, url: &str, out: &mut File, limit: u64) -> Resul
     let mut body = response.body_mut().with_config().limit(limit).reader();
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 64 << 10];
+    let mut written = 0u64;
+    let mut last_report = Instant::now();
     loop {
         let n = match body.read(&mut buf) {
             Ok(0) => break,
@@ -369,7 +383,13 @@ fn download(agent: &ureq::Agent, url: &str, out: &mut File, limit: u64) -> Resul
         };
         hasher.update(&buf[..n]);
         out.write_all(&buf[..n]).context("saving the download")?;
+        written += n as u64;
+        if last_report.elapsed() >= PROGRESS_EVERY {
+            on_bytes(written);
+            last_report = Instant::now();
+        }
     }
+    on_bytes(written);
     out.sync_all().context("saving the download")?;
     Ok(hasher.finalize().into())
 }
@@ -396,14 +416,33 @@ pub fn latest_newer(source: &Source, current: Version) -> Result<Option<Release>
     Ok(parse_release(&json)?.filter(|r| r.version > current))
 }
 
+/// Progress milestones reported while [`install_with_progress`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstallPhase {
+    Downloading { downloaded: u64, total: Option<u64> },
+    Installing,
+}
+
 /// Downloads `release` for `target`, verifies it against `keys`, and swaps
 /// it in at `dest`. Any failure leaves `dest` untouched.
+#[cfg(test)]
 fn install(
     source: &Source,
     release: &Release,
     target: &str,
     dest: &InstallTarget,
     keys: &[[u8; 32]],
+) -> Result<()> {
+    install_with_progress(source, release, target, dest, keys, |_| {})
+}
+
+fn install_with_progress(
+    source: &Source,
+    release: &Release,
+    target: &str,
+    dest: &InstallTarget,
+    keys: &[[u8; 32]],
+    mut on_phase: impl FnMut(InstallPhase),
 ) -> Result<()> {
     let picked = pick_assets(release, target, &source.download_prefix)?;
     ensure!(
@@ -412,6 +451,11 @@ fn install(
         picked.archive.name,
         picked.archive.size
     );
+    let total = (picked.archive.size > 0).then_some(picked.archive.size);
+    on_phase(InstallPhase::Downloading {
+        downloaded: 0,
+        total,
+    });
     let agent = agent(source.https_only);
     let sums = get_small(&agent, &picked.sums.url, MAX_SUMS)?;
     let sig = get_small(&agent, &picked.sig.url, MAX_SIG)?;
@@ -420,12 +464,21 @@ fn install(
     let expected = expected_hash(&sums, &picked.archive.name)?;
     let dir = dest.dir()?;
     let mut archive = TempFile::new(dir, "download")?;
-    let actual = download(&agent, &picked.archive.url, &mut archive.file, MAX_ARCHIVE)?;
+    let actual = download_with_progress(
+        &agent,
+        &picked.archive.url,
+        &mut archive.file,
+        MAX_ARCHIVE,
+        |downloaded| {
+            on_phase(InstallPhase::Downloading { downloaded, total });
+        },
+    )?;
     ensure!(
         actual == expected,
         "{} doesn't match its signed checksum",
         picked.archive.name
     );
+    on_phase(InstallPhase::Installing);
     archive.file.seek(SeekFrom::Start(0))?;
     match dest {
         InstallTarget::Binary(exe) => {
@@ -850,6 +903,18 @@ impl NotEligible {
             }
         }
     }
+
+    /// Brief phrase for tight spaces like the sidebar footer.
+    pub fn short_reason(self) -> &'static str {
+        match self {
+            NotEligible::UnknownPath => "Install path unknown",
+            NotEligible::DevBuild => "Dev build",
+            NotEligible::Root => "Running as root",
+            NotEligible::NotOwned => "Owned by another user",
+            NotEligible::NotWritable => "Read-only install",
+            NotEligible::NotInBundle => "Not in ani-gui.app",
+        }
+    }
 }
 
 /// What ani-gui may replace when it runs as `exe`: a release build outside
@@ -992,7 +1057,7 @@ pub fn ago(then: i64, now: i64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// App glue: one `Updates` model the Settings page watches.
+// App glue: one `Updates` model shared by the sidebar and Settings → Updates.
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
@@ -1002,6 +1067,13 @@ pub enum Status {
     /// Newer and not installed: notify-only installs, or automatic installs
     /// turned off.
     Available(Release),
+    /// Downloading the signed release archive.
+    Downloading {
+        version: Version,
+        downloaded: u64,
+        total: Option<u64>,
+    },
+    /// Verifying and swapping the binary/bundle into place.
     Installing(Version),
     /// Swapped in; it runs after a restart.
     Installed(Version),
@@ -1016,11 +1088,272 @@ pub struct Updates {
     pub saved: Saved,
     /// Where this install can update itself, or why it can't.
     pub install_path: Result<InstallTarget, NotEligible>,
+    /// True briefly after a failure so the sidebar shows the error before
+    /// falling back to the quiet check entry.
+    pub error_transient: bool,
+    error_gen: u64,
 }
 
 impl Updates {
     pub fn busy(&self) -> bool {
-        matches!(self.status, Status::Checking | Status::Installing(_))
+        matches!(
+            self.status,
+            Status::Checking | Status::Downloading { .. } | Status::Installing(_)
+        )
+    }
+}
+
+/// An action the updater UI (sidebar or Settings → Updates) can run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UpdateAction {
+    Check,
+    Install,
+    Restart,
+    OpenRelease { url: String, reason: NotEligible },
+}
+
+/// Visual tone for the sidebar's bottom update control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarTone {
+    Quiet,
+    Busy,
+    Ready,
+    Accent,
+    Error,
+}
+
+/// Everything the sidebar needs to render its bottom update control.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SidebarState {
+    pub tone: SidebarTone,
+    pub label: String,
+    pub detail: Option<String>,
+    /// 0.0..=1.0 while downloading a release with a known size.
+    pub progress: Option<f32>,
+    pub action: Option<UpdateAction>,
+}
+
+/// Everything Settings → Updates needs for its status notice row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateNotice {
+    pub message: String,
+    pub error: bool,
+    pub busy: bool,
+    pub progress: Option<f32>,
+    pub release_url: Option<String>,
+    pub action: Option<(&'static str, UpdateAction)>,
+}
+
+fn download_fraction(downloaded: u64, total: Option<u64>) -> Option<f32> {
+    let total = total.filter(|&t| t > 0)?;
+    Some((downloaded as f64 / total as f64).clamp(0.0, 1.0) as f32)
+}
+
+/// Maps the shared `Updates` model to the sidebar's bottom control.
+pub fn sidebar_state(updates: &Updates) -> SidebarState {
+    sidebar_state_for(
+        &updates.status,
+        &updates.install_path,
+        updates.error_transient,
+        CURRENT,
+    )
+}
+
+fn sidebar_state_for(
+    status: &Status,
+    install_path: &Result<InstallTarget, NotEligible>,
+    error_transient: bool,
+    current: &str,
+) -> SidebarState {
+    let check_entry = || SidebarState {
+        tone: SidebarTone::Quiet,
+        label: format!("v{current} · Check for updates"),
+        detail: None,
+        progress: None,
+        action: Some(UpdateAction::Check),
+    };
+    match status {
+        Status::Idle | Status::UpToDate => check_entry(),
+        Status::Checking => SidebarState {
+            tone: SidebarTone::Busy,
+            label: "Checking for updates…".into(),
+            detail: None,
+            progress: None,
+            action: None,
+        },
+        Status::Downloading {
+            version,
+            downloaded,
+            total,
+        } => {
+            let progress = download_fraction(*downloaded, *total);
+            let label = match progress {
+                Some(p) => format!("Downloading v{version} · {:.0}%", p * 100.0),
+                None => format!("Downloading v{version}…"),
+            };
+            SidebarState {
+                tone: SidebarTone::Busy,
+                label,
+                detail: None,
+                progress,
+                action: None,
+            }
+        }
+        Status::Installing(version) => SidebarState {
+            tone: SidebarTone::Busy,
+            label: format!("Installing v{version}…"),
+            detail: None,
+            progress: None,
+            action: None,
+        },
+        Status::Available(release) => match install_path {
+            Ok(_) => SidebarState {
+                tone: SidebarTone::Ready,
+                label: format!("Install update v{}", release.version),
+                detail: None,
+                progress: None,
+                action: Some(UpdateAction::Install),
+            },
+            Err(reason) => SidebarState {
+                tone: SidebarTone::Ready,
+                label: format!("Update v{} available", release.version),
+                detail: Some(format!("{} · Open release", reason.short_reason())),
+                progress: None,
+                action: Some(UpdateAction::OpenRelease {
+                    url: release.page_url(),
+                    reason: *reason,
+                }),
+            },
+        },
+        Status::Installed(version) => SidebarState {
+            tone: SidebarTone::Accent,
+            label: "Restart to update".into(),
+            detail: Some(format!("v{version} ready")),
+            progress: None,
+            action: Some(UpdateAction::Restart),
+        },
+        Status::Failed { release, .. } if error_transient => {
+            let retry = match (release, install_path) {
+                (Some(_), Ok(_)) => UpdateAction::Install,
+                _ => UpdateAction::Check,
+            };
+            SidebarState {
+                tone: SidebarTone::Error,
+                label: "Update failed".into(),
+                detail: Some("Click to retry".into()),
+                progress: None,
+                action: Some(retry),
+            }
+        }
+        Status::Failed { .. } => check_entry(),
+    }
+}
+
+/// Maps the shared `Updates` model to the Settings → Updates status notice.
+pub fn update_notice(updates: &Updates) -> Option<UpdateNotice> {
+    update_notice_for(&updates.status, &updates.install_path)
+}
+
+fn update_notice_for(
+    status: &Status,
+    install_path: &Result<InstallTarget, NotEligible>,
+) -> Option<UpdateNotice> {
+    match status {
+        Status::Available(release) => match install_path {
+            Ok(_) => Some(UpdateNotice {
+                message: format!("ani-gui v{} is available.", release.version),
+                error: false,
+                busy: false,
+                progress: None,
+                release_url: Some(release.page_url()),
+                action: Some(("Install", UpdateAction::Install)),
+            }),
+            Err(reason) => Some(UpdateNotice {
+                message: format!(
+                    "ani-gui v{} is available. {}",
+                    release.version,
+                    reason.explain()
+                ),
+                error: false,
+                busy: false,
+                progress: None,
+                release_url: None,
+                action: Some((
+                    "Open release page",
+                    UpdateAction::OpenRelease {
+                        url: release.page_url(),
+                        reason: *reason,
+                    },
+                )),
+            }),
+        },
+        Status::Downloading {
+            version,
+            downloaded,
+            total,
+        } => {
+            let progress = download_fraction(*downloaded, *total);
+            let message = match progress {
+                Some(p) => format!("Downloading v{version} ({:.0}%)…", p * 100.0),
+                None => format!("Downloading v{version}…"),
+            };
+            Some(UpdateNotice {
+                message,
+                error: false,
+                busy: true,
+                progress,
+                release_url: None,
+                action: None,
+            })
+        }
+        Status::Installing(version) => Some(UpdateNotice {
+            message: format!("Installing v{version}…"),
+            error: false,
+            busy: true,
+            progress: None,
+            release_url: None,
+            action: None,
+        }),
+        Status::Installed(version) => Some(UpdateNotice {
+            message: format!("Updated to v{version} — restart to use it."),
+            error: false,
+            busy: false,
+            progress: None,
+            release_url: None,
+            action: Some(("Restart now", UpdateAction::Restart)),
+        }),
+        Status::Failed { error, release } => Some(UpdateNotice {
+            message: error.clone(),
+            error: true,
+            busy: false,
+            progress: None,
+            release_url: release.as_ref().map(Release::page_url),
+            action: match (release, install_path) {
+                (Some(_), Ok(_)) => Some(("Try again", UpdateAction::Install)),
+                (Some(r), Err(reason)) => Some((
+                    "Open release page",
+                    UpdateAction::OpenRelease {
+                        url: r.page_url(),
+                        reason: *reason,
+                    },
+                )),
+                (None, _) => Some(("Try again", UpdateAction::Check)),
+            },
+        }),
+        Status::Idle | Status::Checking | Status::UpToDate => None,
+    }
+}
+
+/// Runs an action chosen from the sidebar or Settings → Updates.
+pub fn perform(action: UpdateAction, cx: &mut App) {
+    match action {
+        UpdateAction::Check => check_now(cx),
+        UpdateAction::Install => install_now(cx),
+        UpdateAction::Restart => restart(cx),
+        UpdateAction::OpenRelease { url, reason } => {
+            toast::Toast::info(reason.explain()).key("updater").show(cx);
+            cx.open_url(&url);
+        }
     }
 }
 
@@ -1040,6 +1373,8 @@ pub fn init(cx: &mut App) {
         status: Status::Idle,
         saved: Saved::default(),
         install_path: Err(NotEligible::UnknownPath),
+        error_transient: false,
+        error_gen: 0,
     });
     cx.set_global(UpdatesHandle(updates.clone()));
     cx.spawn(async move |cx| {
@@ -1076,7 +1411,7 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
-/// The Settings page's "Check now".
+/// Runs an immediate update check (from the sidebar or Settings → Updates).
 pub fn check_now(cx: &mut App) {
     check(cx, true);
 }
@@ -1096,6 +1431,8 @@ fn check(cx: &mut App, manual: bool) {
     let installed = u.saved.installed.as_deref().and_then(Version::parse);
     updates.update(cx, |u, cx| {
         u.status = Status::Checking;
+        u.error_transient = false;
+        u.error_gen += 1;
         cx.notify();
     });
     cx.spawn(async move |cx| {
@@ -1124,8 +1461,8 @@ fn check(cx: &mut App, manual: bool) {
     .detach();
 }
 
-/// The Settings page's "Install", for an update found while automatic
-/// installs were off.
+/// Installs an available update (or opens the release page with an explanation
+/// when the install location cannot be replaced).
 pub fn install_now(cx: &mut App) {
     let Some(updates) = model(cx) else {
         return;
@@ -1139,11 +1476,17 @@ pub fn install_now(cx: &mut App) {
     else {
         return;
     };
-    let Ok(dest) = u.install_path.clone() else {
-        return;
-    };
     let release = release.clone();
-    start_install(cx, release, dest, true, false);
+    match u.install_path.clone() {
+        Ok(dest) => start_install(cx, release, dest, true, false),
+        Err(reason) => perform(
+            UpdateAction::OpenRelease {
+                url: release.page_url(),
+                reason,
+            },
+            cx,
+        ),
+    }
 }
 
 fn start_install(cx: &mut App, release: Release, dest: InstallTarget, manual: bool, checked: bool) {
@@ -1152,19 +1495,55 @@ fn start_install(cx: &mut App, release: Release, dest: InstallTarget, manual: bo
     };
     let version = release.version;
     updates.update(cx, |u, cx| {
-        u.status = Status::Installing(version);
+        u.status = Status::Downloading {
+            version,
+            downloaded: 0,
+            total: None,
+        };
+        u.error_transient = false;
+        u.error_gen += 1;
         cx.notify();
     });
+    let (phase_tx, mut phase_rx) = futures::channel::mpsc::unbounded::<InstallPhase>();
+    let progress_updates = updates.clone();
+    cx.spawn(async move |cx| {
+        while let Some(mut phase) = phase_rx.next().await {
+            while let Ok(newer) = phase_rx.try_recv() {
+                phase = newer;
+            }
+            let alive = progress_updates.update(cx, |u, cx| {
+                if !u.busy() {
+                    return;
+                }
+                u.status = match phase {
+                    InstallPhase::Downloading { downloaded, total } => Status::Downloading {
+                        version,
+                        downloaded,
+                        total,
+                    },
+                    InstallPhase::Installing => Status::Installing(version),
+                };
+                cx.notify();
+            });
+            if alive.is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
     cx.spawn(async move |cx| {
         let installed = {
             let release = release.clone();
             cx.background_spawn(async move {
-                install(
+                install_with_progress(
                     &Source::github(),
                     &release,
                     TARGET,
                     &dest,
                     RELEASE_PUBLIC_KEYS,
+                    |phase| {
+                        let _ = phase_tx.unbounded_send(phase);
+                    },
                 )
             })
             .await
@@ -1191,29 +1570,56 @@ fn finish(cx: &mut App, status: Status, manual: bool, checked: bool) {
         Status::Available(r) => format!("v{} available", r.version),
         Status::Installed(v) => format!("Updated to v{v}"),
         Status::Failed { error, .. } => format!("Failed: {error}"),
-        Status::Idle | Status::Checking | Status::Installing(_) => return,
+        Status::Idle | Status::Checking | Status::Downloading { .. } | Status::Installing(_) => {
+            return;
+        }
     };
     let previous = updates.read(cx).saved.result.clone();
+    let install_path = updates.read(cx).install_path.clone();
     match &status {
         Status::Installed(v) if previous.as_deref() != Some(result.as_str()) || manual => {
-            toast::info(cx, format!("Updated to v{v} — restart to use it"));
+            toast::Toast::success(format!("ani-gui v{v} installed — restart to use it"))
+                .key("updater")
+                .action("Restart", |_, cx| restart(cx))
+                .show(cx);
         }
         Status::Available(r) if manual || previous.as_deref() != Some(result.as_str()) => {
-            toast::info(
-                cx,
-                format!("ani-gui v{} is available — see Settings", r.version),
-            );
+            let mut t =
+                toast::Toast::info(format!("ani-gui v{} is available", r.version)).key("updater");
+            t = match install_path {
+                Ok(_) => t.action("Install", |_, cx| install_now(cx)),
+                Err(reason) => {
+                    let url = r.page_url();
+                    t.action("Release page", move |_, cx| {
+                        perform(
+                            UpdateAction::OpenRelease {
+                                url: url.clone(),
+                                reason,
+                            },
+                            cx,
+                        );
+                    })
+                }
+            };
+            t.show(cx);
         }
         Status::Failed { error, .. } => {
             eprintln!("ani-gui: update: {error}");
             if manual {
-                toast::error(cx, "Update failed — see Settings");
+                toast::Toast::error("Update failed — see Settings")
+                    .key("updater")
+                    .show(cx);
             }
         }
-        Status::UpToDate if manual => toast::info(cx, "ani-gui is up to date"),
+        Status::UpToDate if manual => {
+            toast::Toast::info("ani-gui is up to date")
+                .key("updater")
+                .show(cx);
+        }
         _ => {}
     }
-    let saved = updates.update(cx, |u, cx| {
+    let failed = matches!(status, Status::Failed { .. });
+    let (saved, error_gen) = updates.update(cx, |u, cx| {
         if checked {
             u.saved.last_check = Some(now());
         }
@@ -1222,9 +1628,26 @@ fn finish(cx: &mut App, status: Status, manual: bool, checked: bool) {
         }
         u.saved.result = Some(result);
         u.status = status;
+        u.error_transient = failed;
+        u.error_gen += 1;
         cx.notify();
-        u.saved.clone()
+        (u.saved.clone(), u.error_gen)
     });
+    if failed {
+        let updates = updates.clone();
+        cx.spawn(async move |cx| {
+            cx.background_executor().timer(ERROR_FALLBACK_AFTER).await;
+            updates
+                .update(cx, |u, cx| {
+                    if u.error_gen == error_gen && u.error_transient {
+                        u.error_transient = false;
+                        cx.notify();
+                    }
+                })
+                .ok();
+        })
+        .detach();
+    }
     cx.background_spawn(async move {
         if let Err(err) = store_saved(&state_path(), &saved) {
             eprintln!("ani-gui: update: saving state: {err:#}");
@@ -2384,5 +2807,199 @@ mod tests {
         assert_eq!(fs::read(&exe).unwrap(), MACHO);
         assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn sample_release(ver: &str) -> Release {
+        Release {
+            version: v(ver),
+            assets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sidebar_maps_idle_and_up_to_date_to_quiet_check_entry() {
+        let writable = Ok(InstallTarget::Binary(PathBuf::from("/opt/ani-gui")));
+        for status in [Status::Idle, Status::UpToDate] {
+            let s = sidebar_state_for(&status, &writable, false, "0.0.1");
+            assert_eq!(s.tone, SidebarTone::Quiet);
+            assert_eq!(s.label, "v0.0.1 · Check for updates");
+            assert_eq!(s.detail, None);
+            assert_eq!(s.progress, None);
+            assert_eq!(s.action, Some(UpdateAction::Check));
+        }
+    }
+
+    #[test]
+    fn sidebar_maps_busy_states_with_progress_and_no_action() {
+        let writable = Ok(InstallTarget::Binary(PathBuf::from("/opt/ani-gui")));
+
+        let checking = sidebar_state_for(&Status::Checking, &writable, false, "0.0.1");
+        assert_eq!(checking.tone, SidebarTone::Busy);
+        assert_eq!(checking.label, "Checking for updates…");
+        assert_eq!(checking.progress, None);
+        assert_eq!(checking.action, None);
+
+        let dl_known = sidebar_state_for(
+            &Status::Downloading {
+                version: v("0.2.0"),
+                downloaded: 50,
+                total: Some(200),
+            },
+            &writable,
+            false,
+            "0.0.1",
+        );
+        assert_eq!(dl_known.tone, SidebarTone::Busy);
+        assert_eq!(dl_known.label, "Downloading v0.2.0 · 25%");
+        assert_eq!(dl_known.progress, Some(0.25));
+        assert_eq!(dl_known.action, None);
+
+        let dl_unknown = sidebar_state_for(
+            &Status::Downloading {
+                version: v("0.2.0"),
+                downloaded: 1024,
+                total: None,
+            },
+            &writable,
+            false,
+            "0.0.1",
+        );
+        assert_eq!(dl_unknown.tone, SidebarTone::Busy);
+        assert_eq!(dl_unknown.label, "Downloading v0.2.0…");
+        assert_eq!(dl_unknown.progress, None);
+        assert_eq!(dl_unknown.action, None);
+
+        let installing =
+            sidebar_state_for(&Status::Installing(v("0.2.0")), &writable, false, "0.0.1");
+        assert_eq!(installing.tone, SidebarTone::Busy);
+        assert_eq!(installing.label, "Installing v0.2.0…");
+        assert_eq!(installing.action, None);
+    }
+
+    #[test]
+    fn sidebar_maps_available_writable_vs_non_writable() {
+        let rel = sample_release("0.2.0");
+        let writable = Ok(InstallTarget::Binary(PathBuf::from(
+            "/home/u/.local/bin/ani-gui",
+        )));
+
+        let ready = sidebar_state_for(&Status::Available(rel.clone()), &writable, false, "0.0.1");
+        assert_eq!(ready.tone, SidebarTone::Ready);
+        assert_eq!(ready.label, "Install update v0.2.0");
+        assert_eq!(ready.detail, None);
+        assert_eq!(ready.action, Some(UpdateAction::Install));
+
+        for reason in [
+            NotEligible::DevBuild,
+            NotEligible::NotWritable,
+            NotEligible::Root,
+        ] {
+            let not_writable = Err(reason);
+            let s = sidebar_state_for(
+                &Status::Available(rel.clone()),
+                &not_writable,
+                false,
+                "0.0.1",
+            );
+            assert_eq!(s.tone, SidebarTone::Ready);
+            assert_eq!(s.label, "Update v0.2.0 available");
+            assert_eq!(
+                s.detail.as_deref(),
+                Some(format!("{} · Open release", reason.short_reason()).as_str())
+            );
+            assert_eq!(
+                s.action,
+                Some(UpdateAction::OpenRelease {
+                    url: rel.page_url(),
+                    reason,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn sidebar_maps_installed_to_accent_restart_button() {
+        let writable = Ok(InstallTarget::Binary(PathBuf::from("/opt/ani-gui")));
+        let s = sidebar_state_for(&Status::Installed(v("0.2.0")), &writable, false, "0.0.1");
+        assert_eq!(s.tone, SidebarTone::Accent);
+        assert_eq!(s.label, "Restart to update");
+        assert_eq!(s.detail.as_deref(), Some("v0.2.0 ready"));
+        assert_eq!(s.action, Some(UpdateAction::Restart));
+    }
+
+    #[test]
+    fn sidebar_shows_error_transiently_then_falls_back_to_check_entry() {
+        let writable = Ok(InstallTarget::Binary(PathBuf::from("/opt/ani-gui")));
+        let check_failed = Status::Failed {
+            error: "network down".into(),
+            release: None,
+        };
+        let shown = sidebar_state_for(&check_failed, &writable, true, "0.0.1");
+        assert_eq!(shown.tone, SidebarTone::Error);
+        assert_eq!(shown.label, "Update failed");
+        assert_eq!(shown.action, Some(UpdateAction::Check));
+
+        // Once the transient window expires, fall back to the quiet check entry.
+        let fallback = sidebar_state_for(&check_failed, &writable, false, "0.0.1");
+        assert_eq!(fallback.tone, SidebarTone::Quiet);
+        assert_eq!(fallback.label, "v0.0.1 · Check for updates");
+        assert_eq!(fallback.action, Some(UpdateAction::Check));
+
+        // Install failure retries install while shown, then also falls back.
+        let install_failed = Status::Failed {
+            error: "checksum mismatch".into(),
+            release: Some(sample_release("0.2.0")),
+        };
+        let shown_install = sidebar_state_for(&install_failed, &writable, true, "0.0.1");
+        assert_eq!(shown_install.tone, SidebarTone::Error);
+        assert_eq!(shown_install.action, Some(UpdateAction::Install));
+
+        let fallback_install = sidebar_state_for(&install_failed, &writable, false, "0.0.1");
+        assert_eq!(fallback_install.tone, SidebarTone::Quiet);
+        assert_eq!(fallback_install.action, Some(UpdateAction::Check));
+    }
+
+    #[test]
+    fn settings_notice_shares_actions_and_handles_downloading_and_dev_builds() {
+        let rel = sample_release("0.3.0");
+        let writable = Ok(InstallTarget::Binary(PathBuf::from("/opt/ani-gui")));
+
+        assert_eq!(update_notice_for(&Status::Idle, &writable), None);
+        assert_eq!(update_notice_for(&Status::UpToDate, &writable), None);
+        assert_eq!(update_notice_for(&Status::Checking, &writable), None);
+
+        let dl = update_notice_for(
+            &Status::Downloading {
+                version: v("0.3.0"),
+                downloaded: 3,
+                total: Some(4),
+            },
+            &writable,
+        )
+        .unwrap();
+        assert!(dl.busy);
+        assert_eq!(dl.progress, Some(0.75));
+        assert_eq!(dl.message, "Downloading v0.3.0 (75%)…");
+
+        let dev = update_notice_for(&Status::Available(rel.clone()), &Err(NotEligible::DevBuild))
+            .unwrap();
+        assert!(!dev.error);
+        assert!(dev.message.contains("development build"));
+        assert_eq!(
+            dev.action,
+            Some((
+                "Open release page",
+                UpdateAction::OpenRelease {
+                    url: rel.page_url(),
+                    reason: NotEligible::DevBuild,
+                },
+            ))
+        );
+
+        let installed = update_notice_for(&Status::Installed(v("0.3.0")), &writable).unwrap();
+        assert_eq!(
+            installed.action,
+            Some(("Restart now", UpdateAction::Restart))
+        );
     }
 }

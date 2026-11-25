@@ -4,10 +4,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, IntoElement, ScrollHandle, SharedString, Subscription,
-    Task, Window, div, prelude::*, px, relative,
+    Animation, AnimationExt, AnyElement, Context, Entity, FontWeight, IntoElement, ScrollHandle,
+    SharedString, Subscription, Task, Transformation, Window, div, percentage, prelude::*, px,
+    relative,
 };
 
 use crate::app::AppState;
@@ -21,7 +23,7 @@ use crate::ui::components::toast;
 use crate::ui::files::{display_path, open_folder};
 use crate::ui::show::QUALITIES;
 use crate::ui::theme;
-use crate::updater::{self, Status};
+use crate::updater::{self, Status, UpdateAction, UpdateNotice};
 
 const CONTENT_W: f32 = 780.;
 
@@ -334,37 +336,7 @@ impl SettingsPage {
             _ => "Not checked yet".to_string(),
         };
         let busy = u.busy();
-        let can_install = u.install_path.is_ok();
-        let status = match &u.status {
-            Status::Available(release) => Some(update_notice(
-                format!("ani-gui v{} is available.", release.version),
-                false,
-                Some(release.page_url()),
-                can_install.then_some(("Install", Notice::Install)),
-            )),
-            Status::Installing(version) => Some(update_notice(
-                format!("Installing v{version}…"),
-                false,
-                None,
-                None,
-            )),
-            Status::Installed(version) => Some(update_notice(
-                format!("Updated to v{version} — restart to use it."),
-                false,
-                None,
-                Some(("Restart now", Notice::Restart)),
-            )),
-            Status::Failed { error, release } => Some(update_notice(
-                error.clone(),
-                true,
-                release.as_ref().map(|r| r.page_url()),
-                release
-                    .as_ref()
-                    .filter(|_| can_install)
-                    .map(|_| ("Try again", Notice::Install)),
-            )),
-            Status::Idle | Status::Checking | Status::UpToDate => None,
-        };
+        let status = updater::update_notice(u).map(render_update_notice);
         section("Updates")
             .child(
                 div()
@@ -619,20 +591,38 @@ fn switch(id: &'static str, on: bool) -> gpui::Stateful<gpui::Div> {
         }))
 }
 
-#[derive(Clone, Copy)]
-enum Notice {
-    Install,
-    Restart,
-}
-
 /// The line under the Updates rows: what was found or went wrong, a link
 /// to the release page, and the one action that fits.
-fn update_notice(
-    message: String,
-    error: bool,
-    page: Option<String>,
-    action: Option<(&'static str, Notice)>,
-) -> AnyElement {
+fn render_update_notice(notice: UpdateNotice) -> AnyElement {
+    let leading: AnyElement = if notice.busy {
+        icon("loader-circle")
+            .size(px(18.))
+            .text_color(theme::accent())
+            .with_animation(
+                "settings-update-spinner",
+                Animation::new(Duration::from_millis(900)).repeat(),
+                |svg, delta| svg.with_transformation(Transformation::rotate(percentage(delta))),
+            )
+            .into_any_element()
+    } else {
+        let icon_name = if notice.error {
+            "circle-alert"
+        } else {
+            match notice.action.as_ref().map(|(_, a)| a) {
+                Some(UpdateAction::Restart) => "check",
+                Some(UpdateAction::OpenRelease { .. }) => "external-link",
+                _ => "download",
+            }
+        };
+        icon(icon_name)
+            .size(px(18.))
+            .text_color(if notice.error {
+                theme::danger()
+            } else {
+                theme::accent()
+            })
+            .into_any_element()
+    };
     div()
         .flex()
         .items_center()
@@ -640,51 +630,62 @@ fn update_notice(
         .py(px(14.))
         .border_b_1()
         .border_color(theme::line())
-        .child(
-            icon(match (error, action) {
-                (true, _) => "circle-alert",
-                (false, Some((_, Notice::Restart))) => "check",
-                _ => "download",
-            })
-            .size(px(18.))
-            .text_color(if error {
-                theme::danger()
-            } else {
-                theme::accent()
-            }),
-        )
+        .child(leading)
         .child(
             div()
                 .flex_1()
                 .min_w_0()
-                .text_size(px(theme::SMALL))
-                .line_height(relative(1.5))
-                .text_color(if error {
-                    theme::danger()
-                } else {
-                    theme::text()
-                })
-                .child(message),
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .child(
+                    div()
+                        .text_size(px(theme::SMALL))
+                        .line_height(relative(1.5))
+                        .text_color(if notice.error {
+                            theme::danger()
+                        } else {
+                            theme::text()
+                        })
+                        .child(notice.message),
+                )
+                .children(notice.progress.map(|frac| {
+                    div()
+                        .h(px(4.))
+                        .max_w(px(260.))
+                        .w_full()
+                        .rounded_full()
+                        .bg(theme::raised())
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .h_full()
+                                .w(relative(frac.clamp(0.0, 1.0)))
+                                .bg(theme::accent()),
+                        )
+                })),
         )
         .child(
             div()
                 .flex()
                 .flex_none()
                 .gap(px(8.))
-                .children(page.map(|url| {
+                .children(notice.release_url.map(|url| {
                     button("settings-update-page", "Release notes")
                         .kind(ButtonKind::Ghost)
                         .compact()
                         .on_click(move |_, _, cx| cx.open_url(&url))
                 }))
-                .children(action.map(|(label, notice)| {
+                .children(notice.action.map(|(label, action)| {
+                    let kind = if matches!(action, UpdateAction::Restart) {
+                        ButtonKind::Primary
+                    } else {
+                        ButtonKind::Secondary
+                    };
                     button("settings-update-action", label)
-                        .kind(ButtonKind::Secondary)
+                        .kind(kind)
                         .compact()
-                        .on_click(move |_, _, cx| match notice {
-                            Notice::Install => updater::install_now(cx),
-                            Notice::Restart => updater::restart(cx),
-                        })
+                        .on_click(move |_, _, cx| updater::perform(action.clone(), cx))
                 })),
         )
         .into_any_element()
