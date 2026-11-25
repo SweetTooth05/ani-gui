@@ -1,8 +1,14 @@
+use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, mpsc};
+use std::thread;
 
 use anyhow::{Context, Result, bail};
+use futures::channel::oneshot;
+use gpui::RenderImage;
 
 use crate::{allanime, net};
 
@@ -11,7 +17,171 @@ const ALLANIME_HEADERS: &[(&str, &str)] = &[
     ("Referer", allanime::REFERER),
 ];
 
+const DISK_WORKERS: usize = 3;
+const NET_WORKERS: usize = 6;
+
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+type ImageResult = std::result::Result<Arc<RenderImage>, String>;
+type Waiters = Vec<oneshot::Sender<ImageResult>>;
+
+struct Job {
+    url: String,
+    cache_dir: PathBuf,
+    key: String,
+}
+
+static IN_FLIGHT: LazyLock<Mutex<HashMap<String, Waiters>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static DISK_POOL: LazyLock<mpsc::Sender<Job>> = LazyLock::new(|| {
+    spawn_pool("ani-img-disk", DISK_WORKERS, |job| {
+        let path = job.cache_dir.join(&job.key);
+        match fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => match decode_render_image(&bytes) {
+                Ok(img) => {
+                    finish_in_flight(&job.url, Ok(img));
+                    return;
+                }
+                Err(_) => {
+                    // Corrupt or truncated cache entry: remove and re-fetch once.
+                    let _ = fs::remove_file(&path);
+                }
+            },
+            _ => {}
+        }
+        if NET_POOL.send(job).is_err() {
+            // Unreachable unless process is tearing down.
+        }
+    })
+});
+
+static NET_POOL: LazyLock<mpsc::Sender<Job>> = LazyLock::new(|| {
+    spawn_pool("ani-img-net", NET_WORKERS, |job| {
+        let result = fetch_and_decode(&job);
+        finish_in_flight(&job.url, result.map_err(|err| format!("{err:#}")));
+    })
+});
+
+fn spawn_pool(name: &'static str, workers: usize, handle: fn(Job)) -> mpsc::Sender<Job> {
+    let (tx, rx) = mpsc::channel::<Job>();
+    let rx = Arc::new(Mutex::new(rx));
+    for i in 0..workers {
+        let rx = rx.clone();
+        let _ = thread::Builder::new()
+            .name(format!("{name}-{i}"))
+            .spawn(move || {
+                loop {
+                    let job = {
+                        let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.recv()
+                    };
+                    match job {
+                        Ok(job) => handle(job),
+                        Err(_) => break,
+                    }
+                }
+            });
+    }
+    tx
+}
+
+fn finish_in_flight(url: &str, result: ImageResult) {
+    let waiters = IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(url);
+    if let Some(waiters) = waiters {
+        for tx in waiters {
+            let _ = tx.send(result.clone());
+        }
+    }
+}
+
+fn fetch_and_decode(job: &Job) -> Result<Arc<RenderImage>> {
+    let bytes = net::get_bytes(&job.url, request_headers(&job.url))?;
+    if bytes.is_empty() {
+        bail!("empty image from {}", job.url);
+    }
+    let img = decode_render_image(&bytes).with_context(|| format!("decoding {}", job.url))?;
+    if let Err(err) = save_atomic(&job.cache_dir, &job.key, &bytes) {
+        eprintln!("ani-gui: caching image {}: {err:#}", job.url);
+    }
+    Ok(img)
+}
+
+fn decode_render_image(bytes: &[u8]) -> Result<Arc<RenderImage>> {
+    let bgra = decode_bgra(bytes)?;
+    Ok(Arc::new(RenderImage::new(vec![image::Frame::new(bgra)])))
+}
+
+fn decode_bgra(bytes: &[u8]) -> Result<image::RgbaImage> {
+    let mut rgba = image::load_from_memory(bytes)
+        .context("decoding image")?
+        .into_rgba8();
+    // gpui expects BGRA8 pixel layout.
+    for px in rgba.as_chunks_mut::<4>().0 {
+        px.swap(0, 2);
+    }
+    Ok(rgba)
+}
+
+fn save_atomic(cache_dir: &Path, key: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let path = cache_dir.join(key);
+    fs::create_dir_all(cache_dir).with_context(|| format!("creating {}", cache_dir.display()))?;
+    let tmp = cache_dir.join(format!(
+        ".{key}.{}.{}.tmp",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    if let Err(err) = fs::rename(&tmp, &path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err).with_context(|| format!("saving {}", path.display()));
+    }
+    Ok(path)
+}
+
+/// Loads and decodes `url` on dedicated image worker threads (separate from
+/// GPUI's background executor), deduplicating concurrent requests for the same
+/// URL and serving disk cache hits without waiting behind network fetches.
+pub fn load_render_image(
+    url: String,
+    cache_dir: PathBuf,
+) -> impl Future<Output = ImageResult> + Send + 'static {
+    let (tx, rx) = oneshot::channel();
+    let should_enqueue = {
+        let mut map = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        match map.get_mut(&url) {
+            Some(waiters) => {
+                waiters.push(tx);
+                false
+            }
+            None => {
+                map.insert(url.clone(), vec![tx]);
+                true
+            }
+        }
+    };
+    if should_enqueue {
+        let key = cache_key(&url);
+        let url_for_err = url.clone();
+        if DISK_POOL
+            .send(Job {
+                url,
+                cache_dir,
+                key,
+            })
+            .is_err()
+        {
+            finish_in_flight(&url_for_err, Err("image worker pool stopped".into()));
+        }
+    }
+    async move {
+        rx.await
+            .unwrap_or_else(|_| Err("image load cancelled".into()))
+    }
+}
 
 /// FNV-1a 64 of the URL in hex, plus the URL's file extension (lowercased).
 pub fn cache_key(url: &str) -> String {
@@ -41,6 +211,7 @@ fn extension(url: &str) -> String {
 }
 
 /// Path of the local copy of `url` in `cache_dir`, downloading it on first use.
+#[allow(dead_code)]
 pub fn cached_image(url: &str, cache_dir: &Path) -> Result<PathBuf> {
     let key = cache_key(url);
     let path = cache_dir.join(&key);
@@ -51,18 +222,7 @@ pub fn cached_image(url: &str, cache_dir: &Path) -> Result<PathBuf> {
     if bytes.is_empty() {
         bail!("empty image from {url}");
     }
-    fs::create_dir_all(cache_dir).with_context(|| format!("creating {}", cache_dir.display()))?;
-    let tmp = cache_dir.join(format!(
-        ".{key}.{}.{}.tmp",
-        std::process::id(),
-        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::write(&tmp, &bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    if let Err(err) = fs::rename(&tmp, &path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(err).with_context(|| format!("saving {}", path.display()));
-    }
-    Ok(path)
+    save_atomic(cache_dir, &key, &bytes)
 }
 
 /// AllAnime's cover CDN rejects requests without its Referer.
@@ -116,5 +276,15 @@ mod tests {
         assert_eq!(cached_image(url, &dir).unwrap(), dir.join(cache_key(url)));
         assert!(cached_image("http://127.0.0.1:9/missing.jpg", &dir).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn decode_bgra_swaps_red_and_blue_channels() {
+        let mut src = image::RgbaImage::new(1, 1);
+        src.put_pixel(0, 0, image::Rgba([0x11, 0x22, 0x33, 0xff]));
+        let mut png = std::io::Cursor::new(Vec::new());
+        src.write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let bgra = decode_bgra(&png.into_inner()).unwrap();
+        assert_eq!(bgra.get_pixel(0, 0).0, [0x33, 0x22, 0x11, 0xff]);
     }
 }

@@ -9,6 +9,7 @@ use crate::model::{Airing, AniListMedia, Mode, ShowSummary};
 use crate::{allanime, anilist};
 
 const TTL_SECS: i64 = 6 * 60 * 60;
+const EPISODES_TTL_SECS: i64 = 15 * 60;
 const TRENDING_COUNT: usize = 20;
 const WEEK_SECS: i64 = 7 * 24 * 60 * 60;
 
@@ -33,10 +34,33 @@ pub fn schedule_week(db: &Mutex<Db>) -> Vec<Airing> {
     .unwrap_or_default()
 }
 
+/// Previously cached weekly schedule, fresh or stale, without network I/O.
+pub fn schedule_week_cached(db: &Mutex<Db>) -> Option<Vec<Airing>> {
+    cache_peek(db, &format!("{ANILIST_KEY}:schedule"))
+}
+
 pub fn media(db: &Mutex<Db>, id: i64) -> Option<AniListMedia> {
     cached(db, &format!("{ANILIST_KEY}:media:{id}"), || {
         anilist::media(id)
     })
+}
+
+/// Previously cached AniList media entry, fresh or stale, without network I/O.
+pub fn media_cached(db: &Mutex<Db>, id: i64) -> Option<AniListMedia> {
+    cache_peek(db, &format!("{ANILIST_KEY}:media:{id}"))
+}
+
+/// Episode list for an AllAnime show, cached in SQLite with a short TTL and
+/// stale fallback when offline.
+pub fn episodes(db: &Mutex<Db>, show_id: &str, mode: Mode) -> Result<Vec<String>> {
+    let key = episodes_key(show_id, mode);
+    fetch_cached(db, &key, EPISODES_TTL_SECS, || {
+        allanime::episodes(show_id, mode)
+    })
+}
+
+fn episodes_key(show_id: &str, mode: Mode) -> String {
+    format!("allanime:eps:{show_id}:{}", mode.as_str())
 }
 
 /// Card data for `ids`, e.g. to dress AllAnime search results. Keyed by the
@@ -67,6 +91,26 @@ pub fn for_you(db: &Mutex<Db>, seed_ids: &[i64]) -> Vec<AniListMedia> {
         anilist::recommendations(seed_ids)
     })
     .unwrap_or_default()
+}
+
+/// The AllAnime show for an AniList entry: checks the local `shows` table and
+/// `api_cache` before hitting AllAnime's search API.
+pub fn resolve_allanime_cached(
+    db: &Mutex<Db>,
+    media: &AniListMedia,
+    mode: Mode,
+) -> Result<Option<ShowSummary>> {
+    if let Ok(Some(record)) = lock(db).show_by_anilist_id(media.id) {
+        let count = match mode {
+            Mode::Sub => record.summary.sub_count,
+            Mode::Dub => record.summary.dub_count,
+        };
+        if count > 0 {
+            return Ok(Some(record.summary));
+        }
+    }
+    let key = format!("allanime:resolve:{}:{}", media.id, mode.as_str());
+    fetch_cached(db, &key, TTL_SECS, || resolve_allanime(media, mode))
 }
 
 /// The AllAnime show for an AniList entry: the result whose `anilist_id`
@@ -106,6 +150,20 @@ fn pick_match(results: &[ShowSummary], anilist_id: i64) -> Option<ShowSummary> {
         .iter()
         .find(|s| s.anilist_id == Some(anilist_id))
         .cloned()
+}
+
+/// Reads any cached value (fresh or stale) for `key` without network I/O.
+pub fn cache_peek<T: DeserializeOwned>(db: &Mutex<Db>, key: &str) -> Option<T> {
+    lock(db)
+        .cache_get_stale(key)
+        .inspect_err(|err| eprintln!("ani-gui: reading cache {key}: {err:#}"))
+        .ok()
+        .flatten()
+        .and_then(|json| {
+            serde_json::from_str(&json)
+                .inspect_err(|err| eprintln!("ani-gui: cached {key} is unreadable: {err}"))
+                .ok()
+        })
 }
 
 fn cached<T, F>(db: &Mutex<Db>, key: &str, fetch: F) -> Option<T>
@@ -288,5 +346,47 @@ mod tests {
             }
         };
         assert!(resolve_with(&media, Mode::Sub, nothing).is_err());
+    }
+
+    #[test]
+    fn resolve_allanime_cached_hits_shows_table_before_network() {
+        let db = db();
+        let summary = ShowSummary {
+            id: "stored-id".into(),
+            title: "Frieren".into(),
+            anilist_id: Some(154587),
+            sub_count: 28,
+            dub_count: 0,
+            ..Default::default()
+        };
+        db.lock()
+            .unwrap()
+            .upsert_show(&crate::model::ShowRecord {
+                summary: summary.clone(),
+                media: None,
+                updated_at: 100,
+            })
+            .unwrap();
+        let media = AniListMedia {
+            id: 154587,
+            title_romaji: "Sousou no Frieren".into(),
+            ..Default::default()
+        };
+        let resolved = resolve_allanime_cached(&db, &media, Mode::Sub).unwrap();
+        assert_eq!(resolved, Some(summary));
+    }
+
+    #[test]
+    fn cache_peek_reads_stored_values_without_fetching() {
+        let db = db();
+        assert_eq!(cache_peek::<Vec<String>>(&db, "allanime:eps:s1:sub"), None);
+        db.lock()
+            .unwrap()
+            .cache_put("allanime:eps:s1:sub", r#"["1","2"]"#)
+            .unwrap();
+        assert_eq!(
+            cache_peek::<Vec<String>>(&db, &episodes_key("s1", Mode::Sub)),
+            Some(vec!["1".to_string(), "2".to_string()])
+        );
     }
 }

@@ -132,6 +132,13 @@ CREATE TABLE list_rating_prompts (
 );
 ";
 
+const SCHEMA_V4: &str = "
+CREATE INDEX IF NOT EXISTS shows_anilist_id ON shows (anilist_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS progress_show_updated ON progress (show_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS my_list_added_at ON my_list (added_at DESC);
+CREATE INDEX IF NOT EXISTS downloads_created_at ON downloads (created_at DESC);
+";
+
 const ENTRY_COLUMNS: &str = "service, remote_id, anilist_id, mal_id, status, progress, score, \
     episodes, title, cover_url, updated_at";
 
@@ -147,6 +154,9 @@ impl Db {
         let conn = Connection::open(path)
             .with_context(|| format!("opening database {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        conn.pragma_update(None, "cache_size", -16000)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Db::init(conn)
     }
@@ -157,14 +167,23 @@ impl Db {
     }
 
     fn init(mut conn: Connection) -> Result<Db> {
+        conn.set_prepared_statement_cache_capacity(64);
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        for (target, schema) in [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3)] {
-            if version < target {
-                let tx = conn.transaction()?;
-                tx.execute_batch(schema)?;
-                tx.pragma_update(None, "user_version", target)?;
-                tx.commit()?;
+        let migrations = [
+            (1, SCHEMA_V1),
+            (2, SCHEMA_V2),
+            (3, SCHEMA_V3),
+            (4, SCHEMA_V4),
+        ];
+        if migrations.iter().any(|&(target, _)| version < target) {
+            let tx = conn.transaction()?;
+            for &(target, schema) in &migrations {
+                if version < target {
+                    tx.execute_batch(schema)?;
+                    tx.pragma_update(None, "user_version", target)?;
+                }
             }
+            tx.commit()?;
         }
         Ok(Db { conn })
     }
@@ -217,27 +236,25 @@ impl Db {
     }
 
     pub fn get_show(&self, id: &str) -> Result<Option<ShowRecord>> {
-        let row = self
-            .conn
-            .query_row(
-                "SELECT id, title, english_title, cover_url, anilist_id, sub_count, dub_count,
-                     media_json, updated_at
-                 FROM shows WHERE id = ?1",
-                [id],
-                |r| {
-                    let summary = ShowSummary {
-                        id: r.get(0)?,
-                        title: r.get(1)?,
-                        english_title: r.get(2)?,
-                        cover_url: r.get(3)?,
-                        anilist_id: r.get(4)?,
-                        sub_count: r.get(5)?,
-                        dub_count: r.get(6)?,
-                    };
-                    let media_json: Option<String> = r.get(7)?;
-                    Ok((summary, media_json, r.get::<_, i64>(8)?))
-                },
-            )
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, title, english_title, cover_url, anilist_id, sub_count, dub_count,
+                 media_json, updated_at
+             FROM shows WHERE id = ?1",
+        )?;
+        let row = stmt
+            .query_row([id], |r| {
+                let summary = ShowSummary {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    english_title: r.get(2)?,
+                    cover_url: r.get(3)?,
+                    anilist_id: r.get(4)?,
+                    sub_count: r.get(5)?,
+                    dub_count: r.get(6)?,
+                };
+                let media_json: Option<String> = r.get(7)?;
+                Ok((summary, media_json, r.get::<_, i64>(8)?))
+            })
             .optional()?;
         let Some((summary, media_json, updated_at)) = row else {
             return Ok(None);
@@ -254,26 +271,26 @@ impl Db {
     }
 
     pub fn save_progress(&self, p: &Progress) -> Result<()> {
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO progress (show_id, mode, ep, position, duration, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(show_id, mode, ep) DO UPDATE SET
                  position = excluded.position, duration = excluded.duration,
                  updated_at = excluded.updated_at",
-            params![
-                p.show_id,
-                p.mode,
-                p.ep,
-                p.position,
-                p.duration,
-                p.updated_at
-            ],
         )?;
+        stmt.execute(params![
+            p.show_id,
+            p.mode,
+            p.ep,
+            p.position,
+            p.duration,
+            p.updated_at
+        ])?;
         Ok(())
     }
 
     pub fn progress_for_show(&self, show_id: &str, mode: Mode) -> Result<Vec<Progress>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT show_id, mode, ep, position, duration, updated_at FROM progress
              WHERE show_id = ?1 AND mode = ?2
              ORDER BY CAST(ep AS REAL), ep",
@@ -284,7 +301,7 @@ impl Db {
 
     pub fn recent_progress(&self, limit: usize) -> Result<Vec<Progress>> {
         // Ties on updated_at go to the most recently inserted row.
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT show_id, mode, ep, position, duration, updated_at FROM (
                  SELECT *, rowid AS rid, ROW_NUMBER() OVER (
                      PARTITION BY show_id ORDER BY updated_at DESC, rowid DESC
@@ -315,23 +332,58 @@ impl Db {
     }
 
     pub fn my_list_contains(&self, show_id: &str) -> Result<bool> {
-        let found = self
+        let mut stmt = self
             .conn
-            .query_row(
-                "SELECT 1 FROM my_list WHERE show_id = ?1",
-                [show_id],
-                |_| Ok(()),
-            )
-            .optional()?;
+            .prepare_cached("SELECT 1 FROM my_list WHERE show_id = ?1")?;
+        let found = stmt.query_row([show_id], |_| Ok(())).optional()?;
         Ok(found.is_some())
     }
 
+    #[allow(dead_code)]
     pub fn my_list(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT show_id FROM my_list ORDER BY added_at DESC, rowid DESC")?;
+            .prepare_cached("SELECT show_id FROM my_list ORDER BY added_at DESC, rowid DESC")?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Saved shows in `my_list` order, loaded in a single query.
+    pub fn my_list_shows(&self) -> Result<Vec<ShowRecord>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT s.id, s.title, s.english_title, s.cover_url, s.anilist_id, s.sub_count,
+                 s.dub_count, s.media_json, s.updated_at
+             FROM my_list m
+             JOIN shows s ON s.id = m.show_id
+             ORDER BY m.added_at DESC, m.rowid DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let summary = ShowSummary {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                english_title: r.get(2)?,
+                cover_url: r.get(3)?,
+                anilist_id: r.get(4)?,
+                sub_count: r.get(5)?,
+                dub_count: r.get(6)?,
+            };
+            let media_json: Option<String> = r.get(7)?;
+            Ok((summary, media_json, r.get::<_, i64>(8)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (summary, media_json, updated_at) = row?;
+            let media = media_json
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .with_context(|| format!("decoding media_json for show {}", summary.id))?;
+            out.push(ShowRecord {
+                summary,
+                media,
+                updated_at,
+            });
+        }
+        Ok(out)
     }
 
     pub fn upsert_download(&self, d: &DownloadRecord) -> Result<()> {
@@ -452,24 +504,22 @@ impl Db {
 
     /// Returns the cached JSON only if it was fetched at most `max_age_secs` ago.
     pub fn cache_get(&self, key: &str, max_age_secs: i64) -> Result<Option<String>> {
-        let json = self
+        let mut stmt = self
             .conn
-            .query_row(
-                "SELECT json FROM api_cache WHERE key = ?1 AND fetched_at >= ?2",
-                params![key, now().saturating_sub(max_age_secs)],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT json FROM api_cache WHERE key = ?1 AND fetched_at >= ?2")?;
+        let json = stmt
+            .query_row(params![key, now().saturating_sub(max_age_secs)], |r| {
+                r.get(0)
+            })
             .optional()?;
         Ok(json)
     }
 
     pub fn cache_get_stale(&self, key: &str) -> Result<Option<String>> {
-        let json = self
+        let mut stmt = self
             .conn
-            .query_row("SELECT json FROM api_cache WHERE key = ?1", [key], |r| {
-                r.get(0)
-            })
-            .optional()?;
+            .prepare_cached("SELECT json FROM api_cache WHERE key = ?1")?;
+        let json = stmt.query_row([key], |r| r.get(0)).optional()?;
         Ok(json)
     }
 
@@ -478,14 +528,10 @@ impl Db {
     }
 
     pub fn get_provider_title(&self, show_id: &str) -> Result<Option<String>> {
-        let title = self
+        let mut stmt = self
             .conn
-            .query_row(
-                "SELECT title FROM provider_titles WHERE show_id = ?1",
-                [show_id],
-                |r| r.get(0),
-            )
-            .optional()?;
+            .prepare_cached("SELECT title FROM provider_titles WHERE show_id = ?1")?;
+        let title = stmt.query_row([show_id], |r| r.get(0)).optional()?;
         Ok(title)
     }
 
@@ -493,7 +539,7 @@ impl Db {
     pub fn provider_titles(&self) -> Result<Vec<(String, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT show_id, title FROM provider_titles ORDER BY rowid")?;
+            .prepare_cached("SELECT show_id, title FROM provider_titles ORDER BY rowid")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -801,28 +847,48 @@ impl Db {
 
     /// The most recently stored AllAnime show for an AniList id.
     pub fn show_by_anilist_id(&self, anilist_id: i64) -> Result<Option<ShowRecord>> {
-        let id: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT id FROM shows WHERE anilist_id = ?1
-                 ORDER BY updated_at DESC, rowid DESC LIMIT 1",
-                [anilist_id],
-                |r| r.get(0),
-            )
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT id, title, english_title, cover_url, anilist_id, sub_count, dub_count,
+                 media_json, updated_at
+             FROM shows WHERE anilist_id = ?1
+             ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+        )?;
+        let row = stmt
+            .query_row([anilist_id], |r| {
+                let summary = ShowSummary {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    english_title: r.get(2)?,
+                    cover_url: r.get(3)?,
+                    anilist_id: r.get(4)?,
+                    sub_count: r.get(5)?,
+                    dub_count: r.get(6)?,
+                };
+                let media_json: Option<String> = r.get(7)?;
+                Ok((summary, media_json, r.get::<_, i64>(8)?))
+            })
             .optional()?;
-        match id {
-            Some(id) => self.get_show(&id),
-            None => Ok(None),
-        }
+        let Some((summary, media_json, updated_at)) = row else {
+            return Ok(None);
+        };
+        let media = media_json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .with_context(|| format!("decoding media_json for show {}", summary.id))?;
+        Ok(Some(ShowRecord {
+            summary,
+            media,
+            updated_at,
+        }))
     }
 
     fn cache_put_at(&self, key: &str, json: &str, fetched_at: i64) -> Result<()> {
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT INTO api_cache (key, json, fetched_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(key) DO UPDATE SET
                  json = excluded.json, fetched_at = excluded.fetched_at",
-            params![key, json, fetched_at],
         )?;
+        stmt.execute(params![key, json, fetched_at])?;
         Ok(())
     }
 }
@@ -980,7 +1046,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         for table in [
             "shows",
             "progress",
@@ -1005,6 +1071,22 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 1, "missing table {table}");
         }
+        for index in [
+            "shows_anilist_id",
+            "progress_show_updated",
+            "my_list_added_at",
+            "downloads_created_at",
+        ] {
+            let n: i64 = db
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [index],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "missing index {index}");
+        }
     }
 
     #[test]
@@ -1022,7 +1104,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert_eq!(db.my_list().unwrap(), ["a"]);
         db.set_provider_title("a", "Frieren").unwrap();
         assert_eq!(
@@ -1052,7 +1134,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert_eq!(db.my_list().unwrap(), ["a"]);
         assert_eq!(
             db.get_provider_title("a").unwrap().as_deref(),
@@ -1065,6 +1147,53 @@ mod tests {
         let conn = db.conn;
         let db = Db::init(conn).unwrap();
         assert_eq!(db.list_account(Service::Mal).unwrap().client_id, "abc");
+    }
+
+    #[test]
+    fn migrate_v3_to_v4_creates_indexes_and_keeps_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(SCHEMA_V3).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute(
+            "INSERT INTO my_list (show_id, added_at) VALUES ('a', 1)",
+            [],
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        let version: i64 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        assert_eq!(db.my_list().unwrap(), ["a"]);
+    }
+
+    #[test]
+    fn my_list_shows_joins_in_order() {
+        let db = db();
+        let rec = |id: &str| ShowRecord {
+            summary: ShowSummary {
+                id: id.into(),
+                title: format!("Show {id}"),
+                ..Default::default()
+            },
+            media: None,
+            updated_at: 1,
+        };
+        db.upsert_show(&rec("a")).unwrap();
+        db.upsert_show(&rec("c")).unwrap();
+        db.my_list_add("a").unwrap();
+        db.my_list_add("missing").unwrap();
+        db.my_list_add("c").unwrap();
+        let ids: Vec<String> = db
+            .my_list_shows()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.summary.id)
+            .collect();
+        assert_eq!(ids, vec!["c", "a"]);
     }
 
     fn remote(service: Service, remote_id: i64, anilist_id: Option<i64>) -> RemoteEntry {

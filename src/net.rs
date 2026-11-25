@@ -5,11 +5,15 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const USER_AGENT: &str = "ani-gui/1.0";
 
 static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::Agent::config_builder()
         .timeout_global(Some(TIMEOUT))
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .max_idle_connections(32)
+        .max_idle_connections_per_host(12)
         .user_agent(USER_AGENT)
         .build()
         .into()

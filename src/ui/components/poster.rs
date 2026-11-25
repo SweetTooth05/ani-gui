@@ -1,5 +1,5 @@
 use gpui::{
-    App, ClickEvent, ElementId, FontWeight, IntoElement, SharedString, Window, div,
+    App, ClickEvent, ElementId, FontWeight, Global, IntoElement, SharedString, Window, div,
     linear_color_stop, linear_gradient, prelude::*, px, relative,
 };
 
@@ -11,6 +11,21 @@ use crate::ui::theme;
 type OnClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 const RADIUS: f32 = 10.;
+
+/// The single poster card currently under the pointer. Building `info_overlay`
+/// only for this card avoids laying out and text-shaping hidden synopses and
+/// genre chips for every card on the page every frame.
+#[derive(Default)]
+struct HoveredPoster(Option<ElementId>);
+
+impl Global for HoveredPoster {}
+
+/// Clears any remembered poster hover (call on page navigation).
+pub fn clear_hovered_poster(cx: &mut App) {
+    if cx.has_global::<HoveredPoster>() {
+        cx.global_mut::<HoveredPoster>().0 = None;
+    }
+}
 
 /// Portrait cover with the title beneath. With `meta`, a quiet score badge
 /// sits in the corner and hovering raises a scrim with the show's facts.
@@ -58,7 +73,10 @@ impl PosterCard {
 }
 
 impl RenderOnce for PosterCard {
-    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let hovered = cx.try_global::<HoveredPoster>().and_then(|h| h.0.as_ref()) == Some(&self.id);
+        let has_meta = self.meta.is_some();
+        let hover_id = has_meta.then(|| self.id.clone());
         let card = div()
             .id(self.id)
             .group("poster")
@@ -79,7 +97,7 @@ impl RenderOnce for PosterCard {
                         theme::night(),
                         None,
                     ))
-                    .children(self.meta.as_ref().map(info_overlay))
+                    .children(self.meta.as_ref().filter(|_| hovered).map(info_overlay))
                     .children(
                         self.meta
                             .as_ref()
@@ -107,6 +125,28 @@ impl RenderOnce for PosterCard {
                     .text_color(theme::text_muted())
                     .child(s)
             }));
+        let card = match hover_id {
+            Some(hover_id) => card.on_hover(move |&entered, window, cx| {
+                let state = cx.default_global::<HoveredPoster>();
+                let changed = if entered {
+                    if state.0.as_ref() != Some(&hover_id) {
+                        state.0 = Some(hover_id.clone());
+                        true
+                    } else {
+                        false
+                    }
+                } else if state.0.as_ref() == Some(&hover_id) {
+                    state.0 = None;
+                    true
+                } else {
+                    false
+                };
+                if changed {
+                    window.refresh();
+                }
+            }),
+            None => card,
+        };
         match self.on_click {
             Some(f) => card.on_click(f),
             None => card,
@@ -247,8 +287,7 @@ fn score_badge(score: String) -> gpui::Div {
 }
 
 /// The hover reveal: a scrim rising from the poster's foot, carrying status,
-/// facts, genres and the start of the synopsis. Hidden until the card's
-/// group is hovered.
+/// facts, genres and the start of the synopsis. Mounted only while hovered.
 fn info_overlay(meta: &CardMeta) -> gpui::Div {
     let facts = meta.facts.join(" · ");
     div()
@@ -256,8 +295,6 @@ fn info_overlay(meta: &CardMeta) -> gpui::Div {
         .inset_0()
         .rounded(px(RADIUS))
         .overflow_hidden()
-        .opacity(0.)
-        .group_hover("poster", |s| s.opacity(1.))
         .bg(linear_gradient(
             0.,
             linear_color_stop(theme::night_alpha(0.98), 0.),

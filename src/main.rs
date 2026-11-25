@@ -76,9 +76,12 @@ fn main() {
         return;
     }
 
+    app::trace_init();
     let app = Application::new().with_assets(ui::theme::Assets);
     app.run(|cx: &mut App| {
+        app::trace_event("app_run");
         ui::theme::register_fonts(cx);
+        app::trace_event("fonts_registered");
         text_input::bind_keys(cx);
         app::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1360.), px(860.)), cx);
@@ -114,6 +117,7 @@ fn main() {
                 .detach();
             cx.new(|cx| app::Root::new(window, cx))
         });
+        app::trace_event("window_opened");
         if let Err(err) = opened {
             eprintln!("ani-gui: could not open window: {err:#}");
             cx.quit();

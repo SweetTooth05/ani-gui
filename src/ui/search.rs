@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui::{
-    Context, Entity, Focusable, FontWeight, IntoElement, ScrollHandle, Subscription, Task,
-    WeakEntity, Window, div, prelude::*, px,
+    AnyElement, Context, Entity, Focusable, FontWeight, IntoElement, ScrollHandle, SharedString,
+    Subscription, Task, WeakEntity, Window, div, prelude::*, px,
 };
 
 use crate::app::{AppState, Root, Route, ShowRef};
@@ -18,6 +18,19 @@ use crate::ui::theme;
 use crate::{allanime, catalog};
 
 const DEBOUNCE: Duration = Duration::from_millis(300);
+const GRID_GAP_X: f32 = 22.;
+const GRID_ROW_H: f32 = 308.;
+const GRID_ROW_GAP: f32 = 30.;
+const GRID_ROW_STRIDE: f32 = GRID_ROW_H + GRID_ROW_GAP;
+/// Approximate y-offset of the results grid below the heading and search bar.
+const GRID_TOP_Y: f32 = 190.;
+
+struct ResultCard {
+    title: SharedString,
+    cover_url: String,
+    meta: CardMeta,
+    subtitle: SharedString,
+}
 
 enum State {
     Idle,
@@ -36,6 +49,8 @@ pub struct SearchPage {
     /// AniList card data for `results` that carry an AniList id, fetched
     /// after them so results appear without waiting on AniList.
     media: HashMap<i64, AniListMedia>,
+    /// Precomputed display cards for `results` + `media`.
+    cards: Vec<ResultCard>,
     state: State,
     pending: Option<Task<()>>,
     enrich: Option<Task<()>>,
@@ -60,6 +75,7 @@ impl SearchPage {
             query: String::new(),
             results: Vec::new(),
             media: HashMap::new(),
+            cards: Vec::new(),
             state: State::Idle,
             pending: None,
             enrich: None,
@@ -71,6 +87,35 @@ impl SearchPage {
 
     pub fn focus_on_next_render(&mut self) {
         self.focus_next_render = true;
+    }
+
+    fn rebuild_cards(&mut self) {
+        let now = db::now();
+        let tz = local_offset(now);
+        let mode = self.mode;
+        self.cards = self
+            .results
+            .iter()
+            .map(|show| {
+                let count = show.count(mode);
+                let media = show.anilist_id.and_then(|id| self.media.get(&id));
+                let meta = match media {
+                    Some(media) => CardMeta::from_media(media, now, tz),
+                    None => CardMeta::from_summary(show),
+                };
+                let subtitle: SharedString = if count == 1 {
+                    "1 episode".into()
+                } else {
+                    format!("{count} episodes").into()
+                };
+                ResultCard {
+                    title: show.display_title().to_string().into(),
+                    cover_url: show.cover_url.clone(),
+                    meta,
+                    subtitle,
+                }
+            })
+            .collect();
     }
 
     fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
@@ -89,6 +134,7 @@ impl SearchPage {
             self.pending = None;
             self.query.clear();
             self.results.clear();
+            self.cards.clear();
             self.state = State::Idle;
             cx.notify();
             return;
@@ -110,11 +156,13 @@ impl SearchPage {
                 match found {
                     Ok(results) => {
                         page.results = results;
+                        page.rebuild_cards();
                         page.state = State::Done;
                         page.enrich(cx);
                     }
                     Err(err) => {
                         page.results.clear();
+                        page.cards.clear();
                         page.state = State::Failed(format!("{err:#}"));
                     }
                 }
@@ -145,14 +193,20 @@ impl SearchPage {
                 .await;
             this.update(cx, |page, cx| {
                 page.enrich = None;
-                page.media.extend(found.into_iter().map(|m| (m.id, m)));
-                cx.notify();
+                if !found.is_empty() {
+                    page.media.extend(found.into_iter().map(|m| (m.id, m)));
+                    page.rebuild_cards();
+                    cx.notify();
+                }
             })
             .ok();
         }));
     }
 
-    fn open(&self, show: ShowSummary, cx: &mut Context<Self>) {
+    fn open_index(&self, index: usize, cx: &mut Context<Self>) {
+        let Some(show) = self.results.get(index).cloned() else {
+            return;
+        };
         let route = Route::Show(ShowRef {
             anilist_id: show.anilist_id,
             title: show.display_title().to_string(),
@@ -180,6 +234,62 @@ impl SearchPage {
             State::Done => None,
         }
     }
+
+    fn render_grid(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let count = self.cards.len();
+        if count == 0 {
+            return div().into_any_element();
+        }
+        let bounds = self.scroll.bounds();
+        let mut vw = f32::from(bounds.size.width);
+        let mut vh = f32::from(bounds.size.height);
+        if vw <= 1.0 {
+            vw = (f32::from(window.viewport_size().width) - theme::SIDEBAR_WIDTH)
+                .max(theme::POSTER_W + 2.0 * f32::from(theme::gutter()));
+        }
+        if vh <= 1.0 {
+            vh = f32::from(window.viewport_size().height).max(720.0);
+        }
+        let avail = (vw - 2.0 * f32::from(theme::gutter())).max(theme::POSTER_W);
+        let cols = ((avail + GRID_GAP_X) / (theme::POSTER_W + GRID_GAP_X))
+            .floor()
+            .max(1.0) as usize;
+        let total_rows = count.div_ceil(cols);
+        let scroll_y = (-f32::from(self.scroll.offset().y)).max(0.0);
+        let vis_top = (scroll_y - GRID_TOP_Y - GRID_ROW_STRIDE).max(0.0);
+        let vis_bottom = (scroll_y + vh - GRID_TOP_Y + GRID_ROW_STRIDE).max(0.0);
+        let start_row = ((vis_top / GRID_ROW_STRIDE).floor() as usize).min(total_rows);
+        let end_row = ((vis_bottom / GRID_ROW_STRIDE).ceil() as usize).min(total_rows);
+        let top_h = start_row as f32 * GRID_ROW_STRIDE;
+        let bottom_h = (total_rows - end_row) as f32 * GRID_ROW_STRIDE;
+
+        let mut container = div().flex().flex_col();
+        if top_h > 0.0 {
+            container = container.child(div().h(px(top_h)));
+        }
+        for row in start_row..end_row {
+            let first = row * cols;
+            let last = (first + cols).min(count);
+            container = container.child(
+                div()
+                    .flex()
+                    .gap(px(GRID_GAP_X))
+                    .h(px(GRID_ROW_H))
+                    .mb(px(GRID_ROW_GAP))
+                    .children((first..last).map(|i| {
+                        let card = &self.cards[i];
+                        poster_card(("result", i), card.title.clone(), &card.cover_url)
+                            .meta(card.meta.clone())
+                            .subtitle(card.subtitle.clone())
+                            .on_click(cx.listener(move |page, _, _, cx| page.open_index(i, cx)))
+                    })),
+            );
+        }
+        if bottom_h > 0.0 {
+            container = container.child(div().h(px(bottom_h)));
+        }
+        container.into_any_element()
+    }
 }
 
 impl Render for SearchPage {
@@ -190,29 +300,6 @@ impl Render for SearchPage {
         }
         let mode = self.mode;
         let failed = matches!(self.state, State::Failed(_));
-        let now = db::now();
-        let tz = local_offset(now);
-        let cards = self.results.iter().enumerate().map(|(i, show)| {
-            let target = show.clone();
-            let count = show.count(mode);
-            let media = show.anilist_id.and_then(|id| self.media.get(&id));
-            let meta = match media {
-                Some(media) => CardMeta::from_media(media, now, tz),
-                None => CardMeta::from_summary(show),
-            };
-            poster_card(
-                ("result", i),
-                show.display_title().to_string(),
-                &show.cover_url,
-            )
-            .meta(meta)
-            .subtitle(if count == 1 {
-                "1 episode".to_string()
-            } else {
-                format!("{count} episodes")
-            })
-            .on_click(cx.listener(move |page, _, _, cx| page.open(target.clone(), cx)))
-        });
         div()
             .id("search")
             .size_full()
@@ -264,14 +351,7 @@ impl Render for SearchPage {
                             })
                             .child(line)
                     }))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_x(px(22.))
-                            .gap_y(px(30.))
-                            .children(cards),
-                    ),
+                    .child(self.render_grid(window, cx)),
             )
     }
 }

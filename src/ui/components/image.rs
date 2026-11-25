@@ -1,12 +1,11 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
     AbsoluteLength, Animation, AnimationExt, App, Asset, Div, EdgesRefinement, Global, Hsla,
-    ImageAssetLoader, ImageCacheError, Img, IntoElement, ObjectFit, Pixels, RenderImage, Resource,
-    SharedString, Window, div, img, prelude::*, pulsating_between,
+    ImageCacheError, Img, IntoElement, ObjectFit, Pixels, RenderImage, SharedString, Window, div,
+    img, prelude::*, pulsating_between,
 };
 
 use crate::app::AppState;
@@ -14,13 +13,13 @@ use crate::ui::theme;
 use crate::{images, paths};
 
 /// Decoded images kept in memory; older ones are decoded again from disk.
-const KEEP_DECODED: usize = 200;
+const KEEP_DECODED: usize = 256;
 const RETRY_FIRST: Duration = Duration::from_secs(2);
 const RETRY_MAX: Duration = Duration::from_secs(60);
 
-/// Downloads (once, into the image cache) and decodes a remote image. gpui
-/// runs `load`'s future on its background executor and caches the result
-/// until `remote_image` removes it.
+/// Downloads (once, into the image cache) and decodes a remote image on our
+/// dedicated image worker pools so GPUI's background executor stays free for
+/// database and API tasks.
 struct RemoteImage;
 
 impl Asset for RemoteImage {
@@ -35,14 +34,8 @@ impl Asset for RemoteImage {
             .try_global::<AppState>()
             .map_or_else(paths::cache_dir, |s| s.cache_dir.clone())
             .join("images");
-        // `images::cached_image` stores `url` at `dir/cache_key(url)`.
-        let path: Arc<Path> = dir.join(images::cache_key(&url)).into();
-        let decode = <ImageAssetLoader as Asset>::load(Resource::Path(path), cx);
-        async move {
-            images::cached_image(&url, &dir)
-                .map_err(|err| ImageCacheError::Other(Arc::new(err)))?;
-            decode.await
-        }
+        let load = images::load_render_image(url.to_string(), dir);
+        async move { load.await.map_err(|err| ImageCacheError::Asset(err.into())) }
     }
 }
 
@@ -64,6 +57,14 @@ impl<T: Clone> ImagePolicy<T> {
             loaded: HashMap::new(),
             failed: HashMap::new(),
         }
+    }
+
+    /// O(1) lookup for an already-decoded image, bumping its recency tick.
+    fn get_loaded(&mut self, url: &str) -> Option<T> {
+        let entry = self.loaded.get_mut(url)?;
+        self.tick += 1;
+        entry.0 = self.tick;
+        Some(entry.1.clone())
     }
 
     /// Notes that `url` was drawn; returns the image evicted to make room.
@@ -113,35 +114,40 @@ impl Default for Images {
 
 impl Global for Images {}
 
-/// Loads `url` for this frame: evicts the least recently drawn image once
-/// too many are decoded, and forgets failures so a later frame retries.
+/// Loads `url` for this frame: serves already-decoded images in O(1) without
+/// touching GPUI's asset table, evicts the least recently drawn image once too
+/// many are decoded, and forgets failures so a later frame retries.
 fn use_remote(
     url: &SharedString,
     window: &mut Window,
     cx: &mut App,
 ) -> Option<Result<Arc<RenderImage>, ImageCacheError>> {
+    if let Some(image) = cx.default_global::<Images>().0.get_loaded(url) {
+        return Some(Ok(image));
+    }
     let now = Instant::now();
     if cx.default_global::<Images>().0.waiting(url, now) {
         return Some(Err(ImageCacheError::Asset("waiting to retry".into())));
     }
     let result = window.use_asset::<RemoteImage>(url, cx)?;
+    // Once resolved, Images owns the cache entry; removing from GPUI's asset
+    // table avoids duplicate references and per-frame Box/Any round-trips.
+    cx.remove_asset::<RemoteImage>(url);
     match &result {
         Ok(image) => {
-            if let Some((old_url, old)) = cx.default_global::<Images>().0.drawn(url, image) {
-                cx.remove_asset::<RemoteImage>(&old_url.into());
+            if let Some((_, old)) = cx.default_global::<Images>().0.drawn(url, image) {
                 cx.drop_image(old, Some(window));
             }
         }
         Err(_) => {
             cx.default_global::<Images>().0.failed(url, now);
-            cx.remove_asset::<RemoteImage>(url);
         }
     }
     Some(result)
 }
 
-/// An image filling its parent (cover fit), with a shimmer while it loads
-/// and a plain tile when there is none.
+/// An image filling its parent (cover fit), with a quiet surface tile while it
+/// loads or when unavailable.
 pub fn remote_image(url: &str) -> Img {
     let url = SharedString::from(url.to_string());
     img(move |window: &mut Window, cx: &mut App| {
@@ -152,7 +158,7 @@ pub fn remote_image(url: &str) -> Img {
     })
     .size_full()
     .object_fit(ObjectFit::Cover)
-    .with_loading(|| shimmer().into_any_element())
+    .with_loading(|| div().size_full().bg(theme::raised()).into_any_element())
     .with_fallback(|| div().size_full().bg(theme::raised()).into_any_element())
 }
 
