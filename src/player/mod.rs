@@ -113,8 +113,21 @@ struct FrameSlot {
     /// False from `stop` until the next `load`: mpv may still hand out
     /// frames while it tears playback down.
     live: bool,
+    opening: Opening,
     /// A frame was published since the last clear, even if it was taken.
     shown: bool,
+}
+
+/// How far a just-loaded file is into mpv's start-up. mpv keeps rendering
+/// the previous file's last frame until the new one plays, which shows when
+/// the next episode loads the moment the last one stops, so frames are only
+/// published once the new file has started and begun playing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Opening {
+    #[default]
+    Done,
+    AwaitStart,
+    AwaitPlayback,
 }
 
 impl FrameSlot {
@@ -344,6 +357,7 @@ impl MpvPlayer {
             let mut slot = lock(&self.shared.frame);
             slot.clear();
             slot.live = true;
+            slot.opening = Opening::AwaitStart;
         }
         let opts = loadfile_options(s, start_secs);
         let mut rc = self
@@ -500,14 +514,6 @@ fn init(api: &Api, mpv: *mut MpvHandle, hwdec: &CStr) -> Result<RenderCtx, Playe
         // Prefer English when falling back to embedded/multi-track subtitles;
         // external `--sub-file` tracks still take precedence automatically.
         (c"slang", c"en,eng,english"),
-        // Measured on HLS streams: skips ytdl probing, renders the first frame
-        // without waiting for the cache fill threshold, keeps 20 s buffered
-        // ahead for seeks, and selects the top HLS variant directly.
-        (c"ytdl", c"no"),
-        (c"cache", c"yes"),
-        (c"cache-pause-initial", c"no"),
-        (c"demuxer-readahead-secs", c"20"),
-        (c"hls-bitrate", c"max"),
     ] {
         // SAFETY: valid handle and static C strings.
         check(unsafe { (api.set_option_string)(mpv, name.as_ptr(), value.as_ptr()) })?;
@@ -601,7 +607,7 @@ fn render_loop(shared: &Shared, ctx: RenderCtx) {
         };
         {
             let mut slot = lock(&shared.frame);
-            if !slot.live || slot.generation != generation {
+            if !slot.live || slot.opening != Opening::Done || slot.generation != generation {
                 continue;
             }
             serial += 1;
@@ -692,7 +698,21 @@ fn event_loop(shared: &Shared) {
             ffi::MPV_EVENT_SHUTDOWN => break,
             // Events are ordered, so this also drops an error from a file
             // replaced before its failure was reported.
-            ffi::MPV_EVENT_START_FILE => *lock(&shared.last_error) = None,
+            ffi::MPV_EVENT_START_FILE => {
+                *lock(&shared.last_error) = None;
+                let mut slot = lock(&shared.frame);
+                if slot.opening == Opening::AwaitStart {
+                    slot.opening = Opening::AwaitPlayback;
+                }
+            }
+            ffi::MPV_EVENT_PLAYBACK_RESTART => {
+                let mut slot = lock(&shared.frame);
+                if slot.opening == Opening::AwaitPlayback {
+                    slot.opening = Opening::Done;
+                    // A render begun before this may hold the old frame.
+                    slot.generation += 1;
+                }
+            }
             ffi::MPV_EVENT_END_FILE if !event.data.is_null() => {
                 // SAFETY: END_FILE carries an mpv_event_end_file.
                 let end = unsafe { &*(event.data as *const MpvEventEndFile) };
@@ -895,6 +915,71 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         check()
+    }
+
+    /// A 2 s `color` clip, or `None` without ffmpeg.
+    fn color_clip(dir: &Path, color: &str) -> Option<PathBuf> {
+        let clip = dir.join(format!("{color}.mkv"));
+        Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg(format!("color=c={color}:s=64x64:d=2"))
+            .args(["-y"])
+            .arg(&clip)
+            .stdin(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+            .then_some(clip)
+    }
+
+    #[test]
+    fn next_file_never_shows_the_previous_files_frame() {
+        let dir = std::env::temp_dir().join(format!("ani-gui-player-next-{}", std::process::id()));
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let (Some(red), Some(blue)) = (color_clip(&dir, "red"), color_clip(&dir, "blue")) else {
+            eprintln!("skipping: ffmpeg is not available to generate test clips");
+            return;
+        };
+        let Some(player) = test_player() else { return };
+        let stream = |path: &Path| Stream {
+            url: path.to_string_lossy().into_owned(),
+            referrer: None,
+            audio_file: None,
+            sub_file: None,
+            title: None,
+        };
+        // The centre pixel (the clip is square, the frame letterboxed), BGRA.
+        let centre = |f: &Frame| {
+            let i = ((f.height / 2 * f.width + f.width / 2) * 4) as usize;
+            [f.data[i], f.data[i + 1], f.data[i + 2]]
+        };
+        let reddish = |f: &Frame| matches!(centre(f), [b, _, r] if r > 200 && b < 60);
+        player.load(&stream(&red), 0.0).expect("load red");
+        assert!(
+            wait_for(Duration::from_secs(5), || player
+                .take_frame()
+                .is_some_and(|f| reddish(&f))),
+            "no red frame"
+        );
+        // As advancing to an already-found episode does: no wait between.
+        player.stop();
+        player.load(&stream(&blue), 0.0).expect("load blue");
+        let mut first = None;
+        assert!(
+            wait_for(Duration::from_secs(5), || {
+                first = player.take_frame();
+                first.is_some()
+            }),
+            "no frame after loading the next file"
+        );
+        let [b, _, r] = centre(&first.unwrap());
+        assert!(
+            b > 200 && r < 60,
+            "first frame isn't the blue clip's: b={b} r={r}"
+        );
+        drop(player);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
