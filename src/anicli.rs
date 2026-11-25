@@ -55,7 +55,9 @@ const EXTRA_BIN_DIRS: &[&str] = if cfg!(target_os = "macos") {
 };
 
 /// The `ani-cli` executable on PATH, else in `~/.local/bin` or one of
-/// [`EXTRA_BIN_DIRS`].
+/// [`EXTRA_BIN_DIRS`], else the copy a packaged build (.dmg, .deb,
+/// AppImage) ships. The user's own comes first: it can be updated with
+/// `ani-cli -U` when a provider changes, the bundled one only with the app.
 pub fn find() -> Option<PathBuf> {
     let path = env::var_os("PATH").unwrap_or_default();
     env::split_paths(&path)
@@ -63,6 +65,7 @@ pub fn find() -> Option<PathBuf> {
         .chain(env::home_dir().map(|home| home.join(".local/bin")))
         .chain(EXTRA_BIN_DIRS.iter().map(PathBuf::from))
         .map(|dir| dir.join("ani-cli"))
+        .chain(crate::paths::exe_prefix().map(|p| crate::paths::bundled_ani_cli(&p)))
         .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }
 

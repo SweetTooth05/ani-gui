@@ -36,6 +36,24 @@ fn xdg_base(value: Option<OsString>, home: &Path, fallback: &str) -> PathBuf {
     }
 }
 
+/// The folder above the one holding the running binary: `Contents` in
+/// `ani-gui.app/Contents/MacOS/ani-gui`, else the install prefix (`/usr` for
+/// the .deb, `usr` inside the AppImage, `~/.local` for `make install`).
+/// Packaged builds keep ani-cli and libmpv under it.
+pub fn exe_prefix() -> Option<PathBuf> {
+    let exe = env::current_exe().ok()?;
+    Some(exe.parent()?.parent()?.to_path_buf())
+}
+
+/// Where a packaged build keeps the ani-cli it ships, under [`exe_prefix`].
+pub fn bundled_ani_cli(prefix: &Path) -> PathBuf {
+    if cfg!(target_os = "macos") {
+        prefix.join("Resources/bin/ani-cli")
+    } else {
+        prefix.join("lib/ani-gui/bin/ani-cli")
+    }
+}
+
 pub fn data_dir() -> PathBuf {
     xdg_base(env::var_os("XDG_DATA_HOME"), &home(), DATA_FALLBACK).join(APP_DIR)
 }

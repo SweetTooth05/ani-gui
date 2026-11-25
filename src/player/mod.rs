@@ -30,8 +30,26 @@ const LIBRARIES: &[&str] = if cfg!(target_os = "macos") {
         "/usr/local/lib/libmpv.dylib",
     ]
 } else {
-    &["libmpv.so.2"]
+    // libmpv.so.1 (mpv 0.32–0.35, e.g. Ubuntu 22.04) has the same render API.
+    &["libmpv.so.2", "libmpv.so.1"]
 };
+
+/// The libmpv a packaged build ships (inside the .app, or the AppImage's
+/// `usr/lib`), then [`LIBRARIES`].
+fn library_candidates() -> Vec<String> {
+    let bundled: &[&str] = if cfg!(target_os = "macos") {
+        &["Frameworks/libmpv.2.dylib"]
+    } else {
+        &["lib/libmpv.so.2", "lib/libmpv.so.1"]
+    };
+    crate::paths::exe_prefix()
+        .into_iter()
+        .flat_map(|prefix| bundled.iter().map(move |rel| prefix.join(rel)))
+        .filter(|path| path.is_file())
+        .map(|path| path.to_string_lossy().into_owned())
+        .chain(LIBRARIES.iter().map(|name| name.to_string()))
+        .collect()
+}
 const HWDEC: &CStr = c"auto-copy";
 const DEFAULT_SIZE: (u32, u32) = (1280, 720);
 const MAX_SIDE: u32 = 16384;
@@ -237,7 +255,8 @@ unsafe extern "C" fn on_render_update(ctx: *mut c_void) {
 /// mpv. The library stays loaded: unloading it buys nothing and libmpv is
 /// not written to be unloaded.
 pub fn probe_library() -> Result<(), String> {
-    let api = load_api(LIBRARIES)?;
+    let names = library_candidates();
+    let api = load_api(&names.iter().map(String::as_str).collect::<Vec<_>>())?;
     std::mem::forget(api);
     Ok(())
 }
@@ -270,7 +289,8 @@ pub struct MpvPlayer {
 
 impl MpvPlayer {
     pub fn new() -> Result<MpvPlayer, PlayerError> {
-        MpvPlayer::with_library(LIBRARIES, HWDEC)
+        let names = library_candidates();
+        MpvPlayer::with_library(&names.iter().map(String::as_str).collect::<Vec<_>>(), HWDEC)
     }
 
     fn with_library(names: &[&str], hwdec: &CStr) -> Result<MpvPlayer, PlayerError> {
@@ -889,7 +909,7 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(LIBRARIES[0], "libmpv.2.dylib");
         } else {
-            assert_eq!(LIBRARIES, ["libmpv.so.2"]);
+            assert_eq!(LIBRARIES, ["libmpv.so.2", "libmpv.so.1"]);
         }
     }
 

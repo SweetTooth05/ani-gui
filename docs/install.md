@@ -1,12 +1,32 @@
 # Installing ani-gui
 
-Linux first, then [macOS](#macos). The packages each needs are in the [README](../README.md#dependencies).
+The quickest way is a download button in the [README](../README.md#install).
+This page covers the details and the other ways: Linux first, then
+[macOS](#macos).
 
 ## Linux
 
-### From the latest release (recommended)
+### .deb and AppImage
 
-One command, no root and no build tools. It installs into `~/.local`:
+- **`ani-gui-linux-amd64.deb`** (Debian, Ubuntu 22.04+, Mint, Pop!_OS):
+  double-click it, or `sudo apt install ./ani-gui-linux-amd64.deb`. It
+  installs into `/usr` and pulls in libmpv, curl and the other libraries;
+  yt-dlp and ffmpeg (for downloads) come as recommendations. Remove it with
+  `sudo apt remove ani-gui`.
+- **`ani-gui-linux-x86_64.AppImage`** (any distribution with glibc 2.35 or
+  newer): libmpv and its libraries are inside. Make it executable
+  (`chmod +x`, or Properties → Executable as Program) and run it. Delete the
+  file to remove it.
+
+Both include ani-cli, used when you haven't installed your own. Neither can
+replace itself (the .deb lives in `/usr`, the AppImage is read-only), so
+ani-gui tells you when a new version is out and links to the download.
+
+### Into `~/.local` from the terminal
+
+One command, no root and no build tools, and ani-gui then updates itself
+(see [Updates](#updates)). You need the [dependencies](#dependencies) below,
+except ani-cli, which the archive includes:
 
 ```sh
 v=$(curl -fsSL https://api.github.com/repos/SweetTooth05/ani-gui/releases/latest \
@@ -30,7 +50,36 @@ another app left in `~/.local/share/icons` would otherwise look up to date
 and hide ani-gui's icon. To check a download's signature by hand first, see
 [releasing.md](releasing.md#verifying-a-release-by-hand).
 
+### Dependencies
+
+For the `~/.local` install and builds from source (the .deb and AppImage
+bring their own). Linux on X11 or Wayland with a Vulkan-capable GPU, plus:
+
+| Package | Why |
+|---|---|
+| `libmpv2` (or `libmpv1`) | Plays video in the window; everything else works without it |
+| `curl`, `grep`, `sed` | Used by ani-cli |
+| `yt-dlp`, `ffmpeg` | Downloads |
+| [`ani-cli`](https://github.com/pystardust/ani-cli) | Finds each episode's stream; included in the release archive, needed for source builds |
+
+```sh
+sudo apt install libmpv2 curl yt-dlp ffmpeg
+# ani-cli, for source builds (it isn't packaged on most distros):
+mkdir -p ~/.local/bin
+curl -sL https://raw.githubusercontent.com/pystardust/ani-cli/master/ani-cli -o ~/.local/bin/ani-cli
+chmod +x ~/.local/bin/ani-cli
+```
+
 ### From source
+
+A recent stable [Rust](https://rustup.rs) and these development packages:
+
+```sh
+sudo apt install build-essential pkg-config libxkbcommon-x11-dev libxkbcommon-dev \
+  libwayland-dev libvulkan-dev libfontconfig-dev libfreetype-dev libxcb1-dev
+```
+
+Then:
 
 ```sh
 git clone https://github.com/SweetTooth05/ani-gui.git
@@ -93,41 +142,31 @@ clean slate.
 
 ## macOS
 
-ani-gui also runs on macOS 11 or later, on Apple Silicon and Intel Macs. It
-comes as an `ani-gui.app` bundle.
-
-### Prerequisites
-
-Install the tools with [Homebrew](https://brew.sh):
-
-```sh
-brew install mpv ani-cli yt-dlp ffmpeg
-```
-
-`mpv` provides libmpv, which plays the video. ani-gui finds it in
-Homebrew's `/opt/homebrew/lib` (Apple Silicon) or `/usr/local/lib` (Intel).
-It also finds `ani-cli` and the other tools in Homebrew's `bin` folders, even
-when the app is started from Finder. **Settings → Diagnostics** shows what
-it found.
+ani-gui runs on Apple Silicon and Intel Macs, on macOS @MACOS_MIN@ or later.
+It comes as an `ani-gui.app` bundle with libmpv (video playback) and ani-cli
+inside, so it needs nothing else: no Homebrew.
 
 ### From a release
 
-Download `ani-gui-<version>-aarch64-apple-darwin.tar.gz` (Apple Silicon) or
-`...-x86_64-apple-darwin.tar.gz` (Intel) from the
+Download `ani-gui-macos-arm64.dmg` (Apple Silicon) or
+`ani-gui-macos-x86_64.dmg` (Intel) with the [README](../README.md#install)'s
+buttons or from the
 [latest release](https://github.com/SweetTooth05/ani-gui/releases/latest),
-then unpack it into an Applications folder:
+open it and drag **ani-gui** onto **Applications**. Then see
+[the first launch](#the-first-launch-gatekeeper).
 
-```sh
-mkdir -p ~/Applications
-tar -xzf ani-gui-*-apple-darwin.tar.gz -C ~/Applications
-```
+The same app also comes as `ani-gui-<version>-<arch>-apple-darwin.tar.gz`,
+for `tar -xzf … -C ~/Applications` in a terminal.
 
-Use `/Applications` instead of `~/Applications` to install it for every user.
+If you have your own ani-cli (for example `brew install ani-cli`), ani-gui
+uses it instead of the built-in one. Downloading episodes needs `yt-dlp` and
+`ffmpeg` (`brew install yt-dlp ffmpeg`); watching doesn't.
 
 ### From source
 
-You need [rustup](https://rustup.rs) and the Xcode Command Line Tools
-(`xcode-select --install`). Then:
+You need [rustup](https://rustup.rs), the Xcode Command Line Tools
+(`xcode-select --install`) and, to bundle libmpv into the app, Homebrew's
+`brew install mpv dylibbundler` (on the build machine only). Then:
 
 ```sh
 git clone https://github.com/SweetTooth05/ani-gui.git
@@ -137,7 +176,9 @@ cp -R target/release/ani-gui.app ~/Applications/
 ```
 
 `make app` builds the release binary and wraps it in
-`target/release/ani-gui.app`, with its icon, signed ad hoc.
+`target/release/ani-gui.app` with its icon, libmpv and ani-cli, signed ad
+hoc. `packaging/macos/build-dmg.sh target/release/ani-gui.app ani-gui.dmg`
+makes the disk image.
 
 ### The first launch (Gatekeeper)
 

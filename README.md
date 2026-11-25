@@ -23,60 +23,45 @@ ani-cli does the stream extraction, ani-gui keeps working as ani-cli updates.
 [Troubleshooting](docs/troubleshooting.md) ·
 [Contributing](CONTRIBUTING.md)
 
+## Install
+
+<p align="center">
+  <a href="https://github.com/SweetTooth05/ani-gui/releases/latest/download/ani-gui-macos-arm64.dmg"><img src="https://img.shields.io/badge/Download-macOS%20(Apple%20Silicon)-111?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS (Apple Silicon)"></a>
+  <a href="https://github.com/SweetTooth05/ani-gui/releases/latest/download/ani-gui-macos-x86_64.dmg"><img src="https://img.shields.io/badge/Download-macOS%20(Intel)-111?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS (Intel)"></a>
+  <br>
+  <a href="https://github.com/SweetTooth05/ani-gui/releases/latest/download/ani-gui-linux-amd64.deb"><img src="https://img.shields.io/badge/Download-Linux%20(.deb)-E95420?style=for-the-badge&logo=ubuntu&logoColor=white" alt="Download for Linux (.deb)"></a>
+  <a href="https://github.com/SweetTooth05/ani-gui/releases/latest/download/ani-gui-linux-x86_64.AppImage"><img src="https://img.shields.io/badge/Download-Linux%20(AppImage)-333?style=for-the-badge&logo=linux&logoColor=white" alt="Download for Linux (AppImage)"></a>
+</p>
+
+**macOS** (Apple menu → About This Mac tells you Apple Silicon or Intel):
+open the `.dmg` and drag **ani-gui** onto **Applications**. The first time,
+macOS says it can't verify the app (it isn't notarized by Apple): open it once,
+then click **Open Anyway** in **System Settings → Privacy & Security**.
+Nothing else to install; video playback and ani-cli are built in.
+
+**Ubuntu, Debian, Mint, Pop!_OS**: double-click the `.deb` and choose
+**Install**. It installs what ani-gui needs (libmpv and friends) with it.
+
+**Other Linux distributions**: download the AppImage, right-click it →
+**Properties** → allow **Executable as Program**, then double-click it.
+
+All downloads include ani-cli. The app keeps itself up to date (the `.deb` and
+AppImage tell you when a new version is out). More options, such as installing
+into `~/.local` from the terminal or building from source, are in the
+[install guide](docs/install.md).
+
 ## Dependencies
 
-**Linux** on X11 or Wayland with a Vulkan-capable GPU, plus:
+None for the downloads above, on a desktop with a Vulkan-capable GPU (Linux)
+or macOS. Optional extras:
 
 | Package | Why |
 |---|---|
-| [`ani-cli`](https://github.com/pystardust/ani-cli) | Finds each episode's stream (needs `curl`, `grep`, `sed`; `fzf` for terminal use) |
-| `libmpv2` | Plays video in the window; everything else works without it |
-| `yt-dlp`, `ffmpeg` | Downloads |
+| `yt-dlp`, `ffmpeg` | Downloading episodes to watch offline (the `.deb` suggests them) |
+| [`ani-cli`](https://github.com/pystardust/ani-cli) | Your own copy is used instead of the built-in one, so `ani-cli -U` can update it when a site changes |
 
-```sh
-sudo apt install libmpv2 curl fzf yt-dlp ffmpeg
-# ani-cli isn't packaged on most distros:
-mkdir -p ~/.local/bin
-curl -sL https://raw.githubusercontent.com/pystardust/ani-cli/master/ani-cli -o ~/.local/bin/ani-cli
-chmod +x ~/.local/bin/ani-cli
-```
-
-**macOS** 11 or later: `brew install mpv ani-cli yt-dlp ffmpeg`.
-
-Building from source also needs [Rust](https://rustup.rs) and, on Linux:
-
-```sh
-sudo apt install build-essential pkg-config libxkbcommon-x11-dev libxkbcommon-dev \
-  libwayland-dev libvulkan-dev libfontconfig-dev libfreetype-dev libxcb1-dev
-```
-
-## Install
-
-From the latest release, into `~/.local` (no root, no build tools):
-
-```sh
-v=$(curl -fsSL https://api.github.com/repos/SweetTooth05/ani-gui/releases/latest \
-      | sed -n 's/.*"tag_name": *"v\([0-9.]*\)".*/\1/p') &&
-  [ -n "$v" ] && mkdir -p ~/.local &&
-  curl -fL "https://github.com/SweetTooth05/ani-gui/releases/download/v$v/ani-gui-$v-x86_64-unknown-linux-gnu.tar.gz" \
-    | tar -xz -C ~/.local --strip-components=1 &&
-  sed -i "s|^Exec=ani-gui\$|Exec=$HOME/.local/bin/ani-gui|" \
-    ~/.local/share/applications/io.github.sweettooth05.AniGui.desktop &&
-  { gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor
-    update-desktop-database ~/.local/share/applications; } >/dev/null 2>&1; true
-```
-
-Or from source:
-
-```sh
-git clone https://github.com/SweetTooth05/ani-gui.git
-cd ani-gui
-make && make install
-```
-
-ani-gui then appears in your app menu and keeps itself up to date from
-GitHub Releases. For macOS, system-wide installs, updates and uninstalling,
-see the [install guide](docs/install.md).
+Building from source needs [Rust](https://rustup.rs) and, on Linux, the
+packages listed in the [install guide](docs/install.md#from-source).
 
 ## License
 

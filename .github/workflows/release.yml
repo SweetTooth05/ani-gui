@@ -65,8 +65,8 @@ jobs:
             os: macos-15-intel
           # Every entry writes dist/ani-gui-<version>-<target>.tar.gz. The
           # archive name must carry the target triple: the updater picks its
-          # asset by it, and the release job signs every dist/*.tar.gz it
-          # receives.
+          # asset by it. Linux also writes the .deb and AppImage, macOS a .dmg;
+          # the release job lists all of them in the signed SHA256SUMS.
     env:
       TARGET: ${{ matrix.target }}
       VERSION: ${{ needs.version.outputs.version }}
@@ -93,6 +93,13 @@ jobs:
           rustup toolchain install stable --profile minimal --target "$TARGET"
           rustup default stable
 
+      # libmpv and dylibbundler, on the runner only: build-app.sh copies
+      # libmpv into the .app, so users don't need Homebrew. Also lets the
+      # playback tests run.
+      - name: Install mpv (macOS)
+        if: runner.os == 'macOS'
+        run: brew install mpv dylibbundler
+
       # Matches LSMinimumSystemVersion in packaging/macos/Info.plist.
       - name: Set the macOS deployment target
         if: runner.os == 'macOS'
@@ -106,20 +113,38 @@ jobs:
 
       # A prefix tree, so `tar -xzf ... -C ~/.local --strip-components=1`
       # installs it. The launcher entry runs `ani-gui` from PATH; the
-      # README's install command points it at the absolute path.
+      # README's install command points it at the absolute path. It carries
+      # ani-cli in lib/ani-gui/bin, where the app looks when none is installed.
       - name: Package
         if: runner.os == 'Linux'
         run: |
           set -euo pipefail
           stem="ani-gui-${VERSION}-${TARGET}"
           stage="$RUNNER_TEMP/stage"
+          ani_cli="$RUNNER_TEMP/ani-cli"
+          packaging/fetch-ani-cli.sh "$ani_cli"
           make install DESTDIR="$stage/$stem" PREFIX= DESKTOP_EXEC=ani-gui \
             BIN="target/$TARGET/release/ani-gui"
+          install -Dm755 "$ani_cli/ani-cli" "$stage/$stem/lib/ani-gui/bin/ani-cli"
           test -x "$stage/$stem/bin/ani-gui"
           mkdir -p dist
           tar --sort=name --owner=0 --group=0 --numeric-owner \
             -czf "dist/$stem.tar.gz" -C "$stage" "$stem"
           tar -tzvf "dist/$stem.tar.gz"
+
+      # The README's download buttons link to these by fixed names, through
+      # releases/latest/download/.
+      - name: Package .deb and AppImage
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          packaging/linux/build-deb.sh "target/$TARGET/release/ani-gui" "$RUNNER_TEMP/ani-cli" dist
+          packaging/linux/build-appimage.sh "target/$TARGET/release/ani-gui" "$RUNNER_TEMP/ani-cli" dist
+          # The AppImage starts and finds its bundled libmpv.
+          ./dist/ani-gui-linux-x86_64.AppImage --appimage-extract >/dev/null
+          test -x squashfs-root/usr/lib/ani-gui/bin/ani-cli
+          ls squashfs-root/usr/lib/libmpv.so.*
+          rm -rf squashfs-root
 
       # ani-gui.app at the top of the archive, so
       # `tar -xzf ... -C ~/Applications` installs it. The updater expects
@@ -151,11 +176,19 @@ jobs:
             echo "::error::The archive has AppleDouble files"
             exit 1
           fi
+          # The libmpv inside loads without Homebrew's copy around.
+          python3 -c 'import ctypes, sys; ctypes.CDLL(sys.argv[1])' \
+            "$app/Contents/Frameworks/libmpv.2.dylib"
+          packaging/macos/build-dmg.sh "$app" "dist/ani-gui-macos-$arch.dmg"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: archive-${{ matrix.target }}
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/*.deb
+            dist/*.AppImage
+            dist/*.dmg
           if-no-files-found: error
           retention-days: 7
 
@@ -188,7 +221,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s failglob
-          sha256sum -- *.tar.gz > SHA256SUMS
+          sha256sum -- *.tar.gz *.deb *.AppImage *.dmg > SHA256SUMS
           cat SHA256SUMS
 
       - name: Sign SHA256SUMS
@@ -229,4 +262,5 @@ jobs:
             --verify-tag \
             --title "ani-gui $VERSION" \
             --generate-notes \
-            dist/*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sig
+            dist/*.tar.gz dist/*.deb dist/*.AppImage dist/*.dmg \
+            dist/SHA256SUMS dist/SHA256SUMS.sig
