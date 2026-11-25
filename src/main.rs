@@ -107,11 +107,6 @@ fn main() {
             }
         })
         .detach();
-        cx.on_app_quit(|_| {
-            anicli::cancel_all_resolves();
-            async {}
-        })
-        .detach();
         let opened = cx.open_window(options, |window, cx| {
             #[cfg(target_os = "linux")]
             window
