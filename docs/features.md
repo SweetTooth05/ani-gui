@@ -8,7 +8,9 @@
   marks what you've watched.
 - **In-window playback** through libmpv: seek bar, volume, fullscreen, external
   subtitle and audio tracks, autoplay of the next episode, and resume from where
-  you stopped.
+  you stopped. **Skip intro** and **Next episode** appear only during the
+  opening and ending (timestamps from AniSkip, or the video's chapters), and the
+  controls hide after a moment without mouse movement.
 - **My List** for the shows you want to keep track of, plus your
   MyAnimeList and/or AniList list grouped by status.
 - **MyAnimeList and AniList sync** (optional): imports what you've watched,
@@ -33,4 +35,6 @@
 | N | Next episode |
 | Esc | Leave fullscreen, then the player |
 | Alt+← | Back (anywhere in the app) |
+| F11 | Fullscreen (anywhere in the app) |
+| Ctrl+W / Ctrl+Q | Close the window / quit (Linux) |
 
