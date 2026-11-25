@@ -1,20 +1,151 @@
 //! Playback flow rules shared by the player view and the Show page.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
 use crate::anicli::{self, ResolveHandle, ResolveOutcome};
 use crate::db::{Db, lock};
 use crate::downloads::DownloadManager;
-use crate::model::{DlStatus, DownloadRecord, EpisodeRequest, Mode, Progress, ShowSummary};
+use crate::model::{DlStatus, DownloadRecord, EpisodeRequest, Mode, Progress, ShowSummary, Stream};
 use crate::player::PlaybackState;
 use crate::progress;
 
 /// Seconds of playback movement between progress saves.
 const SAVE_EVERY: f64 = 5.0;
+/// How long a resolved stream URL stays reusable for replay / pre-resolve.
+/// Signed HLS URLs expire eventually, so keep this short; the player also
+/// evicts and retries fresh if mpv fails to open a cached URL.
+const STREAM_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const STREAM_CACHE_MAX: usize = 32;
+/// How many seconds before the outro (or before EOF) to start pre-resolving
+/// the next episode in the background.
+const PREFETCH_LEAD_SECS: f64 = 30.0;
+const PREFETCH_REMAINING_SECS: f64 = 120.0;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct StreamKey {
+    show_id: String,
+    mode: Mode,
+    ep: String,
+    quality: String,
+}
+
+impl StreamKey {
+    fn new(show_id: &str, mode: Mode, ep: &str, quality: &str) -> Self {
+        StreamKey {
+            show_id: show_id.to_string(),
+            mode,
+            ep: ep.to_string(),
+            quality: quality.to_string(),
+        }
+    }
+}
+
+struct StreamCache {
+    entries: HashMap<StreamKey, (Stream, Instant)>,
+}
+
+impl StreamCache {
+    fn new() -> Self {
+        StreamCache {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&mut self, key: &StreamKey, now: Instant) -> Option<Stream> {
+        let (stream, stored_at) = self.entries.get(key)?;
+        if now.saturating_duration_since(*stored_at) < STREAM_CACHE_TTL {
+            Some(stream.clone())
+        } else {
+            self.entries.remove(key);
+            None
+        }
+    }
+
+    fn insert(&mut self, key: StreamKey, stream: Stream, now: Instant) {
+        self.entries
+            .retain(|_, (_, t)| now.saturating_duration_since(*t) < STREAM_CACHE_TTL);
+        if self.entries.len() >= STREAM_CACHE_MAX
+            && !self.entries.contains_key(&key)
+            && let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(k, _)| k.clone())
+        {
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(key, (stream, now));
+    }
+
+    fn evict(&mut self, key: &StreamKey) {
+        self.entries.remove(key);
+    }
+
+    fn evict_show(&mut self, show_id: &str) {
+        self.entries.retain(|k, _| k.show_id != show_id);
+    }
+}
+
+static STREAM_CACHE: LazyLock<Mutex<StreamCache>> =
+    LazyLock::new(|| Mutex::new(StreamCache::new()));
+
+fn stream_cache() -> MutexGuard<'static, StreamCache> {
+    STREAM_CACHE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A recently resolved stream for this episode, if still fresh.
+pub fn cached_stream(show_id: &str, mode: Mode, ep: &str, quality: &str) -> Option<Stream> {
+    if repick().contains(show_id) {
+        return None;
+    }
+    stream_cache().get(&StreamKey::new(show_id, mode, ep, quality), Instant::now())
+}
+
+/// Remembers a resolved stream briefly so replaying or advancing to a
+/// pre-resolved episode skips running ani-cli again.
+pub fn cache_stream(show_id: &str, mode: Mode, ep: &str, quality: &str, stream: Stream) {
+    stream_cache().insert(
+        StreamKey::new(show_id, mode, ep, quality),
+        stream,
+        Instant::now(),
+    );
+}
+
+/// Drops one cached stream (e.g. when mpv could not open a stale URL).
+pub fn evict_stream(show_id: &str, mode: Mode, ep: &str, quality: &str) {
+    stream_cache().evict(&StreamKey::new(show_id, mode, ep, quality));
+}
+
+/// Whether playback is close enough to the end of the episode to start
+/// pre-resolving the next episode in the background.
+pub fn should_prefetch_next(
+    state: &PlaybackState,
+    started: bool,
+    outro_start: Option<f64>,
+) -> bool {
+    if !started || state.eof || !state.duration.is_finite() || state.duration <= 0.0 {
+        return false;
+    }
+    if let Some(start) = outro_start
+        && start.is_finite()
+        && start > 0.0
+        && state.time_pos >= (start - PREFETCH_LEAD_SECS).max(0.0)
+    {
+        return true;
+    }
+    let remaining = state.duration - state.time_pos;
+    if state.duration >= PREFETCH_REMAINING_SECS * 2.0 {
+        remaining <= PREFETCH_REMAINING_SECS
+    } else {
+        // For short episodes, prefetch in the last 30%.
+        state.time_pos >= state.duration * 0.70
+    }
+}
 
 /// The episode after `ep`, for "next episode" and autoplay.
 pub fn next_episode(episodes: &[String], ep: &str) -> Option<String> {
@@ -135,6 +266,7 @@ fn repick() -> MutexGuard<'static, BTreeSet<String>> {
 pub fn forget_provider_title(db: &Mutex<Db>, show_id: &str) -> Result<()> {
     lock(db).clear_provider_title(show_id)?;
     repick().insert(show_id.to_string());
+    stream_cache().evict_show(show_id);
     Ok(())
 }
 
@@ -168,8 +300,9 @@ fn title_request(
 }
 
 /// Resolves `ep` of `show` with ani-cli (which records it in its history);
-/// see [`title_request`] for `chosen`. Killed if `owner` is cancelled.
-/// Blocks on ani-cli: call it off the UI thread.
+/// see [`title_request`] for `chosen`. Reuses a freshly cached stream URL when
+/// available. Killed if `owner` is cancelled. Blocks on ani-cli: call it off
+/// the UI thread.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve(
     db: &Mutex<Db>,
@@ -181,8 +314,46 @@ pub fn resolve(
     chosen: Option<&str>,
     owner: &ResolveHandle,
 ) -> Result<ResolveOutcome> {
+    if chosen.is_none()
+        && let Some(stream) = cached_stream(&show.id, mode, ep, quality)
+    {
+        return Ok(ResolveOutcome::Stream(stream));
+    }
     let req = title_request(db, show, ep, mode, quality, chosen)?;
-    anicli::resolve(&req, shims, owner)
+    let outcome = anicli::resolve(&req, shims, owner)?;
+    if let ResolveOutcome::Stream(stream) = &outcome {
+        cache_stream(&show.id, mode, ep, quality, stream.clone());
+    }
+    Ok(outcome)
+}
+
+/// Silently pre-resolves `ep` in the background without touching ani-cli's
+/// history file. Returns `Ok(None)` if the show needs a manual title pick.
+/// Killed if `owner` is cancelled. Call off the UI thread.
+#[allow(clippy::too_many_arguments)]
+pub fn pre_resolve(
+    db: &Mutex<Db>,
+    shims: &Path,
+    show: &ShowSummary,
+    ep: &str,
+    mode: Mode,
+    quality: &str,
+    owner: &ResolveHandle,
+) -> Result<Option<Stream>> {
+    if let Some(stream) = cached_stream(&show.id, mode, ep, quality) {
+        return Ok(Some(stream));
+    }
+    let req = title_request(db, show, ep, mode, quality, None)?;
+    if req.want_titles.is_empty() {
+        return Ok(None);
+    }
+    match anicli::resolve_silent(&req, shims, owner)? {
+        ResolveOutcome::Stream(stream) => {
+            cache_stream(&show.id, mode, ep, quality, stream.clone());
+            Ok(Some(stream))
+        }
+        ResolveOutcome::NeedsPick(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -418,5 +589,66 @@ mod tests {
         assert_eq!(downloaded_file(&list, "s", Mode::Sub, "5"), None);
         assert_eq!(downloaded_file(&list, "other", Mode::Dub, "3"), None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stream_cache_hits_expires_and_evicts() {
+        let mut cache = StreamCache::new();
+        let t0 = Instant::now();
+        let key = StreamKey::new("show-cache", Mode::Sub, "1", "best");
+        let stream = Stream {
+            url: "https://example.invalid/1.m3u8".into(),
+            referrer: None,
+            audio_file: None,
+            sub_file: None,
+            title: None,
+        };
+        cache.insert(key.clone(), stream.clone(), t0);
+        assert_eq!(cache.get(&key, t0 + Duration::from_secs(60)), Some(stream));
+        // Expires at TTL.
+        assert_eq!(cache.get(&key, t0 + STREAM_CACHE_TTL), None);
+
+        // Evicting a show drops all its episodes without touching others.
+        let other = StreamKey::new("other-show", Mode::Sub, "1", "best");
+        let s2 = Stream {
+            url: "https://example.invalid/2.m3u8".into(),
+            referrer: None,
+            audio_file: None,
+            sub_file: None,
+            title: None,
+        };
+        cache.insert(key.clone(), s2.clone(), t0);
+        cache.insert(other.clone(), s2.clone(), t0);
+        cache.evict_show("show-cache");
+        assert_eq!(cache.get(&key, t0), None);
+        assert_eq!(cache.get(&other, t0), Some(s2));
+    }
+
+    #[test]
+    fn should_prefetch_next_triggers_near_outro_or_end() {
+        // Not before playback starts or at EOF.
+        assert!(!should_prefetch_next(&at(1400.0), false, Some(1350.0)));
+        assert!(!should_prefetch_next(
+            &PlaybackState {
+                eof: true,
+                ..at(1440.0)
+            },
+            true,
+            Some(1350.0)
+        ));
+        // Triggers 30 s before outro start.
+        assert!(!should_prefetch_next(&at(1300.0), true, Some(1350.0)));
+        assert!(should_prefetch_next(&at(1320.0), true, Some(1350.0)));
+        // Without outro timestamp: triggers within last 120 s.
+        assert!(!should_prefetch_next(&at(1310.0), true, None));
+        assert!(should_prefetch_next(&at(1320.0), true, None));
+        // Short clip (100 s): triggers at 70%.
+        let short = |pos| PlaybackState {
+            time_pos: pos,
+            duration: 100.0,
+            ..PlaybackState::default()
+        };
+        assert!(!should_prefetch_next(&short(60.0), true, None));
+        assert!(should_prefetch_next(&short(75.0), true, None));
     }
 }

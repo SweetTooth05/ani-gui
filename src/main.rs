@@ -18,6 +18,7 @@ mod playback;
 mod player;
 mod progress;
 mod reviews;
+mod skip_times;
 mod ui;
 mod updater;
 

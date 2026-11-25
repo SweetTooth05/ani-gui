@@ -196,26 +196,46 @@ impl RenderOnce for HudButton {
     }
 }
 
-/// A glass pill with a text label, for occasional actions like skipping
-/// the intro.
-pub fn glass_pill(id: impl Into<ElementId>, label: impl Into<SharedString>) -> gpui::Stateful<Div> {
-    div()
+/// A floating action pill for contextual prompts ("Skip intro", "Next episode")
+/// that may sit directly over bright video while the rest of the HUD is hidden.
+/// `primary` uses the amber accent (for starting the next episode); otherwise
+/// uses a darker frosted glass surface for reliable legibility.
+pub fn floating_pill(
+    id: impl Into<ElementId>,
+    icon_name: &'static str,
+    label: impl Into<SharedString>,
+    primary: bool,
+) -> gpui::Stateful<Div> {
+    let fg: Hsla = if primary {
+        theme::on_accent().into()
+    } else {
+        paper()
+    };
+    let el = div()
         .id(id)
         .flex()
         .flex_none()
         .items_center()
-        .h(px(40.))
+        .gap(px(8.))
+        .h(px(42.))
         .px(px(18.))
         .rounded_full()
-        .bg(glass())
-        .border_1()
-        .border_color(hairline())
         .text_size(px(14.))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(paper())
+        .text_color(fg)
+        .shadow_lg()
         .cursor_pointer()
-        .hover(|s| s.bg(glass_hover()))
-        .child(label.into())
+        .child(icon(icon_name).size(px(16.)).text_color(fg))
+        .child(label.into());
+    if primary {
+        el.bg(theme::accent())
+            .hover(|s| s.bg(theme::accent_hover()))
+    } else {
+        el.bg(gpui::black().opacity(0.68))
+            .border_1()
+            .border_color(gpui::white().opacity(0.24))
+            .hover(|s| s.bg(gpui::black().opacity(0.84)))
+    }
 }
 
 /// A short vertical rule between groups of controls.
