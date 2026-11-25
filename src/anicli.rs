@@ -935,19 +935,31 @@ fn prepare_subtitles(
         candidates.push(first);
     }
 
+    // Fetched side by side, so several candidates cost one timeout, not one
+    // each, before playback starts.
+    let referrer = stream.referrer.as_deref();
+    let prepared: Vec<PreparedSub> = thread::scope(|scope| {
+        let fetches: Vec<_> = candidates
+            .into_iter()
+            .map(|source| {
+                scope.spawn(move || {
+                    fetch_subtitle_bytes(source, referrer)
+                        .and_then(|bytes| inspect_subtitle(source, bytes))
+                })
+            })
+            .collect();
+        fetches
+            .into_iter()
+            .filter_map(|fetch| fetch.join().ok().flatten())
+            .collect()
+    });
+    if cancelled() {
+        return;
+    }
     let mut best: Option<PreparedSub> = None;
-    for source in candidates {
-        if cancelled() {
-            return;
-        }
-        let Some(bytes) = fetch_subtitle_bytes(source, stream.referrer.as_deref()) else {
-            continue;
-        };
-        let Some(prepared) = inspect_subtitle(source, bytes) else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|b| prepared.score() > b.score()) {
-            best = Some(prepared);
+    for sub in prepared {
+        if best.as_ref().is_none_or(|b| sub.score() > b.score()) {
+            best = Some(sub);
         }
     }
 
