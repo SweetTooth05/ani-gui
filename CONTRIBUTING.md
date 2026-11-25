@@ -18,7 +18,7 @@ Contributions of all sizes are welcome: bug reports, docs, and code.
 ## Getting started
 
 Install the build and runtime dependencies listed in the
-[README](README.md#requirements), then:
+[README](README.md#dependencies), then:
 
 ```sh
 git clone <your-fork>
