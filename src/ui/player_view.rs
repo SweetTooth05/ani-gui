@@ -606,6 +606,24 @@ impl PlayerView {
         .detach();
     }
 
+    /// Synchronously saves the latest playback position before the app exits,
+    /// reusing the player's normal progress snapshot/write path.
+    pub fn save_for_quit(&mut self) {
+        self.keep_awake.set_active(false);
+        if let Some(player) = &self.player {
+            let now = player.state();
+            if now.time_pos > 0.0 {
+                self.started = true;
+            }
+            self.state = now;
+        }
+        if let (Some(progress), Some(db)) = (self.snapshot(), &self.db) {
+            save_progress(db, &progress);
+            self.saved_at = self.state.time_pos;
+        }
+        self.leaving = true;
+    }
+
     /// The view is gone: frees the last frame's texture, saves progress
     /// right here (the app may be quitting, and one upsert is quick) and
     /// tears the player down off the UI thread (mpv waits for its network
@@ -615,9 +633,8 @@ impl PlayerView {
         if let Some(image) = self.image.take() {
             cx.defer(move |cx| cx.drop_image(image, None));
         }
-        let last = if self.leaving { None } else { self.snapshot() };
-        if let (Some(progress), Some(db)) = (last, &self.db) {
-            save_progress(db, &progress);
+        if !self.leaving {
+            self.save_for_quit();
         }
         if let Some(player) = self.player.take() {
             discard(player);
