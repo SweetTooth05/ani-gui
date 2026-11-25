@@ -88,6 +88,23 @@ chmod 644 "$fw/libmpv.2.dylib"
 install_name_tool -id @loader_path/libmpv.2.dylib "$fw/libmpv.2.dylib"
 dylibbundler -of -b -x "$fw/libmpv.2.dylib" -d "$fw" -p @loader_path/ \
 	-s "$brew_prefix/lib" >/dev/null
+# dylibbundler can add the same LC_RPATH twice, and dyld refuses to load a
+# library with a duplicate ("duplicate LC_RPATH"): keep one of each.
+rpaths() {
+	otool -l "$1" | awk '/cmd LC_RPATH/{getline; getline; print $2}'
+}
+for lib in "$fw"/*.dylib; do
+	rpaths "$lib" | sort | uniq -d | while read -r rpath; do
+		while rpaths "$lib" | grep -qxF "$rpath"; do
+			install_name_tool -delete_rpath "$rpath" "$lib" 2>/dev/null || break
+		done
+		install_name_tool -add_rpath "$rpath" "$lib" 2>/dev/null
+	done
+	if [ -n "$(rpaths "$lib" | sort | uniq -d)" ]; then
+		echo "build-app.sh: $(basename "$lib") still has a duplicate LC_RPATH" >&2
+		exit 1
+	fi
+done
 # Nothing may still point into Homebrew: that would only work on Macs that
 # happen to have the same packages installed.
 for lib in "$fw"/*.dylib; do

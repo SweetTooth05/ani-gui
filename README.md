@@ -33,7 +33,7 @@ ani-cli does the stream extraction, ani-gui keeps working as ani-cli updates.
   <a href="https://github.com/SweetTooth05/ani-gui/releases/latest/download/ani-gui-linux-x86_64.AppImage"><img src="https://img.shields.io/badge/Download-Linux%20(AppImage)-333?style=for-the-badge&logo=linux&logoColor=white" alt="Download for Linux (AppImage)"></a>
 </p>
 
-**macOS** (Apple menu → About This Mac tells you Apple Silicon or Intel):
+**macOS 15 or later** (Apple menu → About This Mac tells you Apple Silicon or Intel):
 open the `.dmg` and drag **ani-gui** onto **Applications**. The first time,
 macOS says it can't verify the app (it isn't notarized by Apple): open it once,
 then click **Open Anyway** in **System Settings → Privacy & Security**.

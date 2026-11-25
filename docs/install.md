@@ -142,7 +142,7 @@ clean slate.
 
 ## macOS
 
-ani-gui runs on Apple Silicon and Intel Macs, on macOS @MACOS_MIN@ or later.
+ani-gui runs on Apple Silicon and Intel Macs, on macOS 15 or later.
 It comes as an `ani-gui.app` bundle with libmpv (video playback) and ani-cli
 inside, so it needs nothing else: no Homebrew.
 
