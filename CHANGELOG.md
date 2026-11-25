@@ -4,6 +4,39 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.2] — 2026-11-25
+
+### Added
+- Download buttons in the README: a macOS `.dmg` (Apple Silicon and Intel,
+  macOS 15+) with libmpv and ani-cli inside, so no Homebrew is needed; a
+  `.deb` for Debian/Ubuntu; and an AppImage for other distributions. Every
+  download includes ani-cli.
+- Window title bar on Linux (GNOME/Wayland) with minimise, maximise and close,
+  drag to move, resizable edges; F11 fullscreen, Ctrl+W close, Ctrl+Q quit.
+- Update control at the bottom of the sidebar: check, install, progress and
+  "Restart to update".
+- Animated toasts for installed updates and for downloads starting,
+  finishing or failing.
+- "Skip intro" and "Next episode" appear only during the opening and ending
+  (AniSkip timestamps, else the video's chapters).
+- The loading screen shows the episode's thumbnail (else the show's banner or
+  cover).
+
+### Changed
+- Much faster start-up: the window and cached Home appear at once and refresh
+  in the background; no more launch spinner in the GNOME dock.
+- Smoother scrolling: images decode off the UI thread and long lists only
+  draw what's on screen.
+- The next episode is found ahead of time, so moving on takes about 2.5 s.
+- Player controls hide sooner after the mouse stops, along with the cursor.
+- The README is shorter; details moved to `docs/`.
+
+### Fixed
+- Subtitles vanishing partway through some episodes (e.g. Makeine ep 9):
+  stray blank lines in the provider's subtitle file made mpv stop reading it.
+- The next episode no longer flashes the previous episode's last frame.
+- Ubuntu 22.04's libmpv 1 is now supported.
+
 ## [0.0.1] — 2026-11-25
 
 A ground-up rewrite as a native Linux desktop app. This fork drops the upstream
