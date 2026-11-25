@@ -16,7 +16,7 @@ use crate::downloads::DownloadManager;
 use crate::model::{AniListMedia, DlStatus, Mode, Progress, ShowRecord, ShowSummary};
 use crate::ui::components::button::{ButtonKind, button, segmented};
 use crate::ui::components::icon::icon;
-use crate::ui::components::image::{remote_image, rounded_image, shimmer};
+use crate::ui::components::image::{remote_image, rounded_image};
 use crate::ui::components::pick_dialog::pick_dialog;
 use crate::ui::components::poster::progress_bar;
 use crate::ui::components::text_input::TextInput;
@@ -26,7 +26,7 @@ use crate::ui::metadata::ShowMeta;
 use crate::ui::reviews::ReviewsSection;
 use crate::ui::theme;
 use crate::ui::view_models::{self, EpisodeRow, ShowPageModel, media_title, mode_label};
-use crate::{allanime, catalog, lists, playback};
+use crate::{catalog, lists, playback};
 
 pub const QUALITIES: [(&str, &str); 4] = [
     ("best", "Best"),
@@ -41,6 +41,78 @@ const COVER_W: f32 = 200.;
 const COVER_H: f32 = 300.;
 /// About four lines of the 720 px synopsis.
 const SYNOPSIS_CHARS: usize = 360;
+/// Fixed episode row height (99 px thumbnail + 2*10 px padding) and vertical gap.
+const EP_ROW_H: f32 = 119.;
+const EP_ROW_GAP: f32 = 4.;
+const EP_ROW_STRIDE: f32 = EP_ROW_H + EP_ROW_GAP;
+/// Conservative bounds on where the episode list starts below the header.
+const EP_LIST_MIN_TOP: f32 = 350.;
+const EP_LIST_MAX_TOP: f32 = 1150.;
+
+struct PrecomputedHeader {
+    title: SharedString,
+    banner: Option<String>,
+    cover: Option<String>,
+    score: Option<SharedString>,
+    score_rank: Option<SharedString>,
+    strip: Vec<SharedString>,
+    status: Option<SharedString>,
+    airing: bool,
+    facts: Vec<(&'static str, SharedString)>,
+    genres: SharedString,
+    synopsis: Option<SharedString>,
+}
+
+impl PrecomputedHeader {
+    fn from_parts(
+        fallback_title: &str,
+        show: Option<&ShowSummary>,
+        media: Option<&AniListMedia>,
+    ) -> Self {
+        let title: SharedString = match (media, show) {
+            (Some(m), _) => media_title(m).to_string().into(),
+            (None, Some(s)) => s.display_title().to_string().into(),
+            (None, None) => fallback_title.to_string().into(),
+        };
+        let banner = media
+            .and_then(|m| m.banner_url.clone())
+            .or_else(|| show.map(|s| s.cover_url.clone()));
+        let cover = media
+            .map(|m| m.cover_url.clone())
+            .filter(|c| !c.is_empty())
+            .or_else(|| show.map(|s| s.cover_url.clone()));
+        let ShowMeta {
+            score,
+            score_rank,
+            strip,
+            status,
+            airing,
+            facts,
+        } = media
+            .map(|m| ShowMeta::from_media(m, db::now()))
+            .unwrap_or_default();
+        let genres: SharedString = media
+            .map(|m| m.genres.join(", "))
+            .unwrap_or_default()
+            .into();
+        let synopsis = media
+            .and_then(|m| m.synopsis.as_deref())
+            .map(|s| view_models::clamp_words(&view_models::blurb(s), SYNOPSIS_CHARS).into());
+        PrecomputedHeader {
+            title,
+            banner,
+            cover,
+            score: score.map(Into::into),
+            score_rank: score_rank.map(Into::into),
+            strip: strip.into_iter().map(Into::into).collect(),
+            status: status.map(Into::into),
+            airing,
+            facts: facts.into_iter().map(|(k, v)| (k, v.into())).collect(),
+            genres,
+            synopsis,
+        }
+    }
+}
 
 struct Loaded {
     show: ShowSummary,
@@ -86,6 +158,7 @@ pub struct ShowPage {
     loading_mode: Option<Mode>,
     quality: String,
     loaded: Option<Loaded>,
+    header: PrecomputedHeader,
     load_error: Option<String>,
     model: ShowPageModel,
     page: usize,
@@ -121,6 +194,7 @@ impl ShowPage {
             None => (Mode::default(), "best".to_string(), None),
         };
         let subscription = watch.map(|w| cx.observe(&w, |page, _, cx| page.sync_downloads(cx)));
+        let header = PrecomputedHeader::from_parts(&target.title, target.allanime.as_ref(), None);
         let mut page = ShowPage {
             root,
             target,
@@ -128,6 +202,7 @@ impl ShowPage {
             loading_mode: None,
             quality,
             loaded: None,
+            header,
             load_error: None,
             model: ShowPageModel::default(),
             page: 0,
@@ -168,12 +243,30 @@ impl ShowPage {
         };
         let (db, manager) = (state.db.clone(), state.downloads.clone());
         let mut target = self.target.clone();
+        let initial = self.loaded.is_none();
         if let Some(loaded) = &self.loaded {
             target.allanime = Some(loaded.show.clone());
         }
         self.load_error = None;
         self.loading_mode = (mode != self.mode).then_some(mode);
         let task = cx.spawn(async move |this, cx| {
+            // Paint cached banner, cover, synopsis and facts before network calls finish.
+            if initial {
+                let db_peek = db.clone();
+                let target_peek = target.clone();
+                let preview = cx
+                    .background_spawn(async move { peek_header(&db_peek, &target_peek) })
+                    .await;
+                if let Some(header) = preview {
+                    this.update(cx, |page, cx| {
+                        if page.loaded.is_none() {
+                            page.header = header;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                }
+            }
             let loaded = cx
                 .background_spawn(async move {
                     let loaded = load(&db, &target, mode)?;
@@ -212,6 +305,8 @@ impl ShowPage {
         let Some(l) = &self.loaded else {
             return;
         };
+        self.header =
+            PrecomputedHeader::from_parts(&self.target.title, Some(&l.show), l.media.as_ref());
         let episodes = l.episodes_error.is_none().then_some(l.episodes.as_slice());
         self.model = ShowPageModel::build(
             &l.show,
@@ -552,33 +647,7 @@ impl ShowPage {
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> AnyElement {
-        let loaded = self.loaded.as_ref();
-        let media = loaded.and_then(|l| l.media.as_ref());
-        let title = match (media, loaded) {
-            (Some(m), _) => media_title(m).to_string(),
-            (None, Some(l)) => l.show.display_title().to_string(),
-            (None, None) => self.target.title.clone(),
-        };
-        let banner = media
-            .and_then(|m| m.banner_url.clone())
-            .or_else(|| loaded.map(|l| l.show.cover_url.clone()));
-        let cover = media
-            .map(|m| m.cover_url.clone())
-            .filter(|c| !c.is_empty())
-            .or_else(|| loaded.map(|l| l.show.cover_url.clone()));
-        let ShowMeta {
-            score,
-            score_rank,
-            strip,
-            status,
-            airing,
-            facts,
-        } = media
-            .map(|m| ShowMeta::from_media(m, db::now()))
-            .unwrap_or_default();
-        let synopsis = media.and_then(|m| m.synopsis.clone());
-        let genres = media.map(|m| m.genres.join(", ")).unwrap_or_default();
-
+        let h = &self.header;
         div()
             .flex()
             .flex_col()
@@ -588,9 +657,9 @@ impl ShowPage {
                     .w_full()
                     .h(px(BANNER_H))
                     .overflow_hidden()
-                    .child(div().absolute().inset_0().child(match &banner {
+                    .child(div().absolute().inset_0().child(match &h.banner {
                         Some(url) => remote_image(url).into_any_element(),
-                        None => shimmer().into_any_element(),
+                        None => div().size_full().bg(theme::raised()).into_any_element(),
                     }))
                     .child(div().absolute().inset_0().bg(linear_gradient(
                         0.,
@@ -620,14 +689,13 @@ impl ShowPage {
                             .h(px(COVER_H))
                             .rounded(px(12.))
                             .shadow_lg()
-                            .child(match &cover {
+                            .child(match &h.cover {
                                 Some(url) => rounded_image(url, px(12.), theme::night(), None)
                                     .into_any_element(),
                                 None => div()
                                     .size_full()
                                     .rounded(px(12.))
-                                    .overflow_hidden()
-                                    .child(shimmer())
+                                    .bg(theme::raised())
                                     .into_any_element(),
                             }),
                     )
@@ -645,37 +713,36 @@ impl ShowPage {
                                     .text_size(px(theme::PAGE_TITLE))
                                     .line_height(relative(1.))
                                     .line_clamp(2)
-                                    .child(title),
+                                    .child(h.title.clone()),
                             )
-                            .children(score_line(score, score_rank))
-                            .when(!strip.is_empty() || status.is_some(), |col| {
-                                col.child(metadata_strip(strip, status, airing))
+                            .children(score_line(h.score.clone(), h.score_rank.clone()))
+                            .when(!h.strip.is_empty() || h.status.is_some(), |col| {
+                                col.child(metadata_strip(&h.strip, h.status.clone(), h.airing))
                             })
-                            .when(!genres.is_empty(), |col| {
+                            .when(!h.genres.is_empty(), |col| {
                                 col.child(
                                     div()
                                         .text_size(px(theme::SMALL))
                                         .text_color(theme::text_dim())
                                         .truncate()
-                                        .child(genres),
+                                        .child(h.genres.clone()),
                                 )
                             })
-                            .children(synopsis.map(|s| {
+                            .children(h.synopsis.clone().map(|s| {
                                 div()
                                     .max_w(px(720.))
                                     .text_size(px(theme::BODY))
                                     .line_height(relative(1.55))
                                     .text_color(theme::text_dim())
                                     .line_clamp(4)
-                                    .child(view_models::clamp_words(
-                                        &view_models::blurb(&s),
-                                        SYNOPSIS_CHARS,
-                                    ))
+                                    .child(s)
                             }))
                             .child(self.render_controls(cx)),
                     ),
             )
-            .when(!facts.is_empty(), |header| header.child(facts_block(facts)))
+            .when(!h.facts.is_empty(), |header| {
+                header.child(facts_block(&h.facts))
+            })
             .into_any_element()
     }
 
@@ -788,7 +855,7 @@ impl ShowPage {
             .into_any_element()
     }
 
-    fn render_episodes(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_episodes(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(loaded) = &self.loaded else {
             return div().into_any_element();
         };
@@ -879,17 +946,40 @@ impl ShowPage {
                 })
                 .into_any_element()
         } else {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(4.))
-                .children(
-                    self.model.episodes[start..end]
-                        .iter()
-                        .enumerate()
-                        .map(|(i, row)| self.render_episode(start + i, row, cx)),
-                )
-                .into_any_element()
+            let slice = &self.model.episodes[start..end];
+            let slice_len = slice.len();
+            let (vis_start, vis_end) = if slice_len <= 24 {
+                (0, slice_len)
+            } else {
+                let mut vh = f32::from(self.scroll.bounds().size.height);
+                if vh <= 1.0 {
+                    vh = f32::from(window.viewport_size().height).max(720.0);
+                }
+                let scroll_y = (-f32::from(self.scroll.offset().y)).max(0.0);
+                let top = (scroll_y - EP_LIST_MAX_TOP).max(0.0);
+                let bottom = (scroll_y + vh - EP_LIST_MIN_TOP).max(0.0);
+                let first = ((top / EP_ROW_STRIDE).floor() as usize)
+                    .saturating_sub(2)
+                    .min(slice_len);
+                let last = ((bottom / EP_ROW_STRIDE).ceil() as usize + 2).min(slice_len);
+                (first, last.max(first))
+            };
+            let top_h = vis_start as f32 * EP_ROW_STRIDE;
+            let bottom_h = (slice_len - vis_end) as f32 * EP_ROW_STRIDE;
+            let mut list = div().flex().flex_col();
+            if top_h > 0.0 {
+                list = list.child(div().h(px(top_h)));
+            }
+            list = list.children(
+                slice[vis_start..vis_end]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| self.render_episode(start + vis_start + i, row, cx)),
+            );
+            if bottom_h > 0.0 {
+                list = list.child(div().h(px(bottom_h)));
+            }
+            list.into_any_element()
         };
         div()
             .flex()
@@ -991,6 +1081,8 @@ impl ShowPage {
         div()
             .id(("episode", index))
             .group("episode")
+            .h(px(EP_ROW_H))
+            .mb(px(EP_ROW_GAP))
             .flex()
             .items_center()
             .gap(px(20.))
@@ -1089,7 +1181,7 @@ impl ShowPage {
 }
 
 impl Render for ShowPage {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content: AnyElement = match (&self.loaded, &self.load_error) {
             (None, Some(err)) => div()
                 .flex()
@@ -1130,7 +1222,7 @@ impl Render for ShowPage {
                 .flex_col()
                 .child(self.render_header(cx))
                 .child(self.your_list.clone())
-                .child(self.render_episodes(cx))
+                .child(self.render_episodes(window, cx))
                 .children(self.reviews.clone())
                 .into_any_element(),
         };
@@ -1151,7 +1243,7 @@ impl Render for ShowPage {
 
 /// The amber score and its headline rank, e.g. "★ 9.0  #1 highest rated
 /// all time".
-fn score_line(score: Option<String>, rank: Option<String>) -> Option<gpui::Div> {
+fn score_line(score: Option<SharedString>, rank: Option<SharedString>) -> Option<gpui::Div> {
     let score = score?;
     Some(
         div()
@@ -1182,8 +1274,8 @@ fn score_line(score: Option<String>, rank: Option<String>) -> Option<gpui::Div> 
 
 /// Format, season and length as quiet outlined badges, then the status;
 /// an airing show's status is tinted amber, with its countdown.
-fn metadata_strip(strip: Vec<String>, status: Option<String>, airing: bool) -> gpui::Div {
-    let badge = |text: String| {
+fn metadata_strip(strip: &[SharedString], status: Option<SharedString>, airing: bool) -> gpui::Div {
+    let badge = |text: SharedString| {
         div()
             .px(px(9.))
             .py(px(3.))
@@ -1200,7 +1292,7 @@ fn metadata_strip(strip: Vec<String>, status: Option<String>, airing: bool) -> g
         .text_size(px(theme::SMALL))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme::text_dim())
-        .children(strip.into_iter().map(badge))
+        .children(strip.iter().cloned().map(badge))
         .children(status.map(|status| {
             let accent: gpui::Hsla = theme::accent().into();
             badge(status).when(airing, |b| {
@@ -1217,7 +1309,7 @@ fn metadata_strip(strip: Vec<String>, status: Option<String>, airing: bool) -> g
 
 /// Studio, source, dates and popularity as label-over-value pairs in one
 /// row under the hero.
-fn facts_block(facts: Vec<(&'static str, String)>) -> gpui::Div {
+fn facts_block(facts: &[(&'static str, SharedString)]) -> gpui::Div {
     div()
         .flex()
         .flex_wrap()
@@ -1225,7 +1317,7 @@ fn facts_block(facts: Vec<(&'static str, String)>) -> gpui::Div {
         .gap_y(px(16.))
         .px(theme::gutter())
         .pt(px(36.))
-        .children(facts.into_iter().map(|(label, value)| {
+        .children(facts.iter().map(|(label, value)| {
             div()
                 .flex()
                 .flex_col()
@@ -1234,36 +1326,99 @@ fn facts_block(facts: Vec<(&'static str, String)>) -> gpui::Div {
                     div()
                         .text_size(px(12.))
                         .text_color(theme::text_muted())
-                        .child(label),
+                        .child(*label),
                 )
                 .child(
                     div()
                         .text_size(px(14.))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme::text())
-                        .child(value),
+                        .child(value.clone()),
                 )
         }))
+}
+
+/// Reads any cached AniList/DB show metadata for `target` without network I/O
+/// so the header can paint immediately while the full load runs.
+fn peek_header(db: &Mutex<Db>, target: &ShowRef) -> Option<PrecomputedHeader> {
+    let stored = match (&target.allanime, target.anilist_id) {
+        (Some(show), _) => lock(db).get_show(&show.id).ok().flatten(),
+        (None, Some(id)) => lock(db).show_by_anilist_id(id).ok().flatten(),
+        (None, None) => None,
+    };
+    let anilist_id = target
+        .allanime
+        .as_ref()
+        .and_then(|s| s.anilist_id)
+        .or(target.anilist_id)
+        .or_else(|| stored.as_ref().and_then(|s| s.summary.anilist_id));
+    let cached_media = anilist_id
+        .and_then(|id| catalog::media_cached(db, id))
+        .or_else(|| stored.as_ref().and_then(|s| s.media.clone()));
+    let show = target
+        .allanime
+        .as_ref()
+        .or_else(|| stored.as_ref().map(|s| &s.summary));
+    if show.is_none() && cached_media.is_none() {
+        return None;
+    }
+    Some(PrecomputedHeader::from_parts(
+        &target.title,
+        show,
+        cached_media.as_ref(),
+    ))
 }
 
 /// The AllAnime show (resolved from AniList when only that is known), its
 /// AniList details, and its episodes and progress in `mode`. Saves the show.
 fn load(db: &Mutex<Db>, target: &ShowRef, mode: Mode) -> Result<Loaded> {
-    let (show, media) = match &target.allanime {
+    let known_show = match &target.allanime {
+        Some(show) => Some(show.clone()),
+        None => target
+            .anilist_id
+            .and_then(|id| lock(db).show_by_anilist_id(id).ok().flatten())
+            .map(|record| record.summary),
+    };
+    let (show, media, episodes, episodes_error) = match known_show {
         Some(show) => {
-            let media = show
-                .anilist_id
-                .or(target.anilist_id)
-                .and_then(|id| catalog::media(db, id));
-            (show.clone(), media)
+            let media_id = show.anilist_id.or(target.anilist_id);
+            let show_id = show.id.clone();
+            let fetch_eps = show.count(mode) > 0;
+            let (media, ep_result) = std::thread::scope(|s| {
+                let media_job = s.spawn(|| media_id.and_then(|id| catalog::media(db, id)));
+                let ep_job = s.spawn(|| {
+                    if !fetch_eps {
+                        Ok(Vec::new())
+                    } else {
+                        catalog::episodes(db, &show_id, mode)
+                    }
+                });
+                (
+                    media_job.join().unwrap_or(None),
+                    ep_job.join().unwrap_or_else(|_| Ok(Vec::new())),
+                )
+            });
+            let (episodes, episodes_error) = match ep_result {
+                Ok(eps) => (eps, None),
+                Err(err) => (Vec::new(), Some(format!("{err:#}"))),
+            };
+            (show, media, episodes, episodes_error)
         }
         None => {
             let id = target.anilist_id.context("nothing identifies this show")?;
             let media = catalog::media(db, id).context("AniList didn't return this show")?;
             // Sub lists nearly everything, so the match works whatever `mode` is.
-            let show = catalog::resolve_allanime(&media, Mode::Sub)?
+            let show = catalog::resolve_allanime_cached(db, &media, Mode::Sub)?
                 .ok_or_else(|| anyhow!("{} isn't on AllAnime", media_title(&media)))?;
-            (show, Some(media))
+            let (episodes, episodes_error) = if show.count(mode) == 0 {
+                (Vec::new(), None)
+            } else {
+                match catalog::episodes(db, &show.id, mode) {
+                    Ok(eps) => (eps, None),
+                    Err(err) => (Vec::new(), Some(format!("{err:#}"))),
+                }
+            };
+            (show, Some(media), episodes, episodes_error)
         }
     };
     let stored = lock(db).get_show(&show.id).ok().flatten();
@@ -1273,14 +1428,6 @@ fn load(db: &Mutex<Db>, target: &ShowRef, mode: Mode) -> Result<Loaded> {
         media: media.clone(),
         updated_at: db::now(),
     })?;
-    let (episodes, episodes_error) = if show.count(mode) == 0 {
-        (Vec::new(), None)
-    } else {
-        match allanime::episodes(&show.id, mode) {
-            Ok(eps) => (eps, None),
-            Err(err) => (Vec::new(), Some(format!("{err:#}"))),
-        }
-    };
     let remote_progress = (media.as_ref().map(|m| m.id).or(show.anilist_id))
         .and_then(|id| lists::entry_for(db, id))
         .map(|e| e.progress);

@@ -8,5 +8,5 @@ Icon=io.github.sweettooth05.AniGui
 Terminal=false
 Categories=AudioVideo;Video;Player;
 Keywords=anime;ani-cli;video;stream;
-StartupNotify=true
+StartupNotify=false
 StartupWMClass=io.github.sweettooth05.AniGui

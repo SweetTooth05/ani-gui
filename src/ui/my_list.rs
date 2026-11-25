@@ -6,8 +6,8 @@ use std::sync::{Mutex, PoisonError};
 
 use anyhow::Result;
 use gpui::{
-    AnyElement, Context, FontWeight, IntoElement, ScrollHandle, Subscription, Task, WeakEntity,
-    Window, div, prelude::*, px, relative,
+    AnyElement, Context, FontWeight, IntoElement, ScrollHandle, SharedString, Subscription, Task,
+    WeakEntity, Window, div, prelude::*, px, relative,
 };
 
 use crate::app::{AppState, Root, Route, ShowRef};
@@ -25,10 +25,48 @@ use crate::ui::view_models::mode_label;
 
 /// Cards an imported group shows before "Show all"; Watching shows all.
 const GROUP_PREVIEW: usize = 10;
+const GRID_GAP_X: f32 = 22.;
+const GRID_ROW_H: f32 = 308.;
+const GRID_ROW_GAP: f32 = 30.;
+const GRID_ROW_STRIDE: f32 = GRID_ROW_H + GRID_ROW_GAP;
+/// Approximate height of a section heading + gap below it.
+const HEADING_STRIDE: f32 = 54.;
+/// Vertical gap between sections.
+const SECTION_GAP: f32 = 44.;
+/// Page top padding + "My List" title + gap before body.
+const PAGE_HEADER_H: f32 = 124.;
+
+struct SavedCard {
+    title: SharedString,
+    cover_url: String,
+    meta: CardMeta,
+    sub_label: SharedString,
+    dub_label: SharedString,
+    show_ref: ShowRef,
+}
+
+struct ImportedCard {
+    anilist_id: i64,
+    title: SharedString,
+    cover_url: String,
+    subtitle: Option<SharedString>,
+}
+
+struct ImportedGroup {
+    status: ListStatus,
+    cards: Vec<ImportedCard>,
+}
 
 struct Loaded {
-    saved: Vec<ShowRecord>,
-    imported: Vec<ListEntry>,
+    saved: Vec<SavedCard>,
+    groups: Vec<ImportedGroup>,
+    count_label: Option<SharedString>,
+}
+
+impl Loaded {
+    fn is_empty(&self) -> bool {
+        self.saved.is_empty() && self.groups.is_empty()
+    }
 }
 
 enum State {
@@ -86,68 +124,92 @@ impl MyListPage {
             .ok();
     }
 
-    fn render_saved(&self, shows: &[ShowRecord], mode: Mode, cx: &mut Context<Self>) -> AnyElement {
-        let now = db::now();
-        let tz = local_offset(now);
-        grid(shows.iter().enumerate().map(|(i, record)| {
-            let show = &record.summary;
-            let cover = record
-                .media
-                .as_ref()
-                .map(|m| m.cover_url.as_str())
-                .filter(|c| !c.is_empty())
-                .unwrap_or(&show.cover_url);
-            let route = Route::Show(ShowRef {
-                allanime: Some(show.clone()),
-                anilist_id: show.anilist_id,
-                title: show.display_title().to_string(),
-            });
-            let meta = match &record.media {
-                Some(media) => CardMeta::from_media(media, now, tz),
-                None => CardMeta::from_summary(show),
+    fn open_saved(&self, index: usize, cx: &mut Context<Self>) {
+        let State::Ready(loaded) = &self.state else {
+            return;
+        };
+        let Some(card) = loaded.saved.get(index) else {
+            return;
+        };
+        self.navigate(Route::Show(card.show_ref.clone()), cx);
+    }
+
+    fn open_imported(&self, status: ListStatus, index: usize, cx: &mut Context<Self>) {
+        let State::Ready(loaded) = &self.state else {
+            return;
+        };
+        let Some(card) = loaded
+            .groups
+            .iter()
+            .find(|g| g.status == status)
+            .and_then(|g| g.cards.get(index))
+        else {
+            return;
+        };
+        self.navigate(
+            Route::Show(ShowRef {
+                allanime: None,
+                anilist_id: Some(card.anilist_id),
+                title: card.title.to_string(),
+            }),
+            cx,
+        );
+    }
+
+    fn render_saved(
+        &self,
+        shows: &[SavedCard],
+        mode: Mode,
+        vp: GridViewport,
+        section_top: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        virtual_grid(shows.len(), vp, section_top, |i| {
+            let card = &shows[i];
+            let subtitle = match mode {
+                Mode::Sub => card.sub_label.clone(),
+                Mode::Dub => card.dub_label.clone(),
             };
-            poster_card(("my-list", i), show.display_title().to_string(), cover)
-                .meta(meta)
-                .subtitle(episodes_label(
-                    show.count(mode),
-                    show.count(other(mode)),
-                    mode,
-                ))
-                .on_click(cx.listener(move |page, _, _, cx| page.navigate(route.clone(), cx)))
+            poster_card(("my-list", i), card.title.clone(), &card.cover_url)
+                .meta(card.meta.clone())
+                .subtitle(subtitle)
+                .on_click(cx.listener(move |page, _, _, cx| page.open_saved(i, cx)))
                 .into_any_element()
-        }))
+        })
     }
 
     /// One status group of imported entries. Cards open the Show page by
     /// AniList id, like the Home and Calendar rows.
     fn render_group(
         &self,
-        status: ListStatus,
-        entries: &[&ListEntry],
+        group: &ImportedGroup,
+        vp: GridViewport,
+        section_top: f32,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> (AnyElement, f32) {
+        let status = group.status;
+        let entries = &group.cards;
         let all = status == ListStatus::Watching || self.expanded.contains(&status);
         let shown = if all {
             entries.len()
         } else {
             entries.len().min(GROUP_PREVIEW)
         };
-        let cards = entries[..shown].iter().enumerate().map(|(i, entry)| {
-            let route = Route::Show(ShowRef {
-                allanime: None,
-                anilist_id: Some(entry.anilist_id),
-                title: entry.title.clone(),
-            });
+        let grid_top = section_top + HEADING_STRIDE;
+        let grid_el = virtual_grid(shown, vp, grid_top, |i| {
+            let entry = &entries[i];
             let card = poster_card((status.as_str(), i), entry.title.clone(), &entry.cover_url)
-                .on_click(cx.listener(move |page, _, _, cx| page.navigate(route.clone(), cx)));
-            match entry_subtitle(entry) {
-                Some(subtitle) => card.subtitle(subtitle),
+                .on_click(cx.listener(move |page, _, _, cx| page.open_imported(status, i, cx)));
+            match &entry.subtitle {
+                Some(subtitle) => card.subtitle(subtitle.clone()),
                 None => card,
             }
             .into_any_element()
         });
         let hidden = entries.len() - shown;
-        div()
+        let rows = shown.div_ceil(vp.cols);
+        let height = HEADING_STRIDE + rows as f32 * GRID_ROW_STRIDE;
+        let el = div()
             .flex()
             .flex_col()
             .gap(px(18.))
@@ -165,11 +227,12 @@ impl MyListPage {
                     }))
                 })),
             )
-            .child(grid(cards))
-            .into_any_element()
+            .child(grid_el)
+            .into_any_element();
+        (el, height)
     }
 
-    fn render_body(&self, mode: Mode, cx: &mut Context<Self>) -> AnyElement {
+    fn render_body(&self, mode: Mode, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         match &self.state {
             State::Loading => div().into_any_element(),
             State::Failed(err) => div()
@@ -190,7 +253,7 @@ impl MyListPage {
                         .on_click(cx.listener(|page, _, _, cx| page.reload(cx))),
                 )
                 .into_any_element(),
-            State::Ready(loaded) if loaded.saved.is_empty() && loaded.imported.is_empty() => {
+            State::Ready(loaded) if loaded.is_empty() => {
                 div()
                     .flex()
                     .flex_col()
@@ -236,10 +299,23 @@ impl MyListPage {
                     .into_any_element()
             }
             State::Ready(loaded) => {
-                let mut body = div().flex().flex_col().gap(px(44.));
+                let (cols, viewport_h) = grid_metrics(&self.scroll, window);
+                let vp = GridViewport {
+                    cols,
+                    scroll_y: (-f32::from(self.scroll.offset().y)).max(0.0),
+                    viewport_h,
+                };
+                let mut cursor_y = PAGE_HEADER_H;
+                let mut body = div().flex().flex_col().gap(px(SECTION_GAP));
                 if !loaded.saved.is_empty() {
-                    let saved = self.render_saved(&loaded.saved, mode, cx);
-                    body = body.child(if loaded.imported.is_empty() {
+                    let has_heading = !loaded.groups.is_empty();
+                    let grid_top = cursor_y + if has_heading { HEADING_STRIDE } else { 0.0 };
+                    let saved = self.render_saved(&loaded.saved, mode, vp, grid_top, cx);
+                    let rows = loaded.saved.len().div_ceil(vp.cols);
+                    let section_h = if has_heading { HEADING_STRIDE } else { 0.0 }
+                        + rows as f32 * GRID_ROW_STRIDE;
+                    cursor_y += section_h + SECTION_GAP;
+                    body = body.child(if !has_heading {
                         saved
                     } else {
                         div()
@@ -251,8 +327,10 @@ impl MyListPage {
                             .into_any_element()
                     });
                 }
-                for (status, entries) in groups(&loaded.imported) {
-                    body = body.child(self.render_group(status, &entries, cx));
+                for group in &loaded.groups {
+                    let (el, height) = self.render_group(group, vp, cursor_y, cx);
+                    cursor_y += height + SECTION_GAP;
+                    body = body.child(el);
                 }
                 body.into_any_element()
             }
@@ -261,17 +339,12 @@ impl MyListPage {
 }
 
 impl Render for MyListPage {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = cx
             .try_global::<AppState>()
             .map_or(Mode::default(), |s| s.settings.mode);
         let count = match &self.state {
-            State::Ready(l) if !(l.saved.is_empty() && l.imported.is_empty()) => {
-                Some(match l.saved.len() + l.imported.len() {
-                    1 => "1 show".to_string(),
-                    n => format!("{n} shows"),
-                })
-            }
+            State::Ready(l) => l.count_label.clone(),
             _ => None,
         };
         div()
@@ -307,19 +380,76 @@ impl Render for MyListPage {
                                     .child(c)
                             })),
                     )
-                    .child(self.render_body(mode, cx)),
+                    .child(self.render_body(mode, window, cx)),
             )
     }
 }
 
-fn grid(cards: impl Iterator<Item = AnyElement>) -> AnyElement {
-    div()
-        .flex()
-        .flex_wrap()
-        .gap_x(px(22.))
-        .gap_y(px(30.))
-        .children(cards)
-        .into_any_element()
+#[derive(Clone, Copy)]
+struct GridViewport {
+    cols: usize,
+    scroll_y: f32,
+    viewport_h: f32,
+}
+
+fn grid_metrics(scroll: &ScrollHandle, window: &Window) -> (usize, f32) {
+    let bounds = scroll.bounds();
+    let mut vw = f32::from(bounds.size.width);
+    let mut vh = f32::from(bounds.size.height);
+    if vw <= 1.0 {
+        vw = (f32::from(window.viewport_size().width) - theme::SIDEBAR_WIDTH)
+            .max(theme::POSTER_W + 2.0 * f32::from(theme::gutter()));
+    }
+    if vh <= 1.0 {
+        vh = f32::from(window.viewport_size().height).max(720.0);
+    }
+    let avail = (vw - 2.0 * f32::from(theme::gutter())).max(theme::POSTER_W);
+    let cols = ((avail + GRID_GAP_X) / (theme::POSTER_W + GRID_GAP_X))
+        .floor()
+        .max(1.0) as usize;
+    (cols, vh)
+}
+
+fn virtual_grid(
+    count: usize,
+    vp: GridViewport,
+    section_top: f32,
+    mut render_card: impl FnMut(usize) -> AnyElement,
+) -> AnyElement {
+    if count == 0 {
+        return div().into_any_element();
+    }
+    let total_rows = count.div_ceil(vp.cols);
+    let total_h = total_rows as f32 * GRID_ROW_STRIDE;
+    let vis_top = (vp.scroll_y - section_top - GRID_ROW_STRIDE).max(0.0);
+    let vis_bottom = vp.scroll_y + vp.viewport_h - section_top + GRID_ROW_STRIDE;
+    if vis_bottom <= 0.0 || vis_top >= total_h {
+        return div().h(px(total_h)).into_any_element();
+    }
+    let start_row = ((vis_top / GRID_ROW_STRIDE).floor() as usize).min(total_rows);
+    let end_row = ((vis_bottom / GRID_ROW_STRIDE).ceil().max(0.0) as usize).min(total_rows);
+    let top_h = start_row as f32 * GRID_ROW_STRIDE;
+    let bottom_h = (total_rows - end_row) as f32 * GRID_ROW_STRIDE;
+    let mut container = div().flex().flex_col();
+    if top_h > 0.0 {
+        container = container.child(div().h(px(top_h)));
+    }
+    for row in start_row..end_row {
+        let first = row * vp.cols;
+        let last = (first + vp.cols).min(count);
+        container = container.child(
+            div()
+                .flex()
+                .gap(px(GRID_GAP_X))
+                .h(px(GRID_ROW_H))
+                .mb(px(GRID_ROW_GAP))
+                .children((first..last).map(&mut render_card)),
+        );
+    }
+    if bottom_h > 0.0 {
+        container = container.child(div().h(px(bottom_h)));
+    }
+    container.into_any_element()
 }
 
 fn group_heading(title: &'static str, count: usize) -> gpui::Div {
@@ -390,22 +520,75 @@ fn episodes_label(count: u32, other_count: u32, mode: Mode) -> String {
     }
 }
 
+fn build_saved_card(record: ShowRecord, now: i64, tz: i64) -> SavedCard {
+    let show = record.summary;
+    let title: SharedString = show.display_title().to_string().into();
+    let cover_url = record
+        .media
+        .as_ref()
+        .map(|m| m.cover_url.as_str())
+        .filter(|c| !c.is_empty())
+        .unwrap_or(&show.cover_url)
+        .to_string();
+    let meta = match &record.media {
+        Some(media) => CardMeta::from_media(media, now, tz),
+        None => CardMeta::from_summary(&show),
+    };
+    let sub_label = episodes_label(show.count(Mode::Sub), show.count(Mode::Dub), Mode::Sub).into();
+    let dub_label = episodes_label(show.count(Mode::Dub), show.count(Mode::Sub), Mode::Dub).into();
+    let show_ref = ShowRef {
+        anilist_id: show.anilist_id,
+        title: title.to_string(),
+        allanime: Some(show),
+    };
+    SavedCard {
+        title,
+        cover_url,
+        meta,
+        sub_label,
+        dub_label,
+        show_ref,
+    }
+}
+
 /// The saved shows, newest first (ids without a stored show are skipped),
 /// and the imported list entries.
 fn load(db: &Mutex<Db>) -> Result<Loaded> {
-    let saved = {
+    let saved_records = {
         let db = db.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut shows = Vec::new();
-        for id in db.my_list()? {
-            if let Some(record) = db.get_show(&id)? {
-                shows.push(record);
-            }
-        }
-        shows
+        db.my_list_shows()?
     };
+    let imported = lists::my_list(db)?;
+    let now = db::now();
+    let tz = local_offset(now);
+    let total = saved_records.len() + imported.len();
+    let count_label = (total > 0).then(|| match total {
+        1 => SharedString::from("1 show"),
+        n => SharedString::from(format!("{n} shows")),
+    });
+    let saved = saved_records
+        .into_iter()
+        .map(|record| build_saved_card(record, now, tz))
+        .collect();
+    let grouped = groups(&imported)
+        .into_iter()
+        .map(|(status, entries)| ImportedGroup {
+            status,
+            cards: entries
+                .into_iter()
+                .map(|entry| ImportedCard {
+                    anilist_id: entry.anilist_id,
+                    title: entry.title.clone().into(),
+                    cover_url: entry.cover_url.clone(),
+                    subtitle: entry_subtitle(entry).map(Into::into),
+                })
+                .collect(),
+        })
+        .collect();
     Ok(Loaded {
         saved,
-        imported: lists::my_list(db)?,
+        groups: grouped,
+        count_label,
     })
 }
 

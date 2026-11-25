@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, Context, FontWeight, IntoElement, ScrollHandle, Task, WeakEntity, Window, div,
-    prelude::*, px, relative,
+    AnyElement, Context, FontWeight, IntoElement, ScrollHandle, SharedString, Task, WeakEntity,
+    Window, div, prelude::*, px, relative,
 };
 
 use crate::app::{AppState, Root, Route, ShowRef};
@@ -29,7 +29,12 @@ const TICK: Duration = Duration::from_secs(60);
 /// at that moment (so a DST change mid-week doesn't shift it).
 struct Slot {
     airing: Airing,
-    time: String,
+    time: SharedString,
+    title: SharedString,
+    episode_label: SharedString,
+    score: Option<SharedString>,
+    format: Option<SharedString>,
+    genres: Vec<SharedString>,
 }
 
 /// One day of the week strip.
@@ -87,8 +92,30 @@ impl CalendarPage {
         let Some(db) = cx.try_global::<AppState>().map(|s| s.db.clone()) else {
             return;
         };
-        self.state = State::Loading;
+        let keep_visible = matches!(self.state, State::Ready(_));
+        if !keep_visible {
+            self.state = State::Loading;
+        }
         self.load_task = Some(cx.spawn(async move |this, cx| {
+            // Serve cached schedule immediately before refreshing in the background.
+            if !keep_visible {
+                let db_cached = db.clone();
+                let cached = cx
+                    .background_spawn(async move {
+                        let mut items = catalog::schedule_week_cached(&db_cached)?;
+                        let now = db::now();
+                        items.retain(|a| a.airing_at >= now);
+                        Some(week(&items, now, local_offset(now), local_offset))
+                    })
+                    .await;
+                if let Some(days) = cached {
+                    this.update(cx, |page, cx| {
+                        page.state = State::Ready(days);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
             let days = cx
                 .background_spawn(async move {
                     let mut items = catalog::schedule_week(&db);
@@ -114,11 +141,11 @@ impl CalendarPage {
         cx.notify();
     }
 
-    fn open(&self, airing: &Airing, cx: &mut Context<Self>) {
+    fn open(&self, anilist_id: i64, title: String, cx: &mut Context<Self>) {
         let route = Route::Show(ShowRef {
             allanime: None,
-            anilist_id: Some(airing.media.id),
-            title: media_title(&airing.media).to_string(),
+            anilist_id: Some(anilist_id),
+            title,
         });
         self.root
             .update(cx, |root, cx| root.navigate(route, cx))
@@ -243,13 +270,8 @@ impl CalendarPage {
         countdown: Option<String>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let airing = &slot.airing;
-        let media = &airing.media;
-        let episode = match media.episodes {
-            Some(total) => format!("Episode {} of {total}", airing.episode),
-            None => format!("Episode {}", airing.episode),
-        };
-        let target = airing.clone();
+        let anilist_id = slot.airing.media.id;
+        let click_title = slot.title.clone();
         div()
             .id(("airing", index))
             .group("airing")
@@ -260,7 +282,11 @@ impl CalendarPage {
             .rounded(px(12.))
             .cursor_pointer()
             .hover(|s| s.bg(theme::raised()))
-            .on_click(cx.listener(move |page, _, _, cx| page.open(&target, cx)))
+            .on_click(
+                cx.listener(move |page, _, _, cx| {
+                    page.open(anilist_id, click_title.to_string(), cx)
+                }),
+            )
             .child(
                 div()
                     .flex_none()
@@ -277,7 +303,7 @@ impl CalendarPage {
                     .w(px(COVER_W))
                     .h(px(COVER_H))
                     .child(rounded_image(
-                        &media.cover_url,
+                        &slot.airing.media.cover_url,
                         px(8.),
                         theme::night(),
                         Some(("airing", theme::raised().into())),
@@ -295,7 +321,7 @@ impl CalendarPage {
                             .text_size(px(16.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .truncate()
-                            .child(media_title(media).to_string()),
+                            .child(slot.title.clone()),
                     )
                     .child(
                         div()
@@ -304,8 +330,8 @@ impl CalendarPage {
                             .gap(px(14.))
                             .text_size(px(theme::SMALL))
                             .text_color(theme::text_dim())
-                            .child(episode)
-                            .children(media.score.and_then(score_label).map(|score| {
+                            .child(slot.episode_label.clone())
+                            .children(slot.score.clone().map(|score| {
                                 div()
                                     .flex()
                                     .items_center()
@@ -313,9 +339,9 @@ impl CalendarPage {
                                     .child(icon("star").size(px(12.)).text_color(theme::accent()))
                                     .child(score)
                             }))
-                            .children(media.format.as_deref().map(format_label))
+                            .children(slot.format.clone())
                             .children(
-                                media.genres.iter().take(2).map(|g| {
+                                slot.genres.iter().map(|g| {
                                     div().text_color(theme::text_muted()).child(g.clone())
                                 }),
                             ),
@@ -428,9 +454,38 @@ fn week(
                 .map(|(_, list)| std::mem::take(list))
                 .unwrap_or_default()
                 .into_iter()
-                .map(|airing| Slot {
-                    time: time_label(airing.airing_at, offset_at(airing.airing_at)),
-                    airing,
+                .map(|airing| {
+                    let time: SharedString =
+                        time_label(airing.airing_at, offset_at(airing.airing_at)).into();
+                    let title: SharedString = media_title(&airing.media).to_string().into();
+                    let episode_label: SharedString = match airing.media.episodes {
+                        Some(total) => format!("Episode {} of {total}", airing.episode).into(),
+                        None => format!("Episode {}", airing.episode).into(),
+                    };
+                    let score = airing.media.score.and_then(score_label).map(Into::into);
+                    let format = airing
+                        .media
+                        .format
+                        .as_deref()
+                        .map(format_label)
+                        .map(Into::into);
+                    let genres = airing
+                        .media
+                        .genres
+                        .iter()
+                        .take(2)
+                        .cloned()
+                        .map(Into::into)
+                        .collect();
+                    Slot {
+                        airing,
+                        time,
+                        title,
+                        episode_label,
+                        score,
+                        format,
+                        genres,
+                    }
                 })
                 .collect();
             let (weekday, date) = day_parts(day);

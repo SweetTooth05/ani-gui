@@ -1,5 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +18,7 @@ const HISTORY_ENTRIES: usize = 12;
 /// "Watching" shows from MyAnimeList/AniList not played here.
 const REMOTE_ENTRIES: usize = 8;
 const MAX_ITEMS: usize = 20;
+const CONTINUE_CONCURRENCY: usize = 6;
 
 /// One Continue Watching card.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -40,6 +43,63 @@ pub trait Catalog {
     fn media(&self, anilist_id: i64) -> Option<AniListMedia>;
 }
 
+/// Snapshot of `provider_titles` indexed both by show id and normalized title
+/// so `continue_items` reads the table once instead of once per history entry.
+struct ProviderIndex {
+    by_id: HashMap<String, String>,
+    by_norm: HashMap<String, Vec<String>>,
+}
+
+impl ProviderIndex {
+    fn load(db: &Mutex<Db>) -> Self {
+        let rows = lock(db).provider_titles().unwrap_or_else(|err| {
+            eprintln!("ani-gui: reading provider titles: {err:#}");
+            Vec::new()
+        });
+        let mut by_id = HashMap::with_capacity(rows.len());
+        let mut by_norm: HashMap<String, Vec<String>> = HashMap::with_capacity(rows.len());
+        for (id, title) in rows {
+            let norm = normalize_title(&title);
+            if !norm.is_empty() {
+                by_norm.entry(norm).or_default().push(id.clone());
+            }
+            by_id.insert(id, title);
+        }
+        ProviderIndex { by_id, by_norm }
+    }
+
+    fn record_title(&mut self, id: &str, title: &str) {
+        if self.by_id.contains_key(id) {
+            return;
+        }
+        let norm = normalize_title(title);
+        if !norm.is_empty() {
+            self.by_norm.entry(norm).or_default().push(id.to_string());
+        }
+        self.by_id.insert(id.to_string(), title.to_string());
+    }
+
+    fn show_titles(&self, show: &ShowSummary) -> Vec<String> {
+        [
+            Some(show.title.as_str()),
+            show.english_title.as_deref(),
+            self.by_id.get(&show.id).map(String::as_str),
+        ]
+        .into_iter()
+        .flatten()
+        .map(normalize_title)
+        .filter(|t| !t.is_empty())
+        .collect()
+    }
+
+    fn find_stored(&self, db: &Mutex<Db>, wanted: &str) -> Option<ShowRecord> {
+        self.by_norm
+            .get(wanted)?
+            .iter()
+            .find_map(|id| stored_show(db, id))
+    }
+}
+
 /// Shows to pick up again, newest first: the app's own progress, then
 /// ani-cli history entries (newest lines last in its file) for shows without
 /// app progress, matched by title, then shows the user is watching on
@@ -48,6 +108,7 @@ pub trait Catalog {
 /// do not record one. `misses` holds (mode, normalized title) pairs no search
 /// matched; keep it for the session so they are not searched again. Blocks on
 /// `catalog`; run it off the UI thread.
+#[allow(dead_code)]
 pub fn continue_items(
     db: &Mutex<Db>,
     history: &[HistoryEntry],
@@ -61,12 +122,15 @@ pub fn continue_items(
             eprintln!("ani-gui: reading progress: {err:#}");
             Vec::new()
         });
+    let mut providers = ProviderIndex::load(db);
     let mut seen: HashSet<String> = recent.iter().map(|p| p.show_id.clone()).collect();
+    let mut seen_titles: HashSet<String> = HashSet::new();
     let mut items = Vec::new();
     for latest in &recent {
         let Some(record) = stored_show(db, &latest.show_id) else {
             continue;
         };
+        seen_titles.extend(providers.show_titles(&record.summary));
         let episodes = catalog.episodes(&record.summary, latest.mode);
         let Some((ep, start)) = progress::continue_point(latest, &episodes) else {
             continue;
@@ -86,21 +150,15 @@ pub fn continue_items(
             fraction,
         ));
     }
-    let mut seen_titles: HashSet<String> = HashSet::new();
-    for id in &seen {
-        if let Some(record) = stored_show(db, id) {
-            seen_titles.extend(show_titles(db, &record.summary));
-        }
-    }
     for entry in history.iter().rev().take(HISTORY_ENTRIES) {
         let wanted = normalize_title(history_title(&entry.title));
         if wanted.is_empty() || seen_titles.contains(&wanted) {
             continue;
         }
-        let Some(record) = match_history(db, catalog, entry, mode, misses) else {
+        let Some(record) = match_history(db, &mut providers, catalog, entry, mode, misses) else {
             continue;
         };
-        seen_titles.extend(show_titles(db, &record.summary));
+        seen_titles.extend(providers.show_titles(&record.summary));
         if !seen.insert(record.summary.id.clone()) {
             continue;
         }
@@ -118,7 +176,8 @@ pub fn continue_items(
             continue;
         };
         if !seen.insert(record.summary.id.clone())
-            || show_titles(db, &record.summary)
+            || providers
+                .show_titles(&record.summary)
                 .iter()
                 .any(|t| seen_titles.contains(t))
         {
@@ -137,8 +196,306 @@ pub fn continue_items(
     items
 }
 
+/// Runs `work` over `inputs` across up to `CONTINUE_CONCURRENCY` scoped
+/// threads, preserving input order in the returned `Vec`.
+fn par_map<T, R, F>(inputs: &[T], work: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    if inputs.len() <= 1 {
+        return inputs.iter().map(work).collect();
+    }
+    let workers = CONTINUE_CONCURRENCY.min(inputs.len());
+    let next = AtomicUsize::new(0);
+    let results: Vec<Mutex<Option<R>>> = (0..inputs.len()).map(|_| Mutex::new(None)).collect();
+    thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= inputs.len() {
+                        break;
+                    }
+                    let out = work(&inputs[i]);
+                    *results[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(out);
+                }
+            });
+        }
+    });
+    results
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("every slot filled by par_map")
+        })
+        .collect()
+}
+
+/// Concurrent version of [`continue_items`] for thread-safe catalogs:
+/// resolves independent AllAnime searches, episode lists, and AniList media
+/// lookups in parallel while preserving the exact same ordering and dedup
+/// semantics.
+pub fn continue_items_concurrent(
+    db: &Mutex<Db>,
+    history: &[HistoryEntry],
+    mode: Mode,
+    catalog: &(impl Catalog + Sync),
+    misses: &mut HashSet<(Mode, String)>,
+) -> Vec<ContinueItem> {
+    let recent = lock(db)
+        .recent_progress(PROGRESS_SHOWS)
+        .unwrap_or_else(|err| {
+            eprintln!("ani-gui: reading progress: {err:#}");
+            Vec::new()
+        });
+    let mut providers = ProviderIndex::load(db);
+    let mut seen: HashSet<String> = recent.iter().map(|p| p.show_id.clone()).collect();
+    let mut seen_titles: HashSet<String> = HashSet::new();
+
+    // Phase 1: recent in-app progress (fetch episodes + missing media concurrently).
+    let recent_records: Vec<(&Progress, ShowRecord)> = recent
+        .iter()
+        .filter_map(|latest| {
+            let record = stored_show(db, &latest.show_id)?;
+            seen_titles.extend(providers.show_titles(&record.summary));
+            Some((latest, record))
+        })
+        .collect();
+    let mut items: Vec<ContinueItem> = par_map(&recent_records, |(latest, record)| {
+        let episodes = catalog.episodes(&record.summary, latest.mode);
+        let (ep, start) = progress::continue_point(latest, &episodes)?;
+        let fraction = if ep == latest.ep {
+            watched_fraction(latest)
+        } else {
+            0.0
+        };
+        Some(item_for(
+            db,
+            catalog,
+            record.clone(),
+            latest.mode,
+            ep,
+            start,
+            fraction,
+        ))
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+
+    // Phase 2: ani-cli history entries (search + episodes + media concurrently).
+    let mut queued_titles: HashSet<String> = HashSet::new();
+    let history_candidates: Vec<(&HistoryEntry, String, Option<ShowRecord>)> = history
+        .iter()
+        .rev()
+        .take(HISTORY_ENTRIES)
+        .filter_map(|entry| {
+            let wanted = normalize_title(history_title(&entry.title));
+            if wanted.is_empty()
+                || seen_titles.contains(&wanted)
+                || misses.contains(&(mode, wanted.clone()))
+                || !queued_titles.insert(wanted.clone())
+            {
+                return None;
+            }
+            let stored = providers.find_stored(db, &wanted);
+            Some((entry, wanted, stored))
+        })
+        .collect();
+
+    enum HistoryOutcome {
+        Matched {
+            record: Box<ShowRecord>,
+            title_to_save: Option<String>,
+            item: Option<Box<ContinueItem>>,
+        },
+        Missed(String),
+        Failed,
+    }
+
+    let history_outcomes = par_map(&history_candidates, |(entry, wanted, stored)| {
+        let title = history_title(&entry.title);
+        let (record, title_to_save) = match stored {
+            Some(record) => (record.clone(), None),
+            None => {
+                let Ok(results) = catalog.search(title, mode).inspect_err(|err| {
+                    eprintln!("ani-gui: searching AllAnime for {title:?}: {err:#}")
+                }) else {
+                    return HistoryOutcome::Failed;
+                };
+                let Some(found) = results.into_iter().find(|s| {
+                    normalize_title(&s.title) == *wanted
+                        || s.english_title
+                            .as_deref()
+                            .is_some_and(|t| normalize_title(t) == *wanted)
+                }) else {
+                    return HistoryOutcome::Missed(wanted.clone());
+                };
+                let record = {
+                    let guard = lock(db);
+                    match guard.get_show(&found.id) {
+                        Ok(Some(record)) => record,
+                        _ => {
+                            let record = ShowRecord {
+                                summary: found,
+                                media: None,
+                                updated_at: db::now(),
+                            };
+                            if let Err(err) = guard.upsert_show(&record) {
+                                eprintln!("ani-gui: saving show {}: {err:#}", record.summary.id);
+                            }
+                            record
+                        }
+                    }
+                };
+                (record, Some(title.to_string()))
+            }
+        };
+        let episodes = catalog.episodes(&record.summary, mode);
+        let item = progress::history_continue(&entry.ep, &episodes)
+            .map(|ep| Box::new(item_for(db, catalog, record.clone(), mode, ep, 0.0, 0.0)));
+        HistoryOutcome::Matched {
+            record: Box::new(record),
+            title_to_save,
+            item,
+        }
+    });
+
+    for outcome in history_outcomes {
+        match outcome {
+            HistoryOutcome::Matched {
+                record,
+                title_to_save,
+                item,
+            } => {
+                if let Some(title) = title_to_save {
+                    let saved = {
+                        let guard = lock(db);
+                        match guard.get_provider_title(&record.summary.id) {
+                            Ok(Some(_)) => Ok(()),
+                            Ok(None) => guard.set_provider_title(&record.summary.id, &title),
+                            Err(err) => Err(err),
+                        }
+                    };
+                    if let Err(err) = saved {
+                        eprintln!("ani-gui: saving provider title: {err:#}");
+                    } else {
+                        providers.record_title(&record.summary.id, &title);
+                    }
+                }
+                seen_titles.extend(providers.show_titles(&record.summary));
+                if !seen.insert(record.summary.id.clone()) {
+                    continue;
+                }
+                if let Some(item) = item {
+                    items.push(*item);
+                }
+            }
+            HistoryOutcome::Missed(wanted) => {
+                misses.insert((mode, wanted));
+            }
+            HistoryOutcome::Failed => {}
+        }
+    }
+
+    // Phase 3: MyAnimeList / AniList "watching" entries.
+    if items.len() < MAX_ITEMS {
+        let remote_entries: Vec<ListEntry> = lists::watching(db)
+            .into_iter()
+            .take(REMOTE_ENTRIES)
+            .collect();
+        let remote_candidates: Vec<(&ListEntry, Option<ShowRecord>)> = remote_entries
+            .iter()
+            .filter_map(|entry| {
+                let stored = lock(db).show_by_anilist_id(entry.anilist_id).ok().flatten();
+                if stored.is_none() {
+                    let wanted = normalize_title(&entry.title);
+                    if wanted.is_empty() || misses.contains(&(mode, wanted)) {
+                        return None;
+                    }
+                }
+                Some((entry, stored))
+            })
+            .collect();
+
+        enum RemoteOutcome {
+            Matched(Box<ShowRecord>, Option<Box<ContinueItem>>),
+            Missed(String),
+            Failed,
+        }
+
+        let remote_outcomes = par_map(&remote_candidates, |(entry, stored)| {
+            let record = match stored {
+                Some(record) => record.clone(),
+                None => {
+                    let Ok(results) = catalog.search(&entry.title, mode).inspect_err(|err| {
+                        eprintln!("ani-gui: searching AllAnime for {:?}: {err:#}", entry.title);
+                    }) else {
+                        return RemoteOutcome::Failed;
+                    };
+                    let Some(found) = results
+                        .into_iter()
+                        .find(|s| s.anilist_id == Some(entry.anilist_id))
+                    else {
+                        return RemoteOutcome::Missed(normalize_title(&entry.title));
+                    };
+                    let record = ShowRecord {
+                        summary: found,
+                        media: None,
+                        updated_at: db::now(),
+                    };
+                    if let Err(err) = lock(db).upsert_show(&record) {
+                        eprintln!("ani-gui: saving show {}: {err:#}", record.summary.id);
+                    }
+                    record
+                }
+            };
+            let episodes = catalog.episodes(&record.summary, mode);
+            let next = match entry.progress {
+                0 => episodes.first().cloned(),
+                n => progress::next_after(&n.to_string(), &episodes),
+            };
+            let item =
+                next.map(|ep| Box::new(item_for(db, catalog, record.clone(), mode, ep, 0.0, 0.0)));
+            RemoteOutcome::Matched(Box::new(record), item)
+        });
+
+        for outcome in remote_outcomes {
+            if items.len() >= MAX_ITEMS {
+                break;
+            }
+            match outcome {
+                RemoteOutcome::Matched(record, item) => {
+                    if !seen.insert(record.summary.id.clone())
+                        || providers
+                            .show_titles(&record.summary)
+                            .iter()
+                            .any(|t| seen_titles.contains(t))
+                    {
+                        continue;
+                    }
+                    if let Some(item) = item {
+                        items.push(*item);
+                    }
+                }
+                RemoteOutcome::Missed(wanted) => {
+                    misses.insert((mode, wanted));
+                }
+                RemoteOutcome::Failed => {}
+            }
+        }
+    }
+
+    items.truncate(MAX_ITEMS);
+    items
+}
+
 /// The AllAnime show for a MyAnimeList/AniList "watching" entry: one
 /// stored with its AniList id, else a search result carrying that id.
+#[allow(dead_code)]
 fn match_remote(
     db: &Mutex<Db>,
     catalog: &impl Catalog,
@@ -211,26 +568,13 @@ fn item_for(
     }
 }
 
-/// Normalized titles a history entry about `show` could carry.
-fn show_titles(db: &Mutex<Db>, show: &ShowSummary) -> Vec<String> {
-    let provider = lock(db).get_provider_title(&show.id).ok().flatten();
-    [
-        Some(show.title.as_str()),
-        show.english_title.as_deref(),
-        provider.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(normalize_title)
-    .filter(|t| !t.is_empty())
-    .collect()
-}
-
 /// The show a history entry is about: one whose remembered provider title
 /// matches, else an AllAnime search result with an equal (normalized) title.
 /// A searched show without a provider title gets the entry's title as one.
+#[allow(dead_code)]
 fn match_history(
     db: &Mutex<Db>,
+    providers: &mut ProviderIndex,
     catalog: &impl Catalog,
     entry: &HistoryEntry,
     mode: Mode,
@@ -241,15 +585,7 @@ fn match_history(
     if wanted.is_empty() || misses.contains(&(mode, wanted.clone())) {
         return None;
     }
-    let known = lock(db).provider_titles().unwrap_or_else(|err| {
-        eprintln!("ani-gui: reading provider titles: {err:#}");
-        Vec::new()
-    });
-    if let Some(record) = known
-        .iter()
-        .filter(|(_, t)| normalize_title(t) == wanted)
-        .find_map(|(id, _)| stored_show(db, id))
-    {
+    if let Some(record) = providers.find_stored(db, &wanted) {
         return Some(record);
     }
     let results = catalog
@@ -287,6 +623,8 @@ fn match_history(
     };
     if let Err(err) = saved {
         eprintln!("ani-gui: saving provider title: {err:#}");
+    } else {
+        providers.record_title(&record.summary.id, title);
     }
     Some(record)
 }
@@ -533,11 +871,36 @@ impl ShowPageModel {
             .as_ref()
             .map(|(ep, start)| play_label(ep, *start))
             .unwrap_or_default();
+        let progress_by_ep: HashMap<&str, &Progress> =
+            progress.iter().map(|p| (p.ep.as_str(), p)).collect();
+        let mut thumbs_by_ep: HashMap<u64, (Option<&str>, &str)> = HashMap::new();
+        if let Some(m) = media {
+            for (title, thumb) in &m.episode_thumbs {
+                let Some(rest) = title.strip_prefix("Episode ") else {
+                    continue;
+                };
+                let (num, name) = match rest.split_once(" - ") {
+                    Some((num, name)) => (num, Some(name.trim()).filter(|n| !n.is_empty())),
+                    None => (rest, None),
+                };
+                if let Ok(n) = num.trim().parse::<f64>()
+                    && !n.is_nan()
+                {
+                    thumbs_by_ep
+                        .entry((n + 0.0).to_bits())
+                        .or_insert((name, thumb.as_str()));
+                }
+            }
+        }
         let rows = episodes
             .iter()
             .map(|ep| {
-                let watched = progress.iter().find(|p| p.ep == *ep);
-                let meta = media.and_then(|m| episode_meta(m, ep));
+                let watched = progress_by_ep.get(ep.as_str()).copied();
+                let meta = ep
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|n| !n.is_nan())
+                    .and_then(|n| thumbs_by_ep.get(&(n + 0.0).to_bits()).copied());
                 let on_list = remote_watched(ep);
                 let completed = watched.is_some_and(progress::is_completed) || on_list;
                 let fraction = if on_list {

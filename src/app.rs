@@ -1,6 +1,7 @@
 use std::env;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -23,6 +24,39 @@ use crate::ui::settings_page::SettingsPage;
 use crate::ui::show::ShowPage;
 use crate::ui::{sidebar, theme};
 use crate::{anicli, paths};
+
+/// Process-start timestamp when `ANI_GUI_TRACE` is set (non-empty and not "0").
+static TRACE_START: OnceLock<Option<Instant>> = OnceLock::new();
+
+pub fn trace_init() {
+    let _ = TRACE_START.set(
+        env::var_os("ANI_GUI_TRACE")
+            .filter(|v| !v.is_empty() && v != "0")
+            .map(|_| Instant::now()),
+    );
+}
+
+#[inline]
+pub fn trace_enabled() -> bool {
+    TRACE_START.get().is_some_and(Option::is_some)
+}
+
+#[inline]
+pub fn trace_event(label: &str) {
+    if let Some(Some(start)) = TRACE_START.get() {
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("[ani-gui trace +{ms:7.2}ms] {label}");
+    }
+}
+
+#[inline]
+pub fn trace_span(label: &str, dur: Duration) {
+    if let Some(Some(start)) = TRACE_START.get() {
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        let dur_ms = dur.as_secs_f64() * 1000.0;
+        eprintln!("[ani-gui trace +{ms:7.2}ms] {label} ({dur_ms:.2}ms)");
+    }
+}
 
 actions!(
     ani_gui,
@@ -176,35 +210,58 @@ struct Started {
     downloads: Arc<DownloadManager>,
     cache_dir: PathBuf,
     shims: Result<PathBuf, String>,
+    home_snapshot: Option<crate::ui::home::HomeData>,
 }
 
-/// Opens the database, loads settings and downloads, writes ani-cli's shims.
+/// Opens the database, loads settings and downloads, reads the cached Home
+/// snapshot, and writes ani-cli's shims.
 fn start() -> Result<Started> {
+    let t0 = Instant::now();
     let db = Db::open(&paths::db_path())?;
+    trace_span("start.db_open", t0.elapsed());
+    let t1 = Instant::now();
     let settings = db.load_settings().unwrap_or_else(|err| {
         eprintln!("ani-gui: loading settings: {err:#}");
         Settings::default()
     });
+    trace_span("start.load_settings", t1.elapsed());
+    let t_snap = Instant::now();
+    let home_snapshot = crate::ui::home::read_snapshot_db(&db);
+    trace_span(
+        if home_snapshot.is_some() {
+            "start.home_snapshot.hit"
+        } else {
+            "start.home_snapshot.miss"
+        },
+        t_snap.elapsed(),
+    );
     let db = Arc::new(Mutex::new(db));
+    let t2 = Instant::now();
     let downloads = Arc::new(DownloadManager::new(db.clone()));
+    trace_span("start.downloads_new", t2.elapsed());
     let cache_dir = paths::cache_dir();
+    let t3 = Instant::now();
     let shims = env::current_exe()
         .and_then(|exe| anicli::ensure_shims(&cache_dir, &exe))
         .map_err(|err| format!("Could not write ani-cli helper scripts: {err}"));
+    trace_span("start.ensure_shims", t3.elapsed());
     if let Err(err) = &shims {
         eprintln!("ani-gui: {err}");
     }
+    trace_span("start.total", t0.elapsed());
     Ok(Started {
         db,
         settings,
         downloads,
         cache_dir,
         shims,
+        home_snapshot,
     })
 }
 
 impl Root {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        trace_event("root_new");
         let toasts = cx.new(|_| Toasts::default());
         cx.set_global(toast::ToastHost(toasts.clone()));
         let focus = cx.focus_handle();
@@ -227,6 +284,7 @@ impl Root {
     }
 
     fn finish_start(&mut self, started: Result<Started>, cx: &mut Context<Self>) {
+        trace_event("root_finish_start");
         let started = match started {
             Ok(started) => started,
             Err(err) => {
@@ -268,21 +326,32 @@ impl Root {
             shims: started.shims,
             downloads_changed,
         });
+        self.phase = Phase::Ready;
+        let root = cx.entity().downgrade();
+        let home = cx.new(|cx| HomePage::new_with_snapshot(root, started.home_snapshot, cx));
+        self.home = Some(home.clone());
+        self.stack.push(Entry {
+            route: Route::Home,
+            page: Page::Home(home),
+        });
+        cx.notify();
         crate::updater::init(cx);
         crate::ui::accounts::start(cx);
-        self.phase = Phase::Ready;
-        self.navigate(Route::Home, cx);
     }
 
     /// Opens `route`. Sidebar destinations start a fresh back stack; Show and
     /// Player pages stack on top of the current one, but never a player on
     /// a player.
     pub fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        if !matches!(self.phase, Phase::Ready) {
+            return;
+        }
         if matches!(route, Route::Player(_))
             && matches!(self.stack.last().map(|e| &e.page), Some(Page::Player(_)))
         {
             return;
         }
+        crate::ui::components::poster::clear_hovered_poster(cx);
         let root = cx.entity().downgrade();
         let page = match &route {
             Route::Home => match &self.home {
@@ -344,6 +413,7 @@ impl Root {
 
     fn pop(&mut self, cx: &mut Context<Self>) {
         if self.stack.len() > 1 {
+            crate::ui::components::poster::clear_hovered_poster(cx);
             self.stack.pop();
             match self.stack.last().map(|e| &e.page) {
                 Some(Page::Home(home)) => home.update(cx, |home, cx| home.refresh(cx)),
@@ -433,8 +503,24 @@ fn placeholder(title: &str, detail: String) -> gpui::AnyElement {
 
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        static FIRST_FRAME: OnceLock<()> = OnceLock::new();
+        if trace_enabled() && FIRST_FRAME.set(()).is_ok() {
+            trace_event("root_first_render");
+        }
         let body = match &self.phase {
-            Phase::Starting => div().size_full().into_any_element(),
+            Phase::Starting => div()
+                .size_full()
+                .flex()
+                .child(sidebar::sidebar(&Route::Home, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .child(crate::ui::home::skeleton()),
+                )
+                .into_any_element(),
             Phase::Failed(err) => placeholder(
                 "Couldn't open your library",
                 format!("{err}\nDatabase: {}", paths::db_path().display()),
