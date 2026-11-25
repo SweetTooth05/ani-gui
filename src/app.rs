@@ -373,6 +373,7 @@ impl Root {
         });
         cx.notify();
         crate::updater::init(cx);
+        crate::ui::downloads_page::watch_toasts(cx);
         crate::ui::accounts::start(cx);
     }
 

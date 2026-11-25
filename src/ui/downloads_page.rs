@@ -6,13 +6,13 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use gpui::{
-    AnyElement, Context, FontWeight, IntoElement, ScrollHandle, SharedString, Subscription, Task,
-    WeakEntity, Window, div, prelude::*, px, relative,
+    AnyElement, App, Context, FontWeight, IntoElement, ScrollHandle, SharedString, Subscription,
+    Task, WeakEntity, Window, div, prelude::*, px, relative,
 };
 
 use crate::app::{AppState, PlayRequest, Root, Route};
 use crate::db::{Db, lock};
-use crate::downloads::{DlProgress, DownloadManager};
+use crate::downloads::{DlProgress, DownloadEvent, DownloadManager};
 use crate::model::{DlStatus, DownloadRecord, ShowSummary};
 use crate::playback;
 use crate::ui::components::button::{ButtonKind, button};
@@ -25,6 +25,75 @@ use crate::ui::view_models::mode_label;
 
 const COVER_W: f32 = 64.;
 const COVER_H: f32 = 90.;
+
+/// Subscribes to `DownloadManager` lifecycle events and turns them into
+/// coalesced toasts (started, finished, failed) regardless of the active page.
+pub fn watch_toasts(cx: &mut App) {
+    let Some(state) = cx.try_global::<AppState>() else {
+        return;
+    };
+    let watch = state.downloads_changed.clone();
+    let downloads = state.downloads.clone();
+    cx.observe(&watch, move |_, cx| {
+        for event in downloads.take_events() {
+            emit_download_toast(event, cx);
+        }
+    })
+    .detach();
+}
+
+fn emit_download_toast(event: DownloadEvent, cx: &mut App) {
+    match event {
+        DownloadEvent::Started { id, title, ep } => {
+            toast::Toast::info(format!("Downloading {title} episode {ep}"))
+                .key(format!("download:{id}"))
+                .show(cx);
+        }
+        DownloadEvent::Finished {
+            id,
+            title,
+            ep,
+            path,
+        } => {
+            let mut t = toast::Toast::success(format!("Downloaded {title} episode {ep}"))
+                .key(format!("download:{id}"));
+            if let Some(folder) = path.parent().map(Path::to_path_buf) {
+                t = t.action("Open folder", move |_, cx| {
+                    open_folder(folder.clone(), cx);
+                });
+            }
+            t.show(cx);
+        }
+        DownloadEvent::Failed {
+            id,
+            title,
+            ep,
+            error,
+        } => {
+            let summary = short_error(&error);
+            let message = if summary.is_empty() {
+                format!("Download failed: {title} episode {ep}")
+            } else {
+                format!("Download failed: {title} ep {ep} — {summary}")
+            };
+            toast::Toast::error(message)
+                .key(format!("download:{id}"))
+                .show(cx);
+        }
+    }
+}
+
+fn short_error(error: &str) -> String {
+    let line = error.lines().next().unwrap_or(error).trim();
+    const LIMIT: usize = 80;
+    if line.chars().count() <= LIMIT {
+        line.to_string()
+    } else {
+        let mut out: String = line.chars().take(LIMIT - 1).collect();
+        out.push('…');
+        out
+    }
+}
 
 struct Row {
     record: DownloadRecord,

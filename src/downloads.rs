@@ -105,6 +105,29 @@ pub fn parse_progress_line(line: &str) -> Option<DlProgress> {
     None
 }
 
+/// Lifecycle events emitted by [`DownloadManager`] so the UI can show
+/// toast notifications regardless of which page is open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadEvent {
+    Started {
+        id: String,
+        title: String,
+        ep: String,
+    },
+    Finished {
+        id: String,
+        title: String,
+        ep: String,
+        path: PathBuf,
+    },
+    Failed {
+        id: String,
+        title: String,
+        ep: String,
+        error: String,
+    },
+}
+
 /// Runs `ani-cli -d` downloads in the background, keeps their records (and
 /// live progress) in memory and persists every status change.
 pub struct DownloadManager {
@@ -122,6 +145,7 @@ struct Inner {
     /// Lock after `items` when both are needed, never before.
     queue: Mutex<Queue>,
     on_change: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    events: Mutex<Vec<DownloadEvent>>,
     /// Set by `shutdown`; workers then leave records as it saved them.
     closing: AtomicBool,
 }
@@ -181,6 +205,7 @@ impl DownloadManager {
             items: Mutex::new(Vec::new()),
             queue: Mutex::new(Queue::default()),
             on_change: Mutex::new(None),
+            events: Mutex::new(Vec::new()),
             closing: AtomicBool::new(false),
         };
         let items = records
@@ -360,6 +385,11 @@ impl DownloadManager {
     pub fn set_on_change(&self, f: Box<dyn Fn() + Send + Sync>) {
         *lock(&self.inner.on_change) = Some(Arc::from(f));
     }
+
+    /// Drains lifecycle events recorded since the last call.
+    pub fn take_events(&self) -> Vec<DownloadEvent> {
+        std::mem::take(&mut *lock(&self.inner.events))
+    }
 }
 
 /// Marks an active download cancelled and SIGTERMs its process group; the
@@ -455,16 +485,27 @@ impl Inner {
         };
         // setsid made the child the leader of its own process group.
         let pgid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
-        {
+        let started_event = {
             let mut items = lock(&self.items);
             if self.closing.load(Ordering::SeqCst) {
                 // shutdown() already settled this record but couldn't see the group.
                 let _ = killpg(pgid, Signal::SIGKILL);
+                None
             } else if let Some(item) = items.iter_mut().find(|i| i.record.id == id) {
                 item.record.status = DlStatus::Running;
                 item.pgid = Some(pgid);
                 self.persist(&item.record);
+                Some(DownloadEvent::Started {
+                    id: item.record.id.clone(),
+                    title: item.record.title.clone(),
+                    ep: item.record.ep.clone(),
+                })
+            } else {
+                None
             }
+        };
+        if let Some(event) = started_event {
+            self.push_event(event);
         }
         self.notify();
 
@@ -651,7 +692,7 @@ impl Inner {
     }
 
     fn finish(&self, id: &str, outcome: Outcome) {
-        {
+        let event = {
             let mut items = lock(&self.items);
             if self.closing.load(Ordering::SeqCst) {
                 return;
@@ -660,22 +701,41 @@ impl Inner {
                 return;
             };
             let record = &mut item.record;
-            match outcome {
+            let event = match outcome {
                 Outcome::Done(path) => {
                     record.status = DlStatus::Done;
                     record.progress = 100.0;
                     record.path = Some(path.to_string_lossy().into_owned());
                     record.error = None;
+                    Some(DownloadEvent::Finished {
+                        id: record.id.clone(),
+                        title: record.title.clone(),
+                        ep: record.ep.clone(),
+                        path,
+                    })
                 }
                 Outcome::Failed(error) => {
                     record.status = DlStatus::Failed;
-                    record.error = Some(error);
+                    record.error = Some(error.clone());
+                    Some(DownloadEvent::Failed {
+                        id: record.id.clone(),
+                        title: record.title.clone(),
+                        ep: record.ep.clone(),
+                        error,
+                    })
                 }
-                Outcome::Cancelled => record.status = DlStatus::Cancelled,
-            }
+                Outcome::Cancelled => {
+                    record.status = DlStatus::Cancelled;
+                    None
+                }
+            };
             item.progress = None;
             item.cancel = false;
             self.persist(&item.record);
+            event
+        };
+        if let Some(event) = event {
+            self.push_event(event);
         }
         self.notify();
     }
@@ -684,6 +744,10 @@ impl Inner {
         if let Err(err) = lock(&self.db).upsert_download(record) {
             eprintln!("ani-gui: saving download {}: {err:#}", record.id);
         }
+    }
+
+    fn push_event(&self, event: DownloadEvent) {
+        lock(&self.events).push(event);
     }
 
     fn notify(&self) {
@@ -1562,5 +1626,41 @@ wait"#,
             m.retry("old").is_err(),
             "no request is known for a past session"
         );
+    }
+
+    #[test]
+    fn download_events_report_started_finished_and_failed() {
+        let dir = temp_dir("events");
+        let ok_script = fake_ani_cli(
+            &dir.join("bin-ok"),
+            r#"printf 'ok' > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode 3.mp4""#,
+        );
+        let (m, _db) = manager(ok_script, Duration::from_secs(60));
+        let id = m.start(&show(), req(), &dir.join("out-ok")).unwrap();
+        let rec = wait_for(&m, &id, finished);
+        assert_eq!(rec.status, DlStatus::Done, "{rec:?}");
+        let events = m.take_events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(
+            &events[0],
+            DownloadEvent::Started { id: eid, ep, .. } if eid == &id && ep == "3"
+        ));
+        assert!(matches!(
+            &events[1],
+            DownloadEvent::Finished { id: eid, ep, .. } if eid == &id && ep == "3"
+        ));
+        assert!(m.take_events().is_empty());
+
+        let fail_script = fake_ani_cli(&dir.join("bin-fail"), "echo 'boom' >&2; exit 1");
+        let (m2, _db2) = manager(fail_script, Duration::from_secs(60));
+        let id2 = m2.start(&show(), req(), &dir.join("out-fail")).unwrap();
+        let rec2 = wait_for(&m2, &id2, finished);
+        assert_eq!(rec2.status, DlStatus::Failed, "{rec2:?}");
+        let events2 = m2.take_events();
+        assert!(matches!(
+            &events2.last(),
+            Some(DownloadEvent::Failed { id: eid, error, .. }) if eid == &id2 && error.contains("boom")
+        ));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
