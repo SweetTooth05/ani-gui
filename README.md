@@ -105,14 +105,19 @@ v=$(curl -fsSL https://api.github.com/repos/SweetTooth05/ani-gui/releases/latest
   curl -fL "https://github.com/SweetTooth05/ani-gui/releases/download/v$v/ani-gui-$v-x86_64-unknown-linux-gnu.tar.gz" \
     | tar -xz -C ~/.local --strip-components=1 &&
   sed -i "s|^Exec=ani-gui\$|Exec=$HOME/.local/bin/ani-gui|" \
-    ~/.local/share/applications/io.github.sweettooth05.AniGui.desktop
+    ~/.local/share/applications/io.github.sweettooth05.AniGui.desktop &&
+  { gtk-update-icon-cache -f -t ~/.local/share/icons/hicolor
+    update-desktop-database ~/.local/share/applications; } >/dev/null 2>&1; true
 ```
 
 The tarball is laid out like an install prefix (`bin/`, `share/`), so this
 puts the binary, the launcher entry and the icons in the same places as
-`make install` below. The last step points the launcher entry at
+`make install` below. The `sed` step points the launcher entry at
 `~/.local/bin/ani-gui`, because that folder is often missing from the desktop
-session's `PATH`. To check a download's signature by hand first, see
+session's `PATH`. The last step refreshes the icon and launcher caches, as
+`make install` does: `tar` keeps the archive's folder dates, so an icon cache
+another app left in `~/.local/share/icons` would otherwise look up to date
+and hide ani-gui's icon. To check a download's signature by hand first, see
 [docs/releasing.md](docs/releasing.md#verifying-a-release-by-hand).
 
 ### From source
