@@ -21,8 +21,11 @@ mod reviews;
 mod ui;
 mod updater;
 
+#[cfg(target_os = "linux")]
+use gpui::WindowDecorations;
 use gpui::{
-    App, Application, Bounds, TitlebarOptions, WindowBounds, WindowOptions, prelude::*, px, size,
+    App, Application, Bounds, TitlebarOptions, WindowBackgroundAppearance, WindowBounds,
+    WindowOptions, prelude::*, px, size,
 };
 
 use std::env;
@@ -79,12 +82,21 @@ fn main() {
         text_input::bind_keys(cx);
         app::bind_keys(cx);
         let bounds = Bounds::centered(None, size(px(1360.), px(860.)), cx);
+        #[cfg(target_os = "linux")]
+        let (window_decorations, window_background) = (
+            Some(WindowDecorations::Client),
+            WindowBackgroundAppearance::Transparent,
+        );
+        #[cfg(not(target_os = "linux"))]
+        let (window_decorations, window_background) = (None, WindowBackgroundAppearance::Opaque);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
                 title: Some("ani-gui".into()),
                 ..Default::default()
             }),
+            window_decorations,
+            window_background,
             app_id: Some(APP_ID.into()),
             window_min_size: Some(size(px(960.), px(600.))),
             ..Default::default()
@@ -95,7 +107,16 @@ fn main() {
             }
         })
         .detach();
+        cx.on_app_quit(|_| {
+            anicli::cancel_all_resolves();
+            async {}
+        })
+        .detach();
         let opened = cx.open_window(options, |window, cx| {
+            #[cfg(target_os = "linux")]
+            window
+                .observe_window_appearance(|window, _| window.refresh())
+                .detach();
             cx.new(|cx| app::Root::new(window, cx))
         });
         if let Err(err) = opened {

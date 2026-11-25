@@ -13,4 +13,5 @@ pub mod settings_page;
 pub mod show;
 pub mod sidebar;
 pub mod theme;
+pub mod titlebar;
 pub mod view_models;

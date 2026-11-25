@@ -21,17 +21,51 @@ use crate::ui::player_view::{self, PlayerView};
 use crate::ui::search::SearchPage;
 use crate::ui::settings_page::SettingsPage;
 use crate::ui::show::ShowPage;
-use crate::ui::{sidebar, theme};
+use crate::ui::{sidebar, theme, titlebar};
 use crate::{anicli, paths};
 
 actions!(
     ani_gui,
-    [Back, Quit, Hide, HideOthers, ShowAll, Minimize, Zoom]
+    [
+        Back,
+        Quit,
+        CloseWindow,
+        ToggleFullscreen,
+        Hide,
+        HideOthers,
+        ShowAll,
+        Minimize,
+        Zoom
+    ]
 );
 
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("alt-left", Back, None)]);
+    cx.bind_keys([
+        KeyBinding::new("alt-left", Back, None),
+        KeyBinding::new("f11", ToggleFullscreen, None),
+    ]);
+    cx.on_action(|_: &Quit, cx| cx.quit());
+    cx.on_action(|_: &CloseWindow, cx| {
+        if let Some(window) = cx.active_window() {
+            window
+                .update(cx, |_, window, _| window.remove_window())
+                .ok();
+        }
+    });
+    cx.on_action(|_: &ToggleFullscreen, cx| {
+        if let Some(window) = cx.active_window() {
+            window
+                .update(cx, |_, window, _| window.toggle_fullscreen())
+                .ok();
+        }
+    });
     player_view::bind_keys(cx);
+    if cfg!(target_os = "linux") {
+        cx.bind_keys([
+            KeyBinding::new("ctrl-q", Quit, None),
+            KeyBinding::new("ctrl-w", CloseWindow, None),
+        ]);
+    }
     if cfg!(target_os = "macos") {
         install_mac_menus(cx);
     }
@@ -47,7 +81,6 @@ fn install_mac_menus(cx: &mut App) {
         KeyBinding::new("alt-cmd-h", HideOthers, None),
         KeyBinding::new("cmd-m", Minimize, None),
     ]);
-    cx.on_action(|_: &Quit, cx| cx.quit());
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
@@ -252,9 +285,13 @@ impl Root {
         })
         .detach();
         let downloads = started.downloads.clone();
-        // gpui waits only 100 ms for quit futures, too short for shutdown()'s
-        // grace period before it kills stuck ani-cli processes.
-        cx.on_app_quit(move |_, _| {
+        let root = cx.entity().downgrade();
+        // Register on `App`, not `Context<Root>`: closing the last window drops
+        // `Root` before `on_app_quit` fires, and gpui waits only 100 ms for
+        // quit futures (too short for shutdown()'s grace period).
+        App::on_app_quit(cx, move |cx| {
+            root.update(cx, |root, cx| root.save_player_for_quit(cx))
+                .ok();
             anicli::cancel_all_resolves();
             downloads.shutdown();
             async {}
@@ -403,6 +440,15 @@ impl Root {
             Page::Player(player) => player.clone().into_any_element(),
         }
     }
+
+    /// Saves playback progress synchronously if the player is open on quit.
+    fn save_player_for_quit(&mut self, cx: &mut Context<Self>) {
+        for entry in &self.stack {
+            if let Page::Player(player) = &entry.page {
+                player.update(cx, |player, _| player.save_for_quit());
+            }
+        }
+    }
 }
 
 fn placeholder(title: &str, detail: String) -> gpui::AnyElement {
@@ -432,7 +478,7 @@ fn placeholder(title: &str, detail: String) -> gpui::AnyElement {
 }
 
 impl Render for Root {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match &self.phase {
             Phase::Starting => div().size_full().into_any_element(),
             Phase::Failed(err) => placeholder(
@@ -457,7 +503,8 @@ impl Render for Root {
                     .into_any_element()
             }
         };
-        div()
+        let titlebar = titlebar::bar(window);
+        let root = div()
             .id("root")
             .key_context("Root")
             .track_focus(&self.focus)
@@ -466,13 +513,23 @@ impl Render for Root {
                 MouseButton::Navigate(NavigationDirection::Back),
                 cx.listener(|this, _, _, cx| this.back(cx)),
             )
-            .relative()
             .size_full()
-            .bg(theme::night())
+            .flex()
+            .flex_col()
             .font_family(theme::UI_FONT)
             .text_size(px(theme::BODY))
             .text_color(theme::text())
-            .child(body)
-            .child(self.toasts.clone())
+            .children(titlebar)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_hidden()
+                    .child(body)
+                    .child(self.toasts.clone()),
+            );
+        titlebar::frame(root, window, cx)
     }
 }
