@@ -435,6 +435,23 @@ impl MpvPlayer {
     pub fn set_on_change(&self, f: Box<dyn Fn() + Send + Sync>) {
         *lock(&self.shared.on_change) = Some(Arc::from(f));
     }
+
+    #[cfg(test)]
+    pub(crate) fn property_string(&self, name: &str) -> Option<String> {
+        let name = CString::new(name).ok()?;
+        // SAFETY: valid handle and NUL-terminated property name; mpv_free
+        // releases non-null results from mpv_get_property_string.
+        let ptr =
+            unsafe { (self.shared.api.get_property_string)(self.shared.mpv.0, name.as_ptr()) };
+        if ptr.is_null() {
+            return None;
+        }
+        let value = unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { (self.shared.api.free)(ptr as *mut c_void) };
+        Some(value)
+    }
 }
 
 impl Drop for MpvPlayer {
@@ -468,6 +485,9 @@ fn init(api: &Api, mpv: *mut MpvHandle, hwdec: &CStr) -> Result<RenderCtx, Playe
         (c"vo", c"libmpv"),
         (c"hwdec", hwdec),
         (c"keep-open", c"yes"),
+        // Prefer English when falling back to embedded/multi-track subtitles;
+        // external `--sub-file` tracks still take precedence automatically.
+        (c"slang", c"en,eng,english"),
     ] {
         // SAFETY: valid handle and static C strings.
         check(unsafe { (api.set_option_string)(mpv, name.as_ptr(), value.as_ptr()) })?;
@@ -930,6 +950,243 @@ mod tests {
         player.stop();
         std::thread::sleep(Duration::from_millis(300));
         assert!(player.take_frame().is_none(), "frame came back after stop");
+
+        drop(player);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitized_webvtt_restores_cues_after_blank_line() {
+        let dir =
+            std::env::temp_dir().join(format!("ani-gui-player-vtt-test-{}", std::process::id()));
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            eprintln!("skipping: cannot create {}: {err}", dir.display());
+            return;
+        }
+        let clip = dir.join("clip.mp4");
+        let ok = Command::new("ffmpeg")
+            .args(["-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("color=c=black:s=64x64:d=6:r=10")
+            .arg("-y")
+            .arg(&clip)
+            .stdin(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("skipping: ffmpeg is not available to generate a test clip");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let Some(player) = test_player() else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+
+        // Mirrors Makeine ep 9: a blank line inside a bold sign causes
+        // FFmpeg's webvtt demuxer to drop every cue after it.
+        let broken = "WEBVTT\r\n\r\n\
+            00:00.500 --> 00:02.500\r\n\
+            <b>Edible\r\n\r\n\
+            Readings</b>\r\n\r\n\
+            00:03.200 --> 00:05.800\r\n\
+            Yup. Perfect.\r\n";
+        let raw_vtt = dir.join("raw.vtt");
+        let fixed_vtt = dir.join("fixed.vtt");
+        std::fs::write(&raw_vtt, broken).unwrap();
+        let sanitized = crate::anicli::sanitize_webvtt(broken);
+        std::fs::write(&fixed_vtt, &sanitized.content).unwrap();
+
+        let load_and_sample = |sub: &Path, start: f64| -> String {
+            let stream = Stream {
+                url: clip.to_string_lossy().into_owned(),
+                referrer: None,
+                audio_file: None,
+                sub_file: Some(sub.to_string_lossy().into_owned()),
+                title: None,
+            };
+            player.load(&stream, start).expect("load");
+            assert!(
+                wait_for(Duration::from_secs(5), || player.state().time_pos >= start),
+                "did not reach {start}s (at {})",
+                player.state().time_pos
+            );
+            std::thread::sleep(Duration::from_millis(250));
+            player.property_string("sub-text").unwrap_or_default()
+        };
+
+        // Raw file reproduces the truncation: second cue after the orphan block is lost.
+        assert_eq!(load_and_sample(&raw_vtt, 1.0).trim(), "Edible");
+        assert_eq!(load_and_sample(&raw_vtt, 4.0).trim(), "");
+
+        // Sanitized file restores both the full multi-line sign and the later cue.
+        let sign = load_and_sample(&fixed_vtt, 1.0);
+        assert!(
+            sign.contains("Edible") && sign.contains("Readings"),
+            "{sign:?}"
+        );
+        assert_eq!(load_and_sample(&fixed_vtt, 4.0).trim(), "Yup. Perfect.");
+
+        drop(player);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefers_english_embedded_and_external_sub_file() {
+        let dir =
+            std::env::temp_dir().join(format!("ani-gui-player-slang-test-{}", std::process::id()));
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            eprintln!("skipping: cannot create {}: {err}", dir.display());
+            return;
+        }
+        let ar = dir.join("ar.srt");
+        let en = dir.join("en.srt");
+        let ext = dir.join("ext.vtt");
+        let mkv = dir.join("multi.mkv");
+        std::fs::write(&ar, "1\n00:00:00,200 --> 00:00:03,800\nArabic embedded\n").unwrap();
+        std::fs::write(&en, "1\n00:00:00,200 --> 00:00:03,800\nEnglish embedded\n").unwrap();
+        std::fs::write(&ext, "WEBVTT\n\n00:00.200 --> 00:03.800\nExternal VTT\n").unwrap();
+
+        let ok = Command::new("ffmpeg")
+            .args(["-y", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("color=c=black:s=64x64:d=4:r=10")
+            .args(["-i"])
+            .arg(&ar)
+            .args(["-i"])
+            .arg(&en)
+            .args([
+                "-map",
+                "0:v",
+                "-map",
+                "1:s",
+                "-map",
+                "2:s",
+                "-c:v",
+                "libx264",
+                "-c:s",
+                "srt",
+                "-metadata:s:s:0",
+                "language=ara",
+                "-metadata:s:s:1",
+                "language=eng",
+            ])
+            .arg(&mkv)
+            .stdin(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("skipping: ffmpeg could not mux multi-subtitle mkv");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let Some(player) = test_player() else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+
+        let sample = |sub_file: Option<String>| -> String {
+            let stream = Stream {
+                url: mkv.to_string_lossy().into_owned(),
+                referrer: None,
+                audio_file: None,
+                sub_file,
+                title: None,
+            };
+            player.load(&stream, 1.0).expect("load");
+            assert!(
+                wait_for(Duration::from_secs(5), || player.state().time_pos >= 1.0),
+                "did not reach 1.0s"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+            player.property_string("sub-text").unwrap_or_default()
+        };
+
+        assert_eq!(sample(None).trim(), "English embedded");
+        assert_eq!(
+            sample(Some(ext.to_string_lossy().into_owned())).trim(),
+            "External VTT"
+        );
+        // External sub is file-local and doesn't stick to the next load.
+        assert_eq!(sample(None).trim(), "English embedded");
+
+        drop(player);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[ignore = "runs ani-cli and libmpv against live Makeine ep 9; needs `cargo build` first"]
+    fn live_makeine_ep9_subtitles_in_second_half() {
+        let exe = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("ani-gui");
+        assert!(exe.exists(), "run `cargo build` first: {}", exe.display());
+        let dir =
+            std::env::temp_dir().join(format!("ani-gui-live-makeine-ep9-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shims = crate::anicli::ensure_shims(&dir.join("cache"), &exe).unwrap();
+        let show = crate::model::ShowSummary {
+            id: "makeine-live".into(),
+            title: "Make Heroine ga Oosugiru!".into(),
+            english_title: Some("Makeine: Too Many Losing Heroines!".into()),
+            ..Default::default()
+        };
+        let req = crate::anicli::build_request(&show, None, "9", crate::model::Mode::Sub, "best");
+        let hist = dir.join("hist");
+        let scope = crate::anicli::ResolveScope::default();
+        let handle = scope.handle();
+        let program = crate::anicli::find().expect("ani-cli installed");
+        let outcome = crate::anicli::resolve_with(
+            &program,
+            &req,
+            &shims,
+            &[("ANI_CLI_HIST_DIR", hist.into())],
+            Duration::from_secs(60),
+            Some(&handle),
+        )
+        .unwrap();
+        let crate::anicli::ResolveOutcome::Stream(stream) = outcome else {
+            panic!("expected Stream, got {outcome:?}");
+        };
+        let sub_path = stream.sub_file.as_deref().expect("resolved sub_file");
+        let sub_body = std::fs::read_to_string(sub_path).expect("cached local sanitized VTT");
+        let stats = crate::anicli::sanitize_webvtt(&sub_body);
+        assert!(
+            stats.cue_count >= 300 && stats.last_end_secs >= 1300.0,
+            "unexpected Makeine ep 9 subtitle coverage: {stats:?}"
+        );
+
+        let Some(player) = test_player() else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        // Sample timestamps in the second half (past the 18:09 / 1089s truncation point).
+        for (ts, expected_substr) in [
+            (1090.5, "Readings"),
+            (1101.2, "Perfect"),
+            (1327.0, "Nukumizu"),
+            (1347.0, "Episode 9"),
+        ] {
+            player.load(&stream, ts).expect("load Makeine ep 9");
+            assert!(
+                wait_for(Duration::from_secs(15), || {
+                    player.state().time_pos >= ts - 1.0
+                        && player
+                            .property_string("sub-text")
+                            .is_some_and(|s| !s.trim().is_empty())
+                }),
+                "missing subtitle at {ts}s (pos={}, sub={:?})",
+                player.state().time_pos,
+                player.property_string("sub-text")
+            );
+            let text = player.property_string("sub-text").unwrap_or_default();
+            eprintln!("Makeine ep 9 @ {ts}s: {text:?}");
+            assert!(
+                text.contains(expected_substr),
+                "at {ts}s expected {expected_substr:?} in {text:?}"
+            );
+        }
 
         drop(player);
         let _ = std::fs::remove_dir_all(&dir);

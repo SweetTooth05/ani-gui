@@ -77,6 +77,10 @@ pub struct Api {
         unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int,
     pub set_property_string:
         unsafe extern "C" fn(*mut MpvHandle, *const c_char, *const c_char) -> c_int,
+    #[cfg(test)]
+    pub get_property_string: unsafe extern "C" fn(*mut MpvHandle, *const c_char) -> *mut c_char,
+    #[cfg(test)]
+    pub free: unsafe extern "C" fn(*mut c_void),
     pub command: unsafe extern "C" fn(*mut MpvHandle, *mut *const c_char) -> c_int,
     pub observe_property: unsafe extern "C" fn(*mut MpvHandle, u64, *const c_char, c_int) -> c_int,
     pub wait_event: unsafe extern "C" fn(*mut MpvHandle, c_double) -> *mut MpvEvent,
@@ -108,6 +112,10 @@ impl Api {
                 initialize: *lib.get(b"mpv_initialize\0")?,
                 set_option_string: *lib.get(b"mpv_set_option_string\0")?,
                 set_property_string: *lib.get(b"mpv_set_property_string\0")?,
+                #[cfg(test)]
+                get_property_string: *lib.get(b"mpv_get_property_string\0")?,
+                #[cfg(test)]
+                free: *lib.get(b"mpv_free\0")?,
                 command: *lib.get(b"mpv_command\0")?,
                 observe_property: *lib.get(b"mpv_observe_property\0")?,
                 wait_event: *lib.get(b"mpv_wait_event\0")?,
