@@ -89,7 +89,10 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 fetch() { # URL FILE EXPECTED_SHA256
-	curl -fsSL --retry 3 "$1" -o "$2.tmp"
+	if ! curl -fsSL --retry 3 "$1" -o "$2.tmp"; then
+		echo "build-windows.sh: downloading $1 failed" >&2
+		exit 1
+	fi
 	got=$(sha256sum "$2.tmp" | cut -d' ' -f1)
 	if [ "$got" != "$3" ]; then
 		rm -f "$2.tmp"
