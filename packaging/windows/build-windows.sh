@@ -131,9 +131,11 @@ for rel in bin/ani-gui.exe bin/libmpv-2.dll lib/ani-gui/bin/ani-cli lib/ani-gui/
 	fi
 done
 
+# ani-cli checks for a player before it handles -V; the app passes
+# ANI_CLI_PLAYER=debug for the same reason (anicli::version).
 ver_out=$(
 	cd "$prefix" &&
-		MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
+		ANI_CLI_PLAYER=debug MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' \
 			./lib/ani-gui/bin/busybox.exe sh lib/ani-gui/bin/ani-cli -V
 )
 echo "Smoke check (ani-cli -V): $ver_out"
