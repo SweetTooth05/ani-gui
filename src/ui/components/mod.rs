@@ -1,4 +1,6 @@
 pub mod button;
+pub mod chip;
+pub mod dropdown;
 pub mod hud;
 pub mod icon;
 pub mod image;

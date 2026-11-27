@@ -17,6 +17,7 @@ use crate::model::{Mode, ShowRecord};
 use crate::ui::accounts;
 use crate::ui::calendar::local_offset;
 use crate::ui::components::button::{ButtonKind, button};
+use crate::ui::components::icon::brand_mark;
 use crate::ui::components::poster::poster_card;
 use crate::ui::components::your_list::progress_label;
 use crate::ui::metadata::CardMeta;
@@ -260,6 +261,7 @@ impl MyListPage {
                     .items_start()
                     .gap(px(16.))
                     .pt(px(12.))
+                    .child(brand_mark(56.).opacity(0.9))
                     .child(
                         div()
                             .font_family(theme::DISPLAY_FONT)

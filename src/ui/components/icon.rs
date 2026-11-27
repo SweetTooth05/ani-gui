@@ -1,6 +1,7 @@
-//! Monochrome UI icons from `theme::UI_ICONS`, tinted with `text_color`.
+//! Monochrome UI icons from `theme::UI_ICONS`, tinted with `text_color`, and
+//! the colour brand mark.
 
-use gpui::{Styled, Svg, px, svg};
+use gpui::{Img, ObjectFit, Styled, StyledImage, Svg, img, px, svg};
 
 use crate::ui::theme;
 
@@ -20,4 +21,13 @@ pub fn icon(name: &'static str) -> Svg {
         .size(px(20.))
         .flex_none()
         .text_color(theme::text())
+}
+
+/// The ani-gui tile (the ア Play mark) in full colour, `size` px square:
+/// for empty and error states.
+pub fn brand_mark(size: f32) -> Img {
+    img(theme::SYMBOL)
+        .size(px(size))
+        .flex_none()
+        .object_fit(ObjectFit::Contain)
 }

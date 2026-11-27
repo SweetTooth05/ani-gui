@@ -27,7 +27,7 @@ use crate::diagnostics::LIBMPV_INSTALL_HINT;
 use crate::downloads::DownloadManager;
 use crate::images;
 use crate::keep_awake::KeepAwake;
-use crate::model::{AniListMedia, DownloadRecord, Progress, ShowSummary, Stream};
+use crate::model::{AniListMedia, DownloadRecord, Progress, Settings, ShowSummary, Stream};
 use crate::paths;
 use crate::playback;
 use crate::player::{MpvPlayer, PlaybackState, PlayerError};
@@ -61,8 +61,6 @@ const CONTEXT: &str = "Player";
 const HIDE_AFTER: Duration = Duration::from_millis(1750);
 /// How long the view's size must hold before mpv renders at it.
 const RESIZE_SETTLE: Duration = Duration::from_millis(150);
-const UP_NEXT_AFTER: Duration = Duration::from_secs(5);
-const SEEK_STEP: f64 = 10.0;
 const VOLUME_STEP: f64 = 5.0;
 const MAX_VOLUME: f64 = 100.0;
 /// Episode picker grid: columns, and rows visible before it scrolls.
@@ -153,6 +151,15 @@ pub struct PlayerView {
     cache_dir: PathBuf,
     shims: Result<PathBuf, String>,
     autoplay: bool,
+    /// From Settings: jump past openings, the Up next countdown, the skip
+    /// buttons' step, and whether to keep the screen awake.
+    auto_skip_intro: bool,
+    up_next_after: Duration,
+    seek_step: f64,
+    keep_awake_on: bool,
+    /// This episode's opening was already skipped automatically, so seeking
+    /// back into it doesn't skip again.
+    intro_auto_skipped: bool,
     focus: FocusHandle,
     focused: bool,
     state: PlaybackState,
@@ -256,6 +263,14 @@ impl PlayerView {
             }
         });
         cx.on_release(Self::release).detach();
+        let defaults = Settings::default();
+        let settings = cx
+            .try_global::<AppState>()
+            .map_or(&defaults, |s| &s.settings);
+        let auto_skip_intro = settings.auto_skip_intro;
+        let up_next_after = Duration::from_secs(u64::from(settings.up_next_secs));
+        let seek_step = f64::from(settings.seek_secs);
+        let keep_awake_on = settings.keep_awake;
         let saved_at = req.start;
         let mut view = PlayerView {
             root,
@@ -271,6 +286,11 @@ impl PlayerView {
             cache_dir,
             shims,
             autoplay,
+            auto_skip_intro,
+            up_next_after,
+            seek_step,
+            keep_awake_on,
+            intro_auto_skipped: false,
             focus: cx.focus_handle(),
             focused: false,
             state: PlaybackState::default(),
@@ -691,6 +711,7 @@ impl PlayerView {
         self.up_next = None;
         self.loaded_from_cache = from_cache;
         self.chapters.clear();
+        self.intro_auto_skipped = false;
         self.prompt_tracker.reset();
         self.prompt_hide_task = None;
         self.prompt_fade_task = None;
@@ -870,8 +891,9 @@ impl PlayerView {
         let Some(ep) = self.next_ep() else {
             return;
         };
+        let wait = self.up_next_after;
         let timer = cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(UP_NEXT_AFTER).await;
+            cx.background_executor().timer(wait).await;
             this.update(cx, |view, cx| {
                 if let Some(next) = view.up_next.take() {
                     view.advance(next.ep, cx);
@@ -939,7 +961,7 @@ impl PlayerView {
             && self.started
             && !self.state.paused
             && !self.state.eof;
-        self.keep_awake.set_active(playing);
+        self.keep_awake.set_active(playing && self.keep_awake_on);
     }
 
     /// Saves the current episode, then plays `ep` in the same quality: from
@@ -1206,6 +1228,17 @@ impl PlayerView {
         } else {
             None
         };
+        if skip_times::should_auto_skip(
+            eligible,
+            self.auto_skip_intro,
+            self.intro_auto_skipped,
+            self.skip_times.intro.is_some(),
+        ) {
+            self.intro_auto_skipped = true;
+            // Seeks past the opening and comes back here once.
+            self.skip_intro(cx);
+            return;
+        }
         if self.prompt_tracker.update(eligible, now) {
             self.prompt_hide_task = None;
             if let Some(wait) = self.prompt_tracker.time_until_hide(now) {
@@ -1805,8 +1838,13 @@ impl PlayerView {
                 .on_click(cx.listener(|view, _, _, cx| view.play_previous(cx))),
             )
             .child(
-                skip_button("player-back-10", false, SEEK_STEP as u32, "Back 10 s (←)")
-                    .on_click(cx.listener(|view, _, _, cx| view.seek_by(-SEEK_STEP, cx))),
+                skip_button(
+                    "player-back-10",
+                    false,
+                    self.seek_step as u32,
+                    format!("Back {} s (←)", self.seek_step),
+                )
+                .on_click(cx.listener(|view, _, _, cx| view.seek_by(-view.seek_step, cx))),
             )
             .child(
                 hud_button(
@@ -1825,10 +1863,10 @@ impl PlayerView {
                 skip_button(
                     "player-forward-10",
                     true,
-                    SEEK_STEP as u32,
-                    "Forward 10 s (→)",
+                    self.seek_step as u32,
+                    format!("Forward {} s (→)", self.seek_step),
                 )
-                .on_click(cx.listener(|view, _, _, cx| view.seek_by(SEEK_STEP, cx))),
+                .on_click(cx.listener(|view, _, _, cx| view.seek_by(view.seek_step, cx))),
             )
             .child(
                 hud_button(
@@ -2096,7 +2134,7 @@ impl PlayerView {
             .child(div().h(px(3.)).bg(gpui::white().opacity(0.08)).child(
                 div().h_full().bg(theme::accent()).with_animation(
                     bar_id,
-                    Animation::new(UP_NEXT_AFTER),
+                    Animation::new(self.up_next_after),
                     |bar, t| bar.w(relative(1. - t)),
                 ),
             ))
@@ -2210,8 +2248,8 @@ impl Render for PlayerView {
                     view.go_back(window, cx);
                 }),
             )
-            .on_action(cx.listener(|view, _: &SeekBack, _, cx| view.seek_by(-SEEK_STEP, cx)))
-            .on_action(cx.listener(|view, _: &SeekForward, _, cx| view.seek_by(SEEK_STEP, cx)))
+            .on_action(cx.listener(|view, _: &SeekBack, _, cx| view.seek_by(-view.seek_step, cx)))
+            .on_action(cx.listener(|view, _: &SeekForward, _, cx| view.seek_by(view.seek_step, cx)))
             .on_action(cx.listener(|view, _: &VolumeUp, _, cx| {
                 view.set_volume(view.state.volume + VOLUME_STEP, cx)
             }))

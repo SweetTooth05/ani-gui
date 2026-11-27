@@ -8,7 +8,7 @@ use gpui::{
 };
 
 use crate::app::{AppState, Root, Route, ShowRef};
-use crate::model::Airing;
+use crate::model::{Airing, ClockFormat};
 use crate::ui::components::button::{ButtonKind, button};
 use crate::ui::components::icon::icon;
 use crate::ui::components::image::rounded_image;
@@ -89,7 +89,10 @@ impl CalendarPage {
     }
 
     fn reload(&mut self, cx: &mut Context<Self>) {
-        let Some(db) = cx.try_global::<AppState>().map(|s| s.db.clone()) else {
+        let Some((db, clock)) = cx
+            .try_global::<AppState>()
+            .map(|s| (s.db.clone(), s.settings.clock))
+        else {
             return;
         };
         let keep_visible = matches!(self.state, State::Ready(_));
@@ -105,7 +108,7 @@ impl CalendarPage {
                         let mut items = catalog::schedule_week_cached(&db_cached)?;
                         let now = db::now();
                         items.retain(|a| a.airing_at >= now);
-                        Some(week(&items, now, local_offset(now), local_offset))
+                        Some(week(&items, now, local_offset(now), local_offset, clock))
                     })
                     .await;
                 if let Some(days) = cached {
@@ -122,7 +125,7 @@ impl CalendarPage {
                     let now = db::now();
                     // The cached week may have started a while ago.
                     items.retain(|a| a.airing_at >= now);
-                    week(&items, now, local_offset(now), local_offset)
+                    week(&items, now, local_offset(now), local_offset, clock)
                 })
                 .await;
             this.update(cx, |page, cx| {
@@ -195,6 +198,8 @@ impl CalendarPage {
                             .line_height(px(46.))
                             .text_color(if selected {
                                 theme::text()
+                            } else if theme::is_light() {
+                                theme::text_dim()
                             } else {
                                 theme::text_muted()
                             })
@@ -208,16 +213,22 @@ impl CalendarPage {
                             .child(count),
                     )
                     .when(selected, |tile| {
-                        tile.bg(theme::raised()).child(
-                            div()
-                                .absolute()
-                                .bottom(px(0.))
-                                .left(px(14.))
-                                .right(px(14.))
-                                .h(px(3.))
-                                .rounded_t(px(2.))
-                                .bg(theme::accent()),
-                        )
+                        tile.bg(theme::control())
+                            .when(theme::is_light(), |d| {
+                                d.border_1()
+                                    .border_color(theme::control_border())
+                                    .shadow(theme::shadow_sm())
+                            })
+                            .child(
+                                div()
+                                    .absolute()
+                                    .bottom(px(0.))
+                                    .left(px(14.))
+                                    .right(px(14.))
+                                    .h(px(3.))
+                                    .rounded_t(px(2.))
+                                    .bg(theme::accent()),
+                            )
                     })
                     .when(!selected, |tile| {
                         tile.cursor_pointer()
@@ -281,7 +292,14 @@ impl CalendarPage {
             .p(px(10.))
             .rounded(px(12.))
             .cursor_pointer()
-            .hover(|s| s.bg(theme::raised()))
+            .hover(|s| {
+                let s = s.bg(theme::control());
+                if theme::is_light() {
+                    s.shadow(theme::shadow_sm())
+                } else {
+                    s
+                }
+            })
             .on_click(
                 cx.listener(move |page, _, _, cx| {
                     page.open(anilist_id, click_title.to_string(), cx)
@@ -302,11 +320,13 @@ impl CalendarPage {
                     .flex_none()
                     .w(px(COVER_W))
                     .h(px(COVER_H))
+                    .rounded(px(8.))
+                    .when(theme::is_light(), |d| d.shadow(theme::shadow_sm()))
                     .child(rounded_image(
                         &slot.airing.media.cover_url,
                         px(8.),
                         theme::night(),
-                        Some(("airing", theme::raised().into())),
+                        Some(("airing", theme::control().into())),
                     )),
             )
             .child(
@@ -442,6 +462,7 @@ fn week(
     now: i64,
     tz_offset_secs: i64,
     offset_at: impl Fn(i64) -> i64,
+    clock: ClockFormat,
 ) -> Vec<Day> {
     let mut groups = group_by_day(items, tz_offset_secs);
     let today = local_day(now, tz_offset_secs);
@@ -456,7 +477,7 @@ fn week(
                 .into_iter()
                 .map(|airing| {
                     let time: SharedString =
-                        time_label(airing.airing_at, offset_at(airing.airing_at)).into();
+                        clock_label(airing.airing_at, offset_at(airing.airing_at), clock).into();
                     let title: SharedString = media_title(&airing.media).to_string().into();
                     let episode_label: SharedString = match airing.media.episodes {
                         Some(total) => format!("Episode {} of {total}", airing.episode).into(),
@@ -541,10 +562,18 @@ pub fn day_label(day: i64) -> String {
     format!("{weekday} {dom}")
 }
 
-/// Local "HH:MM" of `ts`.
-pub fn time_label(ts: i64, tz_offset_secs: i64) -> String {
+/// Local time of `ts`: "18:05", or "6:05 PM" on a 12-hour clock.
+pub fn clock_label(ts: i64, tz_offset_secs: i64, clock: ClockFormat) -> String {
     let secs = (ts + tz_offset_secs).rem_euclid(DAY);
-    format!("{:02}:{:02}", secs / 3600, secs % 3600 / 60)
+    let (h, m) = (secs / 3600, secs % 3600 / 60);
+    match clock {
+        ClockFormat::H24 => format!("{h:02}:{m:02}"),
+        ClockFormat::H12 => {
+            let suffix = if h < 12 { "AM" } else { "PM" };
+            let h12 = if h % 12 == 0 { 12 } else { h % 12 };
+            format!("{h12}:{m:02} {suffix}")
+        }
+    }
 }
 
 /// `items` by local day, earliest first, each day's airings in time order.
@@ -566,7 +595,7 @@ pub fn group_by_day(items: &[Airing], tz_offset_secs: i64) -> Vec<(String, Vec<A
 
 /// (year, month, day) of `days` since 1970-01-01, proleptic Gregorian
 /// (Howard Hinnant's `civil_from_days`).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -641,7 +670,7 @@ mod tests {
     #[test]
     fn week_has_seven_days_from_today() {
         let items = [airing(1, MON_NOON_UTC), airing(2, TUE_10_UTC)];
-        let days = week(&items, MON_NOON_UTC - 3600, 0, |_| 0);
+        let days = week(&items, MON_NOON_UTC - 3600, 0, |_| 0, ClockFormat::H24);
         assert_eq!(days.len(), 7);
         assert_eq!((days[0].weekday, days[0].date), ("Mon", 23));
         assert_eq!((days[6].weekday, days[6].date), ("Sun", 29));
@@ -658,7 +687,13 @@ mod tests {
         let items = [airing(1, MON_NOON_UTC), airing(2, TUE_10_UTC)];
         // Clocks go forward an hour between the two airings.
         let offset_at = |ts: i64| if ts < TUE_10_UTC { 3600 } else { 7200 };
-        let days = week(&items, MON_NOON_UTC - 3600, 3600, offset_at);
+        let days = week(
+            &items,
+            MON_NOON_UTC - 3600,
+            3600,
+            offset_at,
+            ClockFormat::H24,
+        );
         assert_eq!(days[0].slots[0].time, "13:00");
         assert_eq!(days[1].slots[0].time, "12:00");
     }
@@ -670,8 +705,17 @@ mod tests {
         // Month and year boundaries.
         assert_eq!(civil_from_days(local_day(1_798_675_200, 0)), (2026, 12, 31));
         assert_eq!(civil_from_days(local_day(1_798_761_600, 0)), (2027, 1, 1));
-        assert_eq!(time_label(MON_2330_UTC, 0), "23:30");
-        assert_eq!(time_label(MON_2330_UTC, 3600), "00:30");
-        assert_eq!(time_label(MON_NOON_UTC, -5 * 3600 - 1800), "06:30");
+        assert_eq!(clock_label(MON_2330_UTC, 0, ClockFormat::H24), "23:30");
+        assert_eq!(clock_label(MON_2330_UTC, 0, ClockFormat::H12), "11:30 PM");
+        assert_eq!(
+            clock_label(MON_2330_UTC, 3600, ClockFormat::H12),
+            "12:30 AM"
+        );
+        assert_eq!(clock_label(MON_NOON_UTC, 0, ClockFormat::H12), "12:00 PM");
+        assert_eq!(clock_label(MON_2330_UTC, 3600, ClockFormat::H24), "00:30");
+        assert_eq!(
+            clock_label(MON_NOON_UTC, -5 * 3600 - 1800, ClockFormat::H24),
+            "06:30"
+        );
     }
 }

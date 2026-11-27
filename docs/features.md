@@ -3,9 +3,18 @@
 - **Home**: a hero banner, Continue Watching, recommendations based on what you
   watch, and AniList's trending shows. Opens from the local cache straight away
   and refreshes in the background.
-- **Search** with cover art and sub/dub episode counts.
-- **Show pages** with the synopsis, genres, score, and an episode list that
-  marks what you've watched.
+- **Search** opens on a ready-made listing (Trending now, Popular this season,
+  Upcoming, All-time popular or Top rated). Typing a title searches AllAnime,
+  with sub/dub episode counts. A row of **filter dropdowns** searches AniList's
+  catalogue the way AniList and MyAnimeList's browse pages do: genres and tags
+  (audience such as Shounen or Seinen, and themes) to include (green, +) or
+  leave out (red, −), formats, airing status, season, year, source material,
+  country, minimum score, length, and sort order. Active genre and tag picks
+  show as removable pills under the row.
+- **Show pages** with the synopsis, score, and an episode list that marks what
+  you've watched. Genres and AniList tags (with how strongly each applies)
+  appear as chips; click one to list every show with it. Spoiler tags stay
+  hidden until you ask for them.
 - **In-window playback** through libmpv: seek bar, volume, fullscreen, external
   subtitle and audio tracks, autoplay of the next episode, and resume from where
   you stopped. **Skip intro** and **Next episode** appear only during the
@@ -20,8 +29,15 @@
 - **Downloads** manager with live progress, cancel and retry.
 - **Shares history with ani-cli**: what you watch here shows up in
   `ani-cli -c`, and the other way round.
-- Settings for sub/dub, quality, download folder and autoplay, plus a
-  Diagnostics panel that checks your dependencies.
+- **Settings**:
+  - Appearance: theme (Night, Midnight, Dusk, Daylight), accent colour (Amber,
+    Coral, Violet, Cyan, Mint), English or romaji titles, 24- or 12-hour clock,
+    the page ani-gui opens on, and poster hover details.
+  - Playback: sub/dub, quality, autoplay, the Up next countdown, skipping
+    openings automatically, the skip step, and keeping the screen awake.
+  - Browsing: what Search opens with, and whether to show spoiler tags.
+  - Download folder, updates, accounts, a Diagnostics panel that checks your
+    dependencies, and About.
 
 ## Player keys
 

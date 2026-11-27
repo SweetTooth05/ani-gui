@@ -461,6 +461,7 @@ impl AccountsSection {
             .bg(theme::deep())
             .border_1()
             .border_color(theme::line())
+            .when(theme::is_light(), |d| d.shadow(theme::shadow_sm()))
             .child(header)
             .child(body)
             .children(error.map(|err| {
@@ -561,7 +562,14 @@ impl AccountsSection {
                                 .px(px(12.))
                                 .py(px(7.))
                                 .rounded(px(8.))
-                                .bg(theme::raised())
+                                .bg(if theme::is_light() {
+                                    theme::night()
+                                } else {
+                                    theme::raised()
+                                })
+                                .when(theme::is_light(), |d| {
+                                    d.border_1().border_color(theme::line())
+                                })
                                 .text_size(px(theme::SMALL))
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(uri),
@@ -679,6 +687,7 @@ impl Render for AccountsSection {
 }
 
 fn status_chip(label: String, connected: bool) -> impl IntoElement {
+    let light = theme::is_light();
     div()
         .flex()
         .flex_none()
@@ -687,7 +696,15 @@ fn status_chip(label: String, connected: bool) -> impl IntoElement {
         .px(px(10.))
         .py(px(5.))
         .rounded_full()
-        .bg(theme::raised())
+        .when(light && connected, |d| {
+            d.bg(theme::accent_alpha(0.10))
+                .border_1()
+                .border_color(theme::accent_alpha(0.22))
+        })
+        .when(light && !connected, |d| {
+            d.bg(theme::night()).border_1().border_color(theme::line())
+        })
+        .when(!light, |d| d.bg(theme::raised()))
         .text_size(px(theme::SMALL))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(if connected {

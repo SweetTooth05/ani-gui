@@ -311,7 +311,7 @@ impl Render for HudTooltip {
             .px(px(10.))
             .py(px(5.))
             .rounded(px(8.))
-            .bg(theme::night_alpha(0.96))
+            .bg(theme::art_scrim(0.96))
             .border_1()
             .border_color(hairline())
             .text_size(px(theme::SMALL))

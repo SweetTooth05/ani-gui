@@ -16,8 +16,9 @@ use crate::downloads::{DlProgress, DownloadEvent, DownloadManager};
 use crate::model::{DlStatus, DownloadRecord, ShowSummary};
 use crate::playback;
 use crate::ui::components::button::{ButtonKind, button};
+use crate::ui::components::icon::brand_mark;
 use crate::ui::components::image::rounded_image;
-use crate::ui::components::poster::progress_bar;
+use crate::ui::components::poster::ui_progress_bar;
 use crate::ui::components::toast;
 use crate::ui::files::{display_path, open_folder};
 use crate::ui::theme;
@@ -307,6 +308,7 @@ impl DownloadsPage {
             .h(px(COVER_H))
             .rounded(px(8.))
             .bg(theme::raised())
+            .when(theme::is_light(), |d| d.shadow(theme::shadow_sm()))
             .child(match cover {
                 Some(url) => rounded_image(&url, px(8.), theme::night(), None).into_any_element(),
                 None => div()
@@ -448,6 +450,7 @@ impl DownloadsPage {
                 .items_start()
                 .gap(px(16.))
                 .pt(px(12.))
+                .child(brand_mark(56.).opacity(0.9))
                 .child(
                     div()
                         .font_family(theme::DISPLAY_FONT)
@@ -608,7 +611,7 @@ fn status_line(row: &Row) -> AnyElement {
                     div()
                         .w(px(240.))
                         .flex_none()
-                        .child(progress_bar(percent.unwrap_or(0.0) / 100.0)),
+                        .child(ui_progress_bar(percent.unwrap_or(0.0) / 100.0)),
                 )
                 .child(
                     div()

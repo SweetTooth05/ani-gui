@@ -12,14 +12,14 @@ use gpui::{
 
 use crate::db::Db;
 use crate::downloads::DownloadManager;
-use crate::model::{Mode, Settings, ShowSummary, Stream};
+use crate::model::{Mode, Settings, ShowSummary, StartPage, Stream};
 use crate::ui::calendar::CalendarPage;
 use crate::ui::components::toast::{self, Toasts};
 use crate::ui::downloads_page::DownloadsPage;
 use crate::ui::home::HomePage;
 use crate::ui::my_list::MyListPage;
 use crate::ui::player_view::{self, PlayerView};
-use crate::ui::search::SearchPage;
+use crate::ui::search::{SearchFilter, SearchPage};
 use crate::ui::settings_page::SettingsPage;
 use crate::ui::show::ShowPage;
 use crate::ui::{sidebar, theme, titlebar};
@@ -246,6 +246,12 @@ struct Started {
     home_snapshot: Option<crate::ui::home::HomeData>,
 }
 
+/// Makes the theme, accent and title language in `settings` current.
+pub fn apply_display_prefs(settings: &Settings) {
+    theme::apply(settings);
+    crate::model::set_title_language(settings.title_language);
+}
+
 /// Opens the database, loads settings and downloads, reads the cached Home
 /// snapshot, and writes ani-cli's shims.
 fn start() -> Result<Started> {
@@ -258,6 +264,7 @@ fn start() -> Result<Started> {
         Settings::default()
     });
     trace_span("start.load_settings", t1.elapsed());
+    apply_display_prefs(&settings);
     let t_snap = Instant::now();
     let home_snapshot = crate::ui::home::read_snapshot_db(&db);
     trace_span(
@@ -355,6 +362,7 @@ impl Root {
             async {}
         })
         .detach();
+        let start_page = started.settings.start_page;
         cx.set_global(AppState {
             db: started.db,
             settings: started.settings,
@@ -371,6 +379,16 @@ impl Root {
             route: Route::Home,
             page: Page::Home(home),
         });
+        let start_route = match start_page {
+            StartPage::Home => None,
+            StartPage::Search => Some(Route::Search),
+            StartPage::MyList => Some(Route::MyList),
+            StartPage::Calendar => Some(Route::Calendar),
+        };
+        if let Some(route) = start_route {
+            self.navigate(route, cx);
+        }
+        cx.refresh_windows();
         cx.notify();
         crate::updater::init(cx);
         crate::ui::downloads_page::watch_toasts(cx);
@@ -429,6 +447,14 @@ impl Root {
         }
         self.stack.push(Entry { route, page });
         cx.notify();
+    }
+
+    /// Opens Search listing every show with `filter` (a genre or tag).
+    pub fn search_for(&mut self, filter: SearchFilter, cx: &mut Context<Self>) {
+        self.navigate(Route::Search, cx);
+        if let Some(search) = self.search.clone() {
+            search.update(cx, |search, cx| search.show_only(filter, cx));
+        }
     }
 
     /// Returns to the previous page, if any. The player saves its progress
@@ -530,6 +556,7 @@ fn placeholder(title: &str, detail: String) -> gpui::AnyElement {
         .justify_center()
         .px(theme::gutter())
         .gap_3()
+        .child(crate::ui::components::icon::brand_mark(72.).mb(px(12.)))
         .child(
             div()
                 .font_family(theme::DISPLAY_FONT)
@@ -554,6 +581,11 @@ impl Render for Root {
         if trace_enabled() && FIRST_FRAME.set(()).is_ok() {
             trace_event("root_first_render");
         }
+        // The player draws in the dark palette whatever the theme; this
+        // runs before any page renders in this frame.
+        theme::set_stage(
+            matches!(self.phase, Phase::Ready) && matches!(self.current(), Some(Route::Player(_))),
+        );
         let body = match &self.phase {
             Phase::Starting => div()
                 .size_full()

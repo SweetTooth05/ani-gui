@@ -354,6 +354,7 @@ impl Render for Toasts {
                     Kind::Success => ("check", theme::accent()),
                     Kind::Error => ("circle-alert", theme::danger()),
                 };
+                let light = theme::is_light();
                 let action_el = item.action.clone().map(|action| {
                     let on_click = action.on_click.clone();
                     let accent_btn = kind == Kind::Success;
@@ -369,8 +370,13 @@ impl Render for Toasts {
                         .cursor_pointer()
                         .bg(if accent_btn {
                             theme::accent()
+                        } else if light {
+                            theme::night()
                         } else {
                             theme::raised_hover()
+                        })
+                        .when(light && !accent_btn, |d| {
+                            d.border_1().border_color(theme::control_border())
                         })
                         .text_color(if accent_btn {
                             theme::on_accent()
@@ -380,6 +386,8 @@ impl Render for Toasts {
                         .hover(move |s| {
                             s.bg(if accent_btn {
                                 theme::accent_hover()
+                            } else if light {
+                                theme::ghost_hover()
                             } else {
                                 theme::line()
                             })
@@ -400,10 +408,11 @@ impl Render for Toasts {
                     .px(px(14.))
                     .py(px(11.))
                     .rounded(px(10.))
-                    .bg(theme::raised())
+                    .bg(theme::control())
                     .border_l(px(3.))
                     .border_color(accent_color)
-                    .shadow_lg()
+                    .when(!light, |d| d.shadow_lg())
+                    .when(light, |d| d.shadow(theme::shadow_lg()))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.dismiss(id, cx)))
                     .child(icon(icon_name).size(px(16.)).text_color(accent_color))

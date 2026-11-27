@@ -75,8 +75,13 @@ impl PosterCard {
 impl RenderOnce for PosterCard {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let hovered = cx.try_global::<HoveredPoster>().and_then(|h| h.0.as_ref()) == Some(&self.id);
-        let has_meta = self.meta.is_some();
+        // Settings › Poster details turns the hover overlay off.
+        let details = cx
+            .try_global::<crate::app::AppState>()
+            .is_none_or(|s| s.settings.poster_details);
+        let has_meta = details && self.meta.is_some();
         let hover_id = has_meta.then(|| self.id.clone());
+        let light = theme::is_light();
         let card = div()
             .id(self.id)
             .group("poster")
@@ -91,13 +96,20 @@ impl RenderOnce for PosterCard {
                     .relative()
                     .w(px(theme::POSTER_W))
                     .h(px(theme::POSTER_H))
+                    .rounded(px(RADIUS))
+                    .when(light, |d| d.shadow(theme::shadow_sm()))
                     .child(rounded_image(
                         &self.cover_url,
                         px(RADIUS),
                         theme::night(),
                         None,
                     ))
-                    .children(self.meta.as_ref().filter(|_| hovered).map(info_overlay))
+                    .children(
+                        self.meta
+                            .as_ref()
+                            .filter(|_| hovered && details)
+                            .map(info_overlay),
+                    )
                     .children(
                         self.meta
                             .as_ref()
@@ -112,8 +124,18 @@ impl RenderOnce for PosterCard {
                     .text_size(px(14.))
                     .line_height(relative(1.25))
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::text_dim())
-                    .group_hover("poster", |s| s.text_color(theme::text()))
+                    .text_color(if light {
+                        theme::text()
+                    } else {
+                        theme::text_dim()
+                    })
+                    .group_hover("poster", move |s| {
+                        s.text_color(if light {
+                            theme::accent()
+                        } else {
+                            theme::text()
+                        })
+                    })
                     .line_clamp(2)
                     .child(self.title),
             )
@@ -192,6 +214,7 @@ impl EpisodeCard {
 
 impl RenderOnce for EpisodeCard {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        let light = theme::is_light();
         let card = div()
             .id(self.id)
             .group("episode-card")
@@ -206,6 +229,8 @@ impl RenderOnce for EpisodeCard {
                     .relative()
                     .w(px(theme::CARD_W))
                     .h(px(theme::CARD_H))
+                    .rounded(px(RADIUS))
+                    .when(light, |d| d.shadow(theme::shadow_sm()))
                     .child(rounded_image(
                         &self.image_url,
                         px(RADIUS),
@@ -219,8 +244,8 @@ impl RenderOnce for EpisodeCard {
                             .rounded(px(RADIUS))
                             .bg(linear_gradient(
                                 0.,
-                                linear_color_stop(theme::night_alpha(0.85), 0.),
-                                linear_color_stop(theme::night_alpha(0.), 0.55),
+                                linear_color_stop(theme::art_scrim(0.85), 0.),
+                                linear_color_stop(theme::art_scrim(0.), 0.55),
                             )),
                     )
                     .when(self.fraction > 0.0, |art| {
@@ -244,8 +269,18 @@ impl RenderOnce for EpisodeCard {
                         div()
                             .text_size(px(14.))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::text_dim())
-                            .group_hover("episode-card", |s| s.text_color(theme::text()))
+                            .text_color(if light {
+                                theme::text()
+                            } else {
+                                theme::text_dim()
+                            })
+                            .group_hover("episode-card", move |s| {
+                                s.text_color(if light {
+                                    theme::accent()
+                                } else {
+                                    theme::text()
+                                })
+                            })
                             .truncate()
                             .child(self.title),
                     )
@@ -277,12 +312,16 @@ fn score_badge(score: String) -> gpui::Div {
         .pr(px(7.))
         .py(px(3.))
         .rounded(px(6.))
-        .bg(theme::night_alpha(0.78))
+        .bg(theme::art_scrim(0.78))
         .text_size(px(12.))
         .line_height(px(14.))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(theme::text())
-        .child(icon("star").size(px(11.)).text_color(theme::accent()))
+        .text_color(theme::on_art())
+        .child(
+            icon("star")
+                .size(px(11.))
+                .text_color(theme::on_art_accent()),
+        )
         .child(score)
 }
 
@@ -297,8 +336,8 @@ fn info_overlay(meta: &CardMeta) -> gpui::Div {
         .overflow_hidden()
         .bg(linear_gradient(
             0.,
-            linear_color_stop(theme::night_alpha(0.98), 0.),
-            linear_color_stop(theme::night_alpha(0.74), 0.7),
+            linear_color_stop(theme::art_scrim(0.98), 0.),
+            linear_color_stop(theme::art_scrim(0.74), 0.7),
         ))
         .flex()
         .flex_col()
@@ -316,12 +355,12 @@ fn info_overlay(meta: &CardMeta) -> gpui::Div {
                 .gap(px(6.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(if meta.airing {
-                    theme::accent()
+                    theme::on_art_accent()
                 } else {
-                    theme::text()
+                    theme::on_art()
                 })
                 .when(meta.airing, |s| {
-                    s.child(div().size(px(6.)).rounded_full().bg(theme::accent()))
+                    s.child(div().size(px(6.)).rounded_full().bg(theme::on_art_accent()))
                 })
                 .child(div().truncate().child(status))
         }))
@@ -329,7 +368,7 @@ fn info_overlay(meta: &CardMeta) -> gpui::Div {
             s.child(
                 div()
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme::text_dim())
+                    .text_color(theme::on_art_dim())
                     .truncate()
                     .child(facts),
             )
@@ -348,9 +387,9 @@ fn info_overlay(meta: &CardMeta) -> gpui::Div {
                             .px(px(6.))
                             .py(px(2.))
                             .rounded(px(4.))
-                            .bg(gpui::white().opacity(0.1))
+                            .bg(gpui::white().opacity(0.12))
                             .text_size(px(11.))
-                            .text_color(theme::text_dim())
+                            .text_color(theme::on_art_dim())
                             .child(g.clone())
                     })),
             )
@@ -359,7 +398,7 @@ fn info_overlay(meta: &CardMeta) -> gpui::Div {
             div()
                 .text_size(px(11.5))
                 .line_height(relative(1.35))
-                .text_color(theme::text_dim())
+                .text_color(theme::on_art_dim())
                 .line_clamp(3)
                 .child(s)
         }))
@@ -376,7 +415,7 @@ fn hover_ring(group: &'static str) -> gpui::Div {
         .group_hover(group, |s| s.border_color(theme::accent()))
 }
 
-/// A thin accent bar filled to `fraction` (0..=1).
+/// A thin accent bar filled to `fraction` (0..=1), drawn over dark art.
 pub fn progress_bar(fraction: f32) -> gpui::Div {
     div()
         .h(px(3.))
@@ -387,6 +426,22 @@ pub fn progress_bar(fraction: f32) -> gpui::Div {
                 .h_full()
                 .w(relative(fraction.clamp(0.0, 1.0)))
                 .rounded(px(2.))
-                .bg(theme::accent()),
+                .bg(theme::on_art_accent()),
         )
+}
+
+/// A thin accent bar filled to `fraction` (0..=1), drawn on a UI surface.
+pub fn ui_progress_bar(fraction: f32) -> gpui::Div {
+    let track: gpui::Hsla = if theme::is_light() {
+        theme::track().into()
+    } else {
+        gpui::white().opacity(0.22)
+    };
+    div().h(px(4.)).rounded(px(2.)).bg(track).child(
+        div()
+            .h_full()
+            .w(relative(fraction.clamp(0.0, 1.0)))
+            .rounded(px(2.))
+            .bg(theme::accent()),
+    )
 }
