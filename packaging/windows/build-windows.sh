@@ -19,10 +19,9 @@ TARGET=x86_64-pc-windows-msvc
 LIBMPV_URL=https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261111/mpv-dev-x86_64-20261111-git-bcde6b93cc.7z
 LIBMPV_SHA256=273c079b11ea5575822f972756f4c9a71149a5c10130353abeb8586738938452
 
-# busybox-w32 64-bit Unicode build (Windows 10 1903+ / Windows 11). To update:
-# pick a versioned binary from https://frippery.org/files/busybox/ and verify
-# against its SHA256SUM.
-BUSYBOX_URL=https://frippery.org/files/busybox/busybox-w64u-FRP-6354-g5f09fb446.exe
+# busybox-w32 64-bit Unicode build (Windows 10 1903+ / Windows 11), vendored
+# because frippery.org refuses some CI downloads; see vendor/busybox-w32/.
+BUSYBOX=vendor/busybox-w32/busybox-w64u-FRP-6354-g5f09fb446.exe
 BUSYBOX_SHA256=36b266923fc5765b42f5f981319f39568498fba60b53ccf26e8fc1e575e2a9a9
 
 if [ "$#" -ne 2 ]; then
@@ -88,17 +87,21 @@ winpath() {
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
+check_sha256() { # FILE EXPECTED_SHA256 NAME
+	got=$(sha256sum "$1" | cut -d' ' -f1)
+	if [ "$got" != "$2" ]; then
+		rm -f "$1"
+		echo "build-windows.sh: $3 has SHA-256 $got, expected $2" >&2
+		exit 1
+	fi
+}
+
 fetch() { # URL FILE EXPECTED_SHA256
 	if ! curl -fsSL --retry 3 "$1" -o "$2.tmp"; then
 		echo "build-windows.sh: downloading $1 failed" >&2
 		exit 1
 	fi
-	got=$(sha256sum "$2.tmp" | cut -d' ' -f1)
-	if [ "$got" != "$3" ]; then
-		rm -f "$2.tmp"
-		echo "build-windows.sh: $1 has SHA-256 $got, expected $3" >&2
-		exit 1
-	fi
+	check_sha256 "$2.tmp" "$3" "$1"
 	mv "$2.tmp" "$2"
 }
 
@@ -112,7 +115,8 @@ fetch "$LIBMPV_URL" "$work/mpv-dev.7z" "$LIBMPV_SHA256"
 MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$sevenz" e -y \
 	"$(winpath "$work/mpv-dev.7z")" "-o$(winpath "$prefix/bin")" libmpv-2.dll >/dev/null
 
-fetch "$BUSYBOX_URL" "$prefix/lib/ani-gui/bin/busybox.exe" "$BUSYBOX_SHA256"
+cp "$root/$BUSYBOX" "$prefix/lib/ani-gui/bin/busybox.exe"
+check_sha256 "$prefix/lib/ani-gui/bin/busybox.exe" "$BUSYBOX_SHA256" "$BUSYBOX"
 chmod 755 "$prefix/lib/ani-gui/bin/busybox.exe"
 
 sh "$root/packaging/fetch-ani-cli.sh" "$work/ani-cli"
