@@ -1030,6 +1030,8 @@ impl Drop for TempFile {
 pub enum NotEligible {
     UnknownPath,
     DevBuild,
+    /// Unix only: Windows has no root user.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Root,
     NotOwned,
     NotWritable,
