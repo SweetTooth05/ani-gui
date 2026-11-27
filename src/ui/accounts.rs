@@ -126,6 +126,8 @@ const ANILIST: ServiceInfo = ServiceInfo {
 pub struct AccountsSection {
     accounts: Vec<Account>,
     client_ids: HashMap<Service, Entity<TextInput>>,
+    /// Services with a built-in client ID where the user opened the custom-ID override.
+    custom_open: HashSet<Service>,
     token: Entity<TextInput>,
     /// AniList's token page was opened; the paste field shows.
     awaiting_token: bool,
@@ -157,6 +159,7 @@ impl AccountsSection {
         let mut section = AccountsSection {
             accounts: Service::ALL.into_iter().map(Account::empty).collect(),
             client_ids,
+            custom_open: HashSet::new(),
             token: cx.new(|cx| TextInput::new("Paste the token here", cx)),
             awaiting_token: false,
             working: HashSet::new(),
@@ -183,9 +186,17 @@ impl AccountsSection {
                 if !section.filled {
                     section.filled = true;
                     for account in &accounts {
-                        if let Some(input) = section.client_ids.get(&account.service) {
-                            let id = account.client_id.clone();
-                            input.update(cx, |input, cx| input.set_text(id, cx));
+                        let builtin = lists::builtin_client_id(account.service);
+                        let is_custom = !account.client_id.is_empty()
+                            && builtin.is_none_or(|b| b != account.client_id);
+                        if is_custom {
+                            if let Some(input) = section.client_ids.get(&account.service) {
+                                let id = account.client_id.clone();
+                                input.update(cx, |input, cx| input.set_text(id, cx));
+                            }
+                            if builtin.is_some() {
+                                section.custom_open.insert(account.service);
+                            }
                         }
                     }
                 }
@@ -209,6 +220,27 @@ impl AccountsSection {
             .get(&service)
             .map(|input| input.read(cx).text().trim().to_string())
             .unwrap_or_default()
+    }
+
+    fn effective_client_id(&self, service: Service, cx: &Context<Self>) -> String {
+        let builtin = lists::builtin_client_id(service);
+        if builtin.is_some() && !self.custom_open.contains(&service) {
+            builtin.unwrap_or_default().to_string()
+        } else {
+            lists::effective_client_id(&self.client_id(service, cx), builtin).to_string()
+        }
+    }
+
+    fn toggle_custom(&mut self, service: Service, cx: &mut Context<Self>) {
+        if self.custom_open.remove(&service) {
+            if let Some(input) = self.client_ids.get(&service) {
+                input.update(cx, |input, cx| input.set_text("", cx));
+            }
+        } else {
+            self.custom_open.insert(service);
+        }
+        self.errors.remove(&service);
+        cx.notify();
     }
 
     /// Runs blocking `work` on a thread of its own (a sign-in can wait on
@@ -256,7 +288,7 @@ impl AccountsSection {
     }
 
     fn connect(&mut self, service: Service, cx: &mut Context<Self>) {
-        let client_id = self.client_id(service, cx);
+        let client_id = self.effective_client_id(service, cx);
         match service {
             Service::Mal => {
                 let cancel = Arc::new(AtomicBool::new(false));
@@ -303,7 +335,7 @@ impl AccountsSection {
     }
 
     fn save_token(&mut self, cx: &mut Context<Self>) {
-        let client_id = self.client_id(Service::AniList, cx);
+        let client_id = self.effective_client_id(Service::AniList, cx);
         let token = self.token.read(cx).text().to_string();
         // The token leaves the field (and the screen) straight away.
         self.token.update(cx, |input, cx| input.set_text("", cx));
@@ -450,7 +482,8 @@ impl AccountsSection {
             .into_any_element()
     }
 
-    /// Client ID, redirect URI and Connect, for an account not connected.
+    /// Connect button (one-click when a built-in client ID is present, or
+    /// custom Client ID + redirect URI setup) for an account not connected.
     fn render_setup(
         &self,
         info: &ServiceInfo,
@@ -461,69 +494,14 @@ impl AccountsSection {
         let id = service.as_str();
         let uri = info.redirect_uri;
         let page = info.developer_page;
+        let has_builtin = lists::builtin_client_id(service).is_some();
+        let show_custom = !has_builtin || self.custom_open.contains(&service);
         let has_id = !self.client_id(service, cx).is_empty();
         let waiting_browser = working && service == Service::Mal && self.mal_cancel.is_some();
         let pasting = service == Service::AniList && self.awaiting_token;
 
-        let register = div()
-            .flex()
-            .flex_col()
-            .gap(px(8.))
-            .child(
-                div()
-                    .text_size(px(theme::SMALL))
-                    .line_height(relative(1.45))
-                    .text_color(theme::text_dim())
-                    .child(info.steps),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .px(px(12.))
-                            .py(px(7.))
-                            .rounded(px(8.))
-                            .bg(theme::raised())
-                            .text_size(px(theme::SMALL))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(uri),
-                    )
-                    .child(
-                        button(SharedString::from(format!("{id}-copy-uri")), "Copy")
-                            .kind(ButtonKind::Ghost)
-                            .compact()
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(uri.to_string()));
-                                toast::info(cx, "Redirect URL copied");
-                            }),
-                    )
-                    .child(
-                        button(
-                            SharedString::from(format!("{id}-dev-page")),
-                            "Open developer page",
-                        )
-                        .kind(ButtonKind::Ghost)
-                        .compact()
-                        .on_click(move |_, _, cx| open_page(page, cx)),
-                    ),
-            );
-
-        let id_row = div()
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(self.client_ids[&service].clone()),
-            )
-            .child(if waiting_browser {
+        let connect_btn = |disabled: bool| {
+            if waiting_browser {
                 button(SharedString::from(format!("{id}-cancel")), "Cancel")
                     .kind(ButtonKind::Secondary)
                     .on_click(cx.listener(move |s, _, _, cx| s.cancel(service, cx)))
@@ -533,16 +511,112 @@ impl AccountsSection {
                     if working { "Connecting…" } else { "Connect" },
                 )
                 .kind(ButtonKind::Secondary)
-                .disabled(working || !has_id || pasting)
+                .disabled(disabled)
                 .on_click(cx.listener(move |s, _, _, cx| s.connect(service, cx)))
-            });
+            }
+        };
 
-        let mut setup = div()
-            .flex()
-            .flex_col()
-            .gap(px(14.))
-            .child(register)
-            .child(id_row);
+        let mut setup = div().flex().flex_col().gap(px(14.));
+
+        if !show_custom {
+            setup = setup.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(connect_btn(working || pasting))
+                    .child(
+                        button(
+                            SharedString::from(format!("{id}-custom-id")),
+                            "Use custom Client ID",
+                        )
+                        .kind(ButtonKind::Ghost)
+                        .compact()
+                        .disabled(working || pasting)
+                        .on_click(cx.listener(move |s, _, _, cx| s.toggle_custom(service, cx))),
+                    ),
+            );
+        } else {
+            let register = div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_size(px(theme::SMALL))
+                        .line_height(relative(1.45))
+                        .text_color(theme::text_dim())
+                        .child(info.steps),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .px(px(12.))
+                                .py(px(7.))
+                                .rounded(px(8.))
+                                .bg(theme::raised())
+                                .text_size(px(theme::SMALL))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(uri),
+                        )
+                        .child(
+                            button(SharedString::from(format!("{id}-copy-uri")), "Copy")
+                                .kind(ButtonKind::Ghost)
+                                .compact()
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        uri.to_string(),
+                                    ));
+                                    toast::info(cx, "Redirect URL copied");
+                                }),
+                        )
+                        .child(
+                            button(
+                                SharedString::from(format!("{id}-dev-page")),
+                                "Open developer page",
+                            )
+                            .kind(ButtonKind::Ghost)
+                            .compact()
+                            .on_click(move |_, _, cx| open_page(page, cx)),
+                        ),
+                );
+
+            let id_row = div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.client_ids[&service].clone()),
+                )
+                .child(connect_btn(working || !has_id || pasting));
+
+            setup = setup.child(register).child(id_row);
+            if has_builtin {
+                setup = setup.child(
+                    div().flex().child(
+                        button(
+                            SharedString::from(format!("{id}-builtin-id")),
+                            "Use built-in Client ID",
+                        )
+                        .kind(ButtonKind::Ghost)
+                        .compact()
+                        .disabled(working || pasting)
+                        .on_click(cx.listener(move |s, _, _, cx| s.toggle_custom(service, cx))),
+                    ),
+                );
+            }
+        }
+
         if waiting_browser {
             setup = setup.child(hint(
                 "Finish signing in in your browser. This waits for up to five minutes.",

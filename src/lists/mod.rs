@@ -35,6 +35,28 @@ pub const ANILIST_REDIRECT_URI: &str = "https://anilist.co/api/v2/oauth/pin";
 pub const MAL_DEVELOPER_PAGE: &str = "https://myanimelist.net/apiconfig";
 pub const ANILIST_DEVELOPER_PAGE: &str = "https://anilist.co/settings/developer";
 
+/// Client ID baked into official release builds, if any. Local and source
+/// builds leave the env var unset, so Settings asks for one.
+pub fn builtin_client_id(service: Service) -> Option<&'static str> {
+    match service {
+        Service::Mal => option_env!("ANI_GUI_MAL_CLIENT_ID")
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+        Service::AniList => None,
+    }
+}
+
+/// Resolves which client ID to use: a non-empty user override wins over the
+/// build's default.
+pub fn effective_client_id<'a>(custom: &'a str, builtin: Option<&'a str>) -> &'a str {
+    let custom = custom.trim();
+    if !custom.is_empty() {
+        custom
+    } else {
+        builtin.map(str::trim).unwrap_or("")
+    }
+}
+
 /// How long after a sync the app-start sync skips an account.
 const STARTUP_SYNC_AFTER_SECS: i64 = 30 * 60;
 
@@ -589,6 +611,7 @@ pub fn set_client_id(service: Service, client_id: &str) -> Result<()> {
 /// returns the user name.
 pub fn connect_mal(client_id: &str, cancel: Arc<AtomicBool>) -> Result<String> {
     let lists = lists()?;
+    let client_id = effective_client_id(client_id, builtin_client_id(Service::Mal));
     let name = lists
         .engine()
         .connect_mal(client_id, &cancel, || lists.busy());
@@ -823,5 +846,15 @@ mod tests {
         for bad in [0.0, 0.5, 10.5, -3.0, f32::NAN, f32::INFINITY] {
             assert_eq!(valid_score(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn effective_client_id_prefers_custom_over_builtin() {
+        assert_eq!(effective_client_id("custom", Some("builtin")), "custom");
+        assert_eq!(effective_client_id("  custom  ", Some("builtin")), "custom");
+        assert_eq!(effective_client_id("", Some("builtin")), "builtin");
+        assert_eq!(effective_client_id("   ", Some(" builtin ")), "builtin");
+        assert_eq!(effective_client_id("", None), "");
+        assert_eq!(effective_client_id("custom", None), "custom");
     }
 }

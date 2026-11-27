@@ -88,6 +88,21 @@ To check that it is there (gh shows names only, never values):
 gh secret list --env release --repo SweetTooth05/ani-gui
 ```
 
+### 4. MyAnimeList Client ID (optional, for one-click sign-in)
+
+Official releases bake in a MyAnimeList OAuth Client ID (`App Type: other`,
+redirect URL `http://localhost:53682/callback`) via the `ANI_GUI_MAL_CLIENT_ID`
+repository secret, passed only to the `Build` step. Because it is a public
+PKCE client ID (no client secret) and is needed while compiling, it lives as a
+repository secret rather than in the `release` signing environment:
+
+```sh
+gh secret set ANI_GUI_MAL_CLIENT_ID --repo SweetTooth05/ani-gui
+```
+
+If this secret is unset, releases still build and fall back to asking users for
+their own Client ID in Settings.
+
 ## Cutting a release
 
 1. Pick the version and set it in `Cargo.toml` (`version = "X.Y.Z"`).

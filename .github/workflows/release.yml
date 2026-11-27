@@ -109,7 +109,13 @@ jobs:
         run: cargo test --locked
 
       - name: Build
-        run: cargo build --release --locked --target "$TARGET"
+        env:
+          ANI_GUI_MAL_CLIENT_ID: ${{ secrets.ANI_GUI_MAL_CLIENT_ID }}
+        run: |
+          if [ -z "$ANI_GUI_MAL_CLIENT_ID" ]; then
+            echo "::warning::ANI_GUI_MAL_CLIENT_ID is not set; MyAnimeList will require users to supply their own Client ID."
+          fi
+          cargo build --release --locked --target "$TARGET"
 
       # A prefix tree, so `tar -xzf ... -C ~/.local --strip-components=1`
       # installs it. The launcher entry runs `ani-gui` from PATH; the

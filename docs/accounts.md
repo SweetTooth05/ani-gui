@@ -13,14 +13,28 @@ Connect either account, or both, in **Settings → Accounts**. ani-gui then:
   next sync. When both lists have the same show, the most recently updated one
   wins.
 
-There are no built-in developer keys: you register your own (free) API client
-with each service and paste its client ID into Settings. Client IDs aren't
-secret. Sign-in tokens are stored only in your system keychain (Secret Service,
-such as GNOME Keyring or KWallet, on Linux; the Keychain on macOS), never in
-ani-gui's files. Without a working keychain, connecting fails with an
-explanation rather than saving tokens anywhere else.
+Sign-in tokens are stored only in your system keychain (Secret Service, such as
+GNOME Keyring or KWallet, on Linux; the Keychain on macOS), never in ani-gui's
+files. Without a working keychain, connecting fails with an explanation rather
+than saving tokens anywhere else. See also the [privacy policy](privacy.md).
 
 ## MyAnimeList
+
+Official releases ship with a built-in MyAnimeList Client ID:
+
+1. Open **Settings → Accounts → MyAnimeList** and press **Connect**.
+2. Approve access in the browser that opens. ani-gui listens on
+   `127.0.0.1:53682` for up to five minutes to receive the redirect; when the
+   page says you can close the tab, you're connected.
+
+The sign-in uses OAuth 2 with PKCE, and the token refreshes itself. If port
+53682 is taken by another program, close it and try again.
+
+### Building from source or using your own Client ID
+
+Source builds don't include a built-in Client ID (unless `ANI_GUI_MAL_CLIENT_ID`
+is set at compile time). On official builds, you can also click **Use custom
+Client ID** to use your own app instead:
 
 1. Sign in at [myanimelist.net/apiconfig](https://myanimelist.net/apiconfig)
    and choose **Create ID**.
@@ -32,12 +46,6 @@ explanation rather than saving tokens anywhere else.
    like.
 3. Copy the **Client ID** (not the secret: "other" apps don't have one) into
    Settings → Accounts → MyAnimeList, and press **Connect**.
-4. Approve access in the browser that opens. ani-gui listens on
-   `127.0.0.1:53682` for up to five minutes to receive the redirect; when the
-   page says you can close the tab, you're connected.
-
-The sign-in uses OAuth 2 with PKCE, and the token refreshes itself. If port
-53682 is taken by another program, close it and try again.
 
 ## AniList
 

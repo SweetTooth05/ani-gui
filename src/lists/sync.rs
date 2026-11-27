@@ -118,8 +118,9 @@ impl Engine<'_> {
         let Some(refresh) = tokens.refresh.as_deref() else {
             return Err(self.lose_auth(Service::Mal));
         };
-        let client_id = lock(self.db).list_account(Service::Mal)?.client_id;
-        match mal::refresh(&self.ep.mal_oauth, &client_id, refresh, db::now()) {
+        let stored = lock(self.db).list_account(Service::Mal)?.client_id;
+        let client_id = super::effective_client_id(&stored, super::builtin_client_id(Service::Mal));
+        match mal::refresh(&self.ep.mal_oauth, client_id, refresh, db::now()) {
             Ok(fresh) => {
                 self.store.set(Service::Mal, &fresh)?;
                 Ok(fresh)
