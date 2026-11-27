@@ -14,7 +14,7 @@ use crate::db::{self, Db, lock};
 use crate::model::{AniListMedia, Mode, Settings, ShowRecord, ShowSummary};
 use crate::ui::calendar::local_offset;
 use crate::ui::components::button::{ButtonKind, button};
-use crate::ui::components::image::{remote_image, shimmer};
+use crate::ui::components::image::{remote_image, rounded_image, shimmer};
 use crate::ui::components::poster::{episode_card, poster_card};
 use crate::ui::components::row::row;
 use crate::ui::components::toast;
@@ -119,9 +119,15 @@ impl PrecomputedHome {
                     HERO_SYNOPSIS_CHARS,
                 ))
             });
+            let title = match &hero.source {
+                HeroSource::Trending(m) => media_title(m),
+                HeroSource::Continue(item) => {
+                    item.media.as_ref().map(media_title).unwrap_or(&hero.title)
+                }
+            };
             PrecomputedHero {
                 art: SharedString::from(art.to_string()),
-                title: SharedString::from(hero.title.clone()),
+                title: SharedString::from(title.to_string()),
                 meta,
                 genres,
                 blurb,
@@ -138,8 +144,9 @@ impl PrecomputedHome {
                     format!("Episode {} up next", item.ep)
                 };
                 let art = item.backdrop_url.as_deref().unwrap_or(&item.cover_url);
+                let title = item.media.as_ref().map(media_title).unwrap_or(&item.title);
                 PrecomputedContinueCard {
-                    title: SharedString::from(item.title.clone()),
+                    title: SharedString::from(title.to_string()),
                     label: SharedString::from(label),
                     art: SharedString::from(art.to_string()),
                     fraction: item.fraction,
@@ -173,6 +180,8 @@ pub struct HomePage {
     hero: Option<HeroModel>,
     hero_play: Option<HeroPlay>,
     precomputed: PrecomputedHome,
+    /// `crate::model::display_generation()` when `precomputed` was built.
+    display_gen: u64,
     /// A refresh has finished since the page opened.
     refreshed: bool,
     refresh_task: Option<Task<()>>,
@@ -202,6 +211,7 @@ impl HomePage {
             hero: None,
             hero_play: None,
             precomputed: PrecomputedHome::default(),
+            display_gen: crate::model::display_generation(),
             refreshed: false,
             refresh_task: None,
             hero_play_task: None,
@@ -326,6 +336,7 @@ impl HomePage {
             self.hero_play_task = None;
         }
         self.precomputed = PrecomputedHome::from_data(&data, hero.as_ref());
+        self.display_gen = crate::model::display_generation();
         self.hero = hero;
         self.data = data;
         if self.hero.is_some() && self.hero_play.is_none() && self.hero_play_task.is_none() {
@@ -524,17 +535,60 @@ impl HomePage {
             HeroSource::Continue(item) => item.media.as_ref().map(|m| m.id),
             HeroSource::Trending(media) => Some(media.id),
         };
+        let title = self
+            .precomputed
+            .hero
+            .as_ref()
+            .map(|h| h.title.to_string())
+            .unwrap_or_else(|| hero.title.clone());
         let route = Route::Show(ShowRef {
             allanime: self.hero_play.as_ref().map(|p| p.show.clone()),
             anilist_id,
-            title: hero.title.clone(),
+            title,
         });
         self.navigate(route, cx);
     }
 
-    fn render_hero(&self, hero: &PrecomputedHero, cx: &mut Context<Self>) -> AnyElement {
+    fn hero_actions(&self, hero: &PrecomputedHero, cx: &mut Context<Self>) -> gpui::Div {
         let busy = self.action.as_ref().map(|(_, label)| label.clone());
         let in_list = self.hero_play.as_ref().map(|p| p.in_list);
+        div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .pt(px(6.))
+            .child(
+                button(
+                    "hero-play",
+                    busy.clone().unwrap_or_else(|| hero.play_label.clone()),
+                )
+                .disabled(busy.is_some())
+                .on_click(cx.listener(|page, _, _, cx| page.play_hero(cx))),
+            )
+            .child(
+                button(
+                    "hero-list",
+                    if in_list == Some(true) {
+                        "In My List"
+                    } else {
+                        "+ My List"
+                    },
+                )
+                .kind(ButtonKind::Secondary)
+                .disabled(in_list.is_none())
+                .on_click(cx.listener(|page, _, _, cx| page.toggle_hero_list(cx))),
+            )
+            .child(
+                button("hero-details", "Details")
+                    .kind(ButtonKind::Ghost)
+                    .on_click(cx.listener(|page, _, _, cx| page.open_hero_details(cx))),
+            )
+    }
+
+    fn render_hero(&self, hero: &PrecomputedHero, cx: &mut Context<Self>) -> AnyElement {
+        if theme::is_light() {
+            return self.render_hero_light(hero, cx);
+        }
         div()
             .relative()
             .w_full()
@@ -600,39 +654,108 @@ impl HomePage {
                             .line_clamp(3)
                             .child(s)
                     }))
+                    .child(self.hero_actions(hero, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// Light-first editorial hero: pure-white card with crisp dark typography
+    /// beside un-faded, gallery-framed artwork so banner art never looks milky.
+    fn render_hero_light(&self, hero: &PrecomputedHero, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex_none()
+            .w_full()
+            .px(theme::gutter())
+            .pt(px(28.))
+            .pb(px(16.))
+            .child(
+                div()
+                    .w_full()
+                    .h(px(348.))
+                    .p(px(12.))
+                    .rounded(px(18.))
+                    .bg(theme::control())
+                    .border_1()
+                    .border_color(theme::line())
+                    .shadow(theme::shadow_md())
+                    .flex()
+                    .gap(px(24.))
                     .child(
                         div()
+                            .w(relative(0.47))
+                            .min_w(px(360.))
+                            .max_w(px(520.))
+                            .h_full()
+                            .flex_none()
                             .flex()
-                            .gap(px(10.))
-                            .pt(px(6.))
+                            .flex_col()
+                            .justify_between()
+                            .py(px(18.))
+                            .pl(px(22.))
+                            .pr(px(8.))
+                            .overflow_hidden()
                             .child(
-                                button(
-                                    "hero-play",
-                                    busy.clone().unwrap_or_else(|| hero.play_label.clone()),
-                                )
-                                .disabled(busy.is_some())
-                                .on_click(cx.listener(|page, _, _, cx| page.play_hero(cx))),
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(12.))
+                                    .child(
+                                        div()
+                                            .font_family(theme::DISPLAY_FONT)
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_size(px(40.))
+                                            .line_height(relative(1.0))
+                                            .text_color(theme::text())
+                                            .line_clamp(2)
+                                            .child(hero.title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .items_center()
+                                            .gap_x(px(10.))
+                                            .gap_y(px(6.))
+                                            .text_size(px(theme::SMALL))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(theme::text_dim())
+                                            .children(
+                                                hero.meta.iter().cloned().map(|m| div().child(m)),
+                                            )
+                                            .children(hero.genres.iter().cloned().map(|g| {
+                                                div()
+                                                    .px(px(9.))
+                                                    .py(px(2.))
+                                                    .rounded_full()
+                                                    .bg(theme::night())
+                                                    .border_1()
+                                                    .border_color(theme::line())
+                                                    .text_size(px(12.))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(theme::text_dim())
+                                                    .child(g)
+                                            })),
+                                    )
+                                    .children(hero.blurb.clone().map(|s| {
+                                        div()
+                                            .text_size(px(14.5))
+                                            .line_height(relative(1.52))
+                                            .text_color(theme::text_dim())
+                                            .line_clamp(3)
+                                            .child(s)
+                                    })),
                             )
-                            .child(
-                                button(
-                                    "hero-list",
-                                    if in_list == Some(true) {
-                                        "In My List"
-                                    } else {
-                                        "+ My List"
-                                    },
-                                )
-                                .kind(ButtonKind::Secondary)
-                                .disabled(in_list.is_none())
-                                .on_click(cx.listener(|page, _, _, cx| page.toggle_hero_list(cx))),
-                            )
-                            .child(
-                                button("hero-details", "Details")
-                                    .kind(ButtonKind::Ghost)
-                                    .on_click(
-                                        cx.listener(|page, _, _, cx| page.open_hero_details(cx)),
-                                    ),
-                            ),
+                            .child(self.hero_actions(hero, cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .rounded(px(12.))
+                            .overflow_hidden()
+                            .child(rounded_image(&hero.art, px(12.), theme::control(), None)),
                     ),
             )
             .into_any_element()
@@ -754,11 +877,25 @@ fn horizontal_spacer(width: f32) -> AnyElement {
 }
 
 pub fn skeleton() -> AnyElement {
+    let hero_skel = if theme::is_light() {
+        div().w_full().px(theme::gutter()).pt(px(28.)).child(
+            div()
+                .w_full()
+                .h(px(348.))
+                .rounded(px(18.))
+                .overflow_hidden()
+                .border_1()
+                .border_color(theme::line())
+                .child(shimmer()),
+        )
+    } else {
+        div().w_full().h(px(HERO_H)).child(shimmer())
+    };
     div()
         .flex()
         .flex_col()
         .gap(px(40.))
-        .child(div().w_full().h(px(HERO_H)).child(shimmer()))
+        .child(hero_skel)
         .child(
             div()
                 .flex()
@@ -780,6 +917,14 @@ pub fn skeleton() -> AnyElement {
 impl Render for HomePage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let trace_start = crate::app::trace_enabled().then(Instant::now);
+        let display_gen = crate::model::display_generation();
+        if display_gen != self.display_gen {
+            self.display_gen = display_gen;
+            if !self.data.is_empty() {
+                self.hero = view_models::hero_pick(&self.data.continue_items, &self.data.trending);
+                self.precomputed = PrecomputedHome::from_data(&self.data, self.hero.as_ref());
+            }
+        }
         static FIRST_RENDER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         static FIRST_CONTENT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         if trace_start.is_some() {

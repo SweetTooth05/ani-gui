@@ -1,6 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
@@ -62,7 +63,7 @@ impl ShowSummary {
     }
 
     pub fn display_title(&self) -> &str {
-        self.english_title.as_deref().unwrap_or(&self.title)
+        pick_title(self.english_title.as_deref(), &self.title)
     }
 }
 
@@ -117,6 +118,22 @@ pub struct AniListMedia {
     pub studios: Vec<String>,
     #[serde(default)]
     pub rankings: Vec<Ranking>,
+    /// AniList's descriptive tags (e.g. "Shounen", "Time Manipulation"),
+    /// most relevant first. Only the detail query asks for them.
+    #[serde(default)]
+    pub tags: Vec<MediaTag>,
+}
+
+/// One of AniList's tags on a show.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaTag {
+    pub name: String,
+    /// How strongly it applies, 0–100 (AniList users vote on it).
+    pub rank: u8,
+    /// Gives away the plot, for this show or in general.
+    pub spoiler: bool,
+    /// e.g. "Demographic", "Theme-Fantasy", "Cast-Traits".
+    pub category: Option<String>,
 }
 
 /// An AniList date, any part of which may be unknown.
@@ -255,7 +272,103 @@ pub struct DownloadRecord {
     pub created_at: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// A fixed set of named options stored as text in the settings table:
+/// `as_str` is the stored key, `label` what the Settings page shows.
+macro_rules! choice {
+    ($(#[$meta:meta])* $name:ident { $($variant:ident = $key:literal, $label:literal;)+ }) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum $name { $($variant,)+ }
+
+        impl $name {
+            pub const ALL: &'static [$name] = &[$($name::$variant,)+];
+
+            pub fn as_str(self) -> &'static str {
+                match self { $($name::$variant => $key,)+ }
+            }
+
+            pub fn label(self) -> &'static str {
+                match self { $($name::$variant => $label,)+ }
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = anyhow::Error;
+
+            fn from_str(s: &str) -> anyhow::Result<Self> {
+                match s {
+                    $($key => Ok($name::$variant),)+
+                    other => Err(anyhow!(concat!("unknown ", stringify!($name), ": {:?}"), other)),
+                }
+            }
+        }
+    };
+}
+
+choice!(
+    /// Colour scheme for everything but the video player, which stays dark.
+    Theme {
+        Night = "night", "Night";
+        Midnight = "midnight", "Midnight";
+        Dusk = "dusk", "Dusk";
+        Daylight = "daylight", "Daylight";
+    }
+);
+
+choice!(
+    /// The colour of Play buttons, progress and the current page. The
+    /// options come from the logo's palette (plus mint).
+    Accent {
+        Amber = "amber", "Amber";
+        Coral = "coral", "Coral";
+        Violet = "violet", "Violet";
+        Cyan = "cyan", "Cyan";
+        Mint = "mint", "Mint";
+    }
+);
+
+choice!(
+    /// Which title to show when a show has both.
+    TitleLanguage {
+        English = "english", "English";
+        Romaji = "romaji", "Romaji";
+    }
+);
+
+choice!(
+    /// The page ani-gui opens on.
+    StartPage {
+        Home = "home", "Home";
+        Search = "search", "Search";
+        MyList = "my-list", "My List";
+        Calendar = "calendar", "Calendar";
+    }
+);
+
+choice!(
+    ClockFormat {
+        H24 = "24h", "24-hour";
+        H12 = "12h", "12-hour";
+    }
+);
+
+choice!(
+    /// A ready-made Search listing, shown before anything is typed.
+    BrowsePreset {
+        Trending = "trending", "Trending now";
+        Season = "season", "Popular this season";
+        Upcoming = "upcoming", "Upcoming";
+        AllTime = "all-time", "All-time popular";
+        TopRated = "top-rated", "Top rated";
+    }
+);
+
+/// Seconds the "Up next" card counts down before autoplaying.
+pub const UP_NEXT_CHOICES: [u32; 4] = [3, 5, 10, 15];
+/// Seconds the player's skip buttons and arrow keys jump.
+pub const SEEK_CHOICES: [u32; 4] = [5, 10, 15, 30];
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub mode: Mode,
     pub quality: String,
@@ -263,6 +376,25 @@ pub struct Settings {
     pub autoplay_next: bool,
     /// Install signed releases in place when ani-gui can update itself.
     pub auto_update: bool,
+    pub theme: Theme,
+    pub accent: Accent,
+    pub title_language: TitleLanguage,
+    pub start_page: StartPage,
+    pub clock: ClockFormat,
+    /// Facts and synopsis over a poster while it is hovered.
+    pub poster_details: bool,
+    /// What Search lists before a title is typed.
+    pub browse_preset: BrowsePreset,
+    /// Tags AniList marks as spoilers, on show pages.
+    pub show_spoiler_tags: bool,
+    /// Jump past an episode's opening as soon as it starts.
+    pub auto_skip_intro: bool,
+    /// One of `UP_NEXT_CHOICES`.
+    pub up_next_secs: u32,
+    /// One of `SEEK_CHOICES`.
+    pub seek_secs: u32,
+    /// Keep the screen from blanking while a video plays.
+    pub keep_awake: bool,
 }
 
 impl Default for Settings {
@@ -273,7 +405,50 @@ impl Default for Settings {
             download_dir: paths::default_download_dir(),
             autoplay_next: true,
             auto_update: true,
+            theme: Theme::Night,
+            accent: Accent::Amber,
+            title_language: TitleLanguage::English,
+            start_page: StartPage::Home,
+            clock: ClockFormat::H24,
+            poster_details: true,
+            browse_preset: BrowsePreset::Trending,
+            show_spoiler_tags: false,
+            auto_skip_intro: false,
+            up_next_secs: 5,
+            seek_secs: 10,
+            keep_awake: true,
         }
+    }
+}
+
+static PREFER_ROMAJI: AtomicBool = AtomicBool::new(false);
+/// Bumped whenever the title language changes, so pages that keep titles
+/// they built earlier know to rebuild them.
+static DISPLAY_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Makes `display_title` (and `ui::view_models::media_title`) follow the
+/// user's title language. Process-wide, like the theme.
+pub fn set_title_language(language: TitleLanguage) {
+    let romaji = language == TitleLanguage::Romaji;
+    if PREFER_ROMAJI.swap(romaji, Ordering::Relaxed) != romaji {
+        DISPLAY_GEN.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Changes each time titles should be rebuilt (see `set_title_language`).
+pub fn display_generation() -> u64 {
+    DISPLAY_GEN.load(Ordering::Relaxed)
+}
+
+/// The title to show: `english` unless missing or romaji is preferred.
+pub fn pick_title<'a>(english: Option<&'a str>, romaji: &'a str) -> &'a str {
+    pick_title_with(english, romaji, PREFER_ROMAJI.load(Ordering::Relaxed))
+}
+
+fn pick_title_with<'a>(english: Option<&'a str>, romaji: &'a str, prefer_romaji: bool) -> &'a str {
+    match english.filter(|t| !t.is_empty()) {
+        Some(english) if !prefer_romaji || romaji.is_empty() => english,
+        _ => romaji,
     }
 }
 
@@ -323,6 +498,42 @@ mod tests {
         }
         assert!("SUB".parse::<Mode>().is_err());
         assert_eq!(Mode::default(), Mode::Sub);
+    }
+
+    #[test]
+    fn pick_title_prefers_english_unless_romaji_wanted() {
+        assert_eq!(
+            pick_title_with(Some("Frieren"), "Sousou no Frieren", false),
+            "Frieren"
+        );
+        assert_eq!(
+            pick_title_with(Some("Frieren"), "Sousou no Frieren", true),
+            "Sousou no Frieren"
+        );
+        assert_eq!(
+            pick_title_with(None, "Sousou no Frieren", false),
+            "Sousou no Frieren"
+        );
+        assert_eq!(
+            pick_title_with(Some(""), "Sousou no Frieren", false),
+            "Sousou no Frieren"
+        );
+        assert_eq!(pick_title_with(Some("Frieren"), "", true), "Frieren");
+    }
+
+    #[test]
+    fn choices_roundtrip_strings() {
+        for theme in Theme::ALL {
+            assert_eq!(theme.as_str().parse::<Theme>().ok(), Some(*theme));
+        }
+        for accent in Accent::ALL {
+            assert_eq!(accent.as_str().parse::<Accent>().ok(), Some(*accent));
+        }
+        for preset in BrowsePreset::ALL {
+            assert_eq!(preset.as_str().parse::<BrowsePreset>().ok(), Some(*preset));
+        }
+        assert_eq!("my-list".parse::<StartPage>().ok(), Some(StartPage::MyList));
+        assert!("Night".parse::<Theme>().is_err());
     }
 
     #[test]

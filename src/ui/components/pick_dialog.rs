@@ -32,6 +32,7 @@ pub fn pick_dialog(
         Some(f) => scrim.on_click(f),
         None => scrim,
     };
+    let light = theme::is_light();
     scrim
         .child(
             div()
@@ -43,10 +44,15 @@ pub fn pick_dialog(
                 .gap(px(16.))
                 .p(px(28.))
                 .rounded(px(16.))
-                .bg(theme::night())
+                .bg(if light {
+                    theme::control()
+                } else {
+                    theme::night()
+                })
                 .border_1()
                 .border_color(theme::line())
-                .shadow_lg()
+                .when(!light, |d| d.shadow_lg())
+                .when(light, |d| d.shadow(theme::shadow_lg()))
                 .on_click(|_, _, cx| cx.stop_propagation())
                 .child(
                     div()
@@ -79,10 +85,21 @@ pub fn pick_dialog(
                                 .px(px(16.))
                                 .py(px(12.))
                                 .rounded(px(10.))
-                                .bg(theme::raised())
+                                .bg(if light {
+                                    theme::night()
+                                } else {
+                                    theme::raised()
+                                })
+                                .when(light, |d| d.border_1().border_color(theme::line()))
                                 .font_weight(FontWeight::MEDIUM)
                                 .cursor_pointer()
-                                .hover(|s| s.bg(theme::raised_hover()))
+                                .hover(move |s| {
+                                    s.bg(if light {
+                                        theme::ghost_hover()
+                                    } else {
+                                        theme::raised_hover()
+                                    })
+                                })
                                 .on_click(move |_, window, cx| on_choose(&chosen, window, cx))
                                 .child(c.clone())
                         })),

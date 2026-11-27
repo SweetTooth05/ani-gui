@@ -62,6 +62,7 @@ impl Button {
 
 impl RenderOnce for Button {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        let light = theme::is_light();
         let (bg, hover_bg, fg, hover_fg): (Hsla, Hsla, Rgba, Rgba) = match self.kind {
             ButtonKind::Primary => (
                 theme::accent().into(),
@@ -70,14 +71,14 @@ impl RenderOnce for Button {
                 theme::on_accent(),
             ),
             ButtonKind::Secondary => (
-                theme::raised().into(),
-                theme::raised_hover().into(),
+                theme::control().into(),
+                theme::control_hover().into(),
                 theme::text(),
                 theme::text(),
             ),
             ButtonKind::Ghost => (
                 gpui::transparent_black(),
-                theme::raised().into(),
+                theme::ghost_hover().into(),
                 theme::text_dim(),
                 theme::text(),
             ),
@@ -97,6 +98,14 @@ impl RenderOnce for Button {
             .px(px_x)
             .rounded(px(8.))
             .bg(bg)
+            .when(light && self.kind == ButtonKind::Secondary, |d| {
+                d.border_1()
+                    .border_color(theme::control_border())
+                    .shadow(theme::shadow_sm())
+            })
+            .when(light && self.kind == ButtonKind::Primary, |d| {
+                d.shadow(theme::shadow_sm())
+            })
             .text_color(fg)
             .text_size(size)
             .font_weight(FontWeight::SEMIBOLD)
@@ -144,6 +153,7 @@ impl Segmented {
 
 impl RenderOnce for Segmented {
     fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        let light = theme::is_light();
         div()
             .id(self.id)
             .flex()
@@ -152,7 +162,7 @@ impl RenderOnce for Segmented {
             .p(px(4.))
             .gap(px(2.))
             .rounded(px(10.))
-            .bg(theme::raised())
+            .bg(theme::track())
             .children(
                 self.options
                     .into_iter()
@@ -170,12 +180,22 @@ impl RenderOnce for Segmented {
                             .whitespace_nowrap()
                             .child(label);
                         if selected {
-                            seg.bg(theme::raised_hover()).text_color(theme::text())
+                            seg.bg(if light {
+                                theme::control()
+                            } else {
+                                theme::raised_hover()
+                            })
+                            .text_color(theme::text())
+                            .when(light, |s| s.shadow(theme::shadow_sm()))
                         } else {
-                            seg.text_color(theme::text_muted())
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(theme::text()))
-                                .on_click(f)
+                            seg.text_color(if light {
+                                theme::text_dim()
+                            } else {
+                                theme::text_muted()
+                            })
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme::text()))
+                            .on_click(f)
                         }
                     }),
             )

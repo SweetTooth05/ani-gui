@@ -78,6 +78,9 @@ fn main() {
     }
 
     app::trace_init();
+    let prefs = db::read_display_prefs(&paths::db_path());
+    app::apply_display_prefs(&prefs);
+    app::trace_event("display_prefs_loaded");
     let app = Application::new().with_assets(ui::theme::Assets);
     app.run(|cx: &mut App| {
         app::trace_event("app_run");

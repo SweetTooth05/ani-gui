@@ -13,7 +13,7 @@ use crate::lists::{self, ListEntry, ListStatus, Service};
 use crate::ui::accounts;
 use crate::ui::components::button::{ButtonKind, button};
 use crate::ui::components::icon::icon;
-use crate::ui::components::poster::progress_bar;
+use crate::ui::components::poster::ui_progress_bar;
 use crate::ui::components::toast;
 use crate::ui::theme;
 
@@ -263,7 +263,12 @@ impl Render for YourList {
                                     .px(px(10.))
                                     .py(px(4.))
                                     .rounded_full()
-                                    .bg(theme::raised())
+                                    .bg(theme::control())
+                                    .when(theme::is_light(), |d| {
+                                        d.border_1()
+                                            .border_color(theme::control_border())
+                                            .shadow(theme::shadow_sm())
+                                    })
                                     .text_size(px(theme::SMALL))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(entry.status.label()),
@@ -280,7 +285,7 @@ impl Render for YourList {
                             ),
                     )
                     .when(entry.episodes.is_some(), |d| {
-                        d.child(progress_bar(fraction))
+                        d.child(ui_progress_bar(fraction))
                     });
                 let completed = entry.status == ListStatus::Completed;
                 let rating = completed.then(|| {
@@ -296,6 +301,7 @@ impl Render for YourList {
                             .bg(theme::deep())
                             .border_l(px(3.))
                             .border_color(theme::accent())
+                            .when(theme::is_light(), |d| d.shadow(theme::shadow_md()))
                             .child(
                                 div()
                                     .flex()

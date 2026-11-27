@@ -1,5 +1,5 @@
-//! Settings: playback and download defaults, and a check of what ani-gui
-//! needs installed.
+//! Settings: appearance, playback, browsing and download preferences, and a
+//! check of what ani-gui needs installed.
 
 use std::path::{Path, PathBuf};
 use std::sync::PoisonError;
@@ -7,16 +7,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, Context, Entity, FontWeight, IntoElement, ScrollHandle,
-    SharedString, Subscription, Task, Transformation, Window, div, percentage, prelude::*, px,
-    relative,
+    Animation, AnimationExt, AnyElement, ClickEvent, Context, Entity, FontWeight, IntoElement,
+    ObjectFit, ScrollHandle, SharedString, Subscription, Task, Transformation, Window, div, img,
+    percentage, prelude::*, px, relative,
 };
 
 use crate::app::AppState;
 use crate::diagnostics::{self, Report};
-use crate::model::{Mode, Settings};
+use crate::model::{
+    Accent, BrowsePreset, ClockFormat, Mode, SEEK_CHOICES, Settings, StartPage, Theme,
+    TitleLanguage, UP_NEXT_CHOICES,
+};
 use crate::ui::accounts::AccountsSection;
 use crate::ui::components::button::{ButtonKind, button, segmented};
+use crate::ui::components::chip::{ChipState, icon_chip};
 use crate::ui::components::icon::icon;
 use crate::ui::components::text_input::{Changed, TextInput};
 use crate::ui::components::toast;
@@ -100,7 +104,14 @@ impl SettingsPage {
         };
         let db = state.db.clone();
         cx.global_mut::<AppState>().settings = settings.clone();
+        let restyled = settings.theme != self.settings.theme
+            || settings.accent != self.settings.accent
+            || settings.title_language != self.settings.title_language;
         self.settings = settings.clone();
+        if restyled {
+            crate::app::apply_display_prefs(&settings);
+            cx.refresh_windows();
+        }
         let mine = SAVE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         cx.notify();
         cx.spawn(async move |_, cx| {
@@ -121,32 +132,23 @@ impl SettingsPage {
         .detach();
     }
 
-    fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
-        if self.settings.mode != mode {
-            let settings = Settings {
-                mode,
-                ..self.settings.clone()
-            };
+    /// Applies `change` to a copy of the settings and saves it if anything
+    /// changed.
+    fn update(&mut self, change: impl FnOnce(&mut Settings), cx: &mut Context<Self>) {
+        let mut settings = self.settings.clone();
+        change(&mut settings);
+        if settings != self.settings {
             self.apply(settings, cx);
         }
     }
 
-    fn set_quality(&mut self, quality: &str, cx: &mut Context<Self>) {
-        if self.settings.quality != quality {
-            let settings = Settings {
-                quality: quality.to_string(),
-                ..self.settings.clone()
-            };
-            self.apply(settings, cx);
-        }
-    }
-
-    fn toggle_autoplay(&mut self, cx: &mut Context<Self>) {
-        let settings = Settings {
-            autoplay_next: !self.settings.autoplay_next,
-            ..self.settings.clone()
-        };
-        self.apply(settings, cx);
+    /// A click handler that applies `change`.
+    fn on(
+        &self,
+        change: impl Fn(&mut Settings) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static {
+        cx.listener(move |page, _, _, cx| page.update(&change, cx))
     }
 
     /// The folder typed in, if it differs from the current one.
@@ -199,33 +201,292 @@ impl SettingsPage {
         .detach();
     }
 
+    fn render_appearance(&self, cx: &mut Context<Self>) -> AnyElement {
+        let s = &self.settings;
+        let themes = div()
+            .flex()
+            .flex_wrap()
+            .gap(px(12.))
+            .children(Theme::ALL.iter().map(|&t| {
+                let p = theme::theme_preview(t);
+                let selected = s.theme == t;
+                let accent_pill: gpui::Hsla = {
+                    let mut c: gpui::Hsla = p.accent.into();
+                    c.a = if p.light { 0.16 } else { 0.25 };
+                    c
+                };
+                div()
+                    .id(("settings-theme", t as usize))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .cursor_pointer()
+                    .on_click(self.on(move |s| s.theme = t, cx))
+                    .child(
+                        div()
+                            .w(px(136.))
+                            .h(px(84.))
+                            .rounded(px(10.))
+                            .overflow_hidden()
+                            .bg(p.page)
+                            .border_2()
+                            .border_color(if selected {
+                                theme::accent()
+                            } else {
+                                theme::control_border()
+                            })
+                            .when(theme::is_light(), |d| d.shadow(theme::shadow_sm()))
+                            .flex()
+                            .child(
+                                div()
+                                    .w(px(30.))
+                                    .h_full()
+                                    .bg(p.sidebar)
+                                    .border_r_1()
+                                    .border_color(p.border)
+                                    .p(px(6.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(5.))
+                                    .child(div().w(px(14.)).h(px(5.)).rounded(px(2.)).bg(p.accent))
+                                    .child(
+                                        div()
+                                            .mt(px(4.))
+                                            .w_full()
+                                            .h(px(6.))
+                                            .rounded(px(2.))
+                                            .bg(if p.light { accent_pill } else { p.tile.into() }),
+                                    )
+                                    .child(div().w(px(14.)).h(px(4.)).rounded(px(2.)).bg(p.tile))
+                                    .child(div().w(px(12.)).h(px(4.)).rounded(px(2.)).bg(p.tile)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .h_full()
+                                    .p(px(8.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(6.))
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .h(px(34.))
+                                            .p(px(6.))
+                                            .rounded(px(5.))
+                                            .bg(p.card)
+                                            .when(p.light, |d| d.border_1().border_color(p.border))
+                                            .flex()
+                                            .flex_col()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .w(px(48.))
+                                                    .h(px(5.))
+                                                    .rounded(px(2.))
+                                                    .bg(p.tile),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(26.))
+                                                    .h(px(9.))
+                                                    .rounded(px(3.))
+                                                    .bg(p.accent),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .flex()
+                                            .gap(px(5.))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .h_full()
+                                                    .rounded(px(4.))
+                                                    .bg(p.card)
+                                                    .when(p.light, |d| {
+                                                        d.border_1().border_color(p.border)
+                                                    }),
+                                            )
+                                            .child(
+                                                div().flex_1().h_full().rounded(px(4.)).bg(p.tile),
+                                            )
+                                            .child(
+                                                div().flex_1().h_full().rounded(px(4.)).bg(p.tile),
+                                            ),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(theme::SMALL))
+                            .font_weight(if selected {
+                                FontWeight::SEMIBOLD
+                            } else {
+                                FontWeight::MEDIUM
+                            })
+                            .text_color(if selected {
+                                theme::text()
+                            } else {
+                                theme::text_dim()
+                            })
+                            .child(t.label()),
+                    )
+            }));
+        let accents = div()
+            .flex()
+            .gap(px(10.))
+            .children(Accent::ALL.iter().map(|&a| {
+                let selected = s.accent == a;
+                div()
+                    .id(("settings-accent", a as usize))
+                    .size(px(34.))
+                    .p(px(3.))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(if selected {
+                        theme::text()
+                    } else {
+                        gpui::transparent_black().into()
+                    })
+                    .cursor_pointer()
+                    .on_click(self.on(move |s| s.accent = a, cx))
+                    .child(div().size_full().rounded_full().bg(theme::accent_swatch(a)))
+            }));
+        let accent_name = s.accent.label();
+        section("Appearance")
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.))
+                    .py(px(18.))
+                    .border_b_1()
+                    .border_color(theme::line())
+                    .child(label_block(
+                        "Theme",
+                        "The video player stays dark whichever you pick.",
+                    ))
+                    .child(themes),
+            )
+            .child(setting_row(
+                "Accent colour",
+                format!("{accent_name}. For Play buttons, progress and the current page."),
+                accents.into_any_element(),
+            ))
+            .child(setting_row(
+                "Titles",
+                "Which name to show when a show has both. Pages you open from now on use it.",
+                self.choices(
+                    "settings-titles",
+                    TitleLanguage::ALL,
+                    s.title_language,
+                    TitleLanguage::label,
+                    |s, v| s.title_language = v,
+                    cx,
+                ),
+            ))
+            .child(setting_row(
+                "Clock",
+                "How airing times are written in the Calendar.",
+                self.choices(
+                    "settings-clock",
+                    ClockFormat::ALL,
+                    s.clock,
+                    ClockFormat::label,
+                    |s, v| s.clock = v,
+                    cx,
+                ),
+            ))
+            .child(setting_row(
+                "Start page",
+                "Where ani-gui opens.",
+                self.choices(
+                    "settings-start",
+                    StartPage::ALL,
+                    s.start_page,
+                    StartPage::label,
+                    |s, v| s.start_page = v,
+                    cx,
+                ),
+            ))
+            .child(setting_row(
+                "Poster details",
+                "Score, genres and a synopsis over a poster while the pointer is on it.",
+                switch("settings-poster-details", s.poster_details)
+                    .on_click(self.on(|s| s.poster_details = !s.poster_details, cx))
+                    .into_any_element(),
+            ))
+            .into_any_element()
+    }
+
+    /// A segmented control over `all`, applying `set` with the pick.
+    fn choices<T: Copy + PartialEq + 'static>(
+        &self,
+        id: &'static str,
+        all: &'static [T],
+        current: T,
+        label: fn(T) -> &'static str,
+        set: fn(&mut Settings, T),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut control = segmented(id);
+        for &value in all {
+            control = control.option(
+                label(value),
+                current == value,
+                self.on(move |s| set(s, value), cx),
+            );
+        }
+        control.into_any_element()
+    }
+
+    /// A segmented control over seconds.
+    fn seconds(
+        &self,
+        id: &'static str,
+        all: &'static [u32],
+        current: u32,
+        set: fn(&mut Settings, u32),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut control = segmented(id);
+        for &secs in all {
+            control = control.option(
+                format!("{secs} s"),
+                current == secs,
+                self.on(move |s| set(s, secs), cx),
+            );
+        }
+        control.into_any_element()
+    }
+
     fn render_playback(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mode = self.settings.mode;
+        let s = &self.settings;
         let mut quality = segmented("settings-quality");
         for (value, label) in QUALITIES {
             quality = quality.option(
                 label,
-                self.settings.quality == value,
-                cx.listener(move |page, _, _, cx| page.set_quality(value, cx)),
+                s.quality == value,
+                self.on(move |s| s.quality = value.to_string(), cx),
             );
         }
-        let on = self.settings.autoplay_next;
         section("Playback")
             .child(setting_row(
                 "Audio",
                 "Sub or Dub, for shows you open from now on.",
-                segmented("settings-mode")
-                    .option(
-                        "Sub",
-                        mode == Mode::Sub,
-                        cx.listener(|page, _, _, cx| page.set_mode(Mode::Sub, cx)),
-                    )
-                    .option(
-                        "Dub",
-                        mode == Mode::Dub,
-                        cx.listener(|page, _, _, cx| page.set_mode(Mode::Dub, cx)),
-                    )
-                    .into_any_element(),
+                self.choices(
+                    "settings-mode",
+                    &[Mode::Sub, Mode::Dub],
+                    s.mode,
+                    |m| match m {
+                        Mode::Sub => "Sub",
+                        Mode::Dub => "Dub",
+                    },
+                    |s, v| s.mode = v,
+                    cx,
+                ),
             ))
             .child(setting_row(
                 "Quality",
@@ -234,25 +495,88 @@ impl SettingsPage {
             ))
             .child(setting_row(
                 "Autoplay next episode",
-                "Starts the next episode a few seconds after one ends.",
-                div()
-                    .id("settings-autoplay")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .w(px(48.))
-                    .h(px(28.))
-                    .p(px(3.))
-                    .rounded_full()
-                    .cursor_pointer()
-                    .bg(if on { theme::accent() } else { theme::raised() })
-                    .when(on, |d| d.justify_end())
-                    .on_click(cx.listener(|page, _, _, cx| page.toggle_autoplay(cx)))
-                    .child(div().size(px(22.)).rounded_full().bg(if on {
-                        theme::on_accent()
+                "Starts the next episode after a short countdown when one ends.",
+                switch("settings-autoplay", s.autoplay_next)
+                    .on_click(self.on(|s| s.autoplay_next = !s.autoplay_next, cx))
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Up next countdown",
+                "How long the Up next card waits before playing.",
+                self.seconds(
+                    "settings-up-next",
+                    &UP_NEXT_CHOICES,
+                    s.up_next_secs,
+                    |s, v| s.up_next_secs = v,
+                    cx,
+                ),
+            ))
+            .child(setting_row(
+                "Skip openings automatically",
+                "Jumps past an episode's opening when its timing is known (AniSkip or chapters). Once per episode.",
+                switch("settings-auto-skip", s.auto_skip_intro)
+                    .on_click(self.on(|s| s.auto_skip_intro = !s.auto_skip_intro, cx))
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Skip step",
+                "How far the player's skip buttons and arrow keys jump.",
+                self.seconds(
+                    "settings-seek",
+                    &SEEK_CHOICES,
+                    s.seek_secs,
+                    |s, v| s.seek_secs = v,
+                    cx,
+                ),
+            ))
+            .child(setting_row(
+                "Keep screen awake",
+                "Stops the screen from dimming or locking while a video plays.",
+                switch("settings-keep-awake", s.keep_awake)
+                    .on_click(self.on(|s| s.keep_awake = !s.keep_awake, cx))
+                    .into_any_element(),
+            ))
+            .into_any_element()
+    }
+
+    fn render_browsing(&self, cx: &mut Context<Self>) -> AnyElement {
+        let s = &self.settings;
+        let presets = div()
+            .flex()
+            .flex_wrap()
+            .justify_end()
+            .gap(px(6.))
+            .max_w(px(420.))
+            .children(BrowsePreset::ALL.iter().map(|&p| {
+                icon_chip(
+                    ("settings-preset", p as usize),
+                    match p {
+                        BrowsePreset::Trending => "flame",
+                        BrowsePreset::Season => "calendar",
+                        BrowsePreset::Upcoming => "sparkles",
+                        BrowsePreset::AllTime => "heart",
+                        BrowsePreset::TopRated => "trophy",
+                    },
+                    p.label(),
+                    if s.browse_preset == p {
+                        ChipState::On
                     } else {
-                        theme::text_dim()
-                    }))
+                        ChipState::Off
+                    },
+                )
+                .on_click(self.on(move |s| s.browse_preset = p, cx))
+            }));
+        section("Browsing")
+            .child(setting_row(
+                "Search opens with",
+                "What Search lists before you type a title.",
+                presets.into_any_element(),
+            ))
+            .child(setting_row(
+                "Spoiler tags",
+                "Show tags AniList marks as spoilers on show pages. Otherwise each page can reveal them.",
+                switch("settings-spoilers", s.show_spoiler_tags)
+                    .on_click(self.on(|s| s.show_spoiler_tags = !s.show_spoiler_tags, cx))
                     .into_any_element(),
             ))
             .into_any_element()
@@ -305,18 +629,11 @@ impl SettingsPage {
             .into_any_element()
     }
 
-    fn toggle_auto_update(&mut self, cx: &mut Context<Self>) {
-        let settings = Settings {
-            auto_update: !self.settings.auto_update,
-            ..self.settings.clone()
-        };
-        self.apply(settings, cx);
-    }
-
     fn render_updates(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(updates) = updater::model(cx) else {
             return div().into_any_element();
         };
+        let toggle_auto = self.on(|s| s.auto_update = !s.auto_update, cx);
         let u = updates.read(cx);
         let on = self.settings.auto_update;
         let auto_help = match &u.install_path {
@@ -353,10 +670,7 @@ impl SettingsPage {
                             .min_w_0()
                             .child(label_block("Install updates automatically", auto_help)),
                     )
-                    .child(
-                        switch("settings-auto-update", on)
-                            .on_click(cx.listener(|page, _, _, cx| page.toggle_auto_update(cx))),
-                    ),
+                    .child(switch("settings-auto-update", on).on_click(toggle_auto)),
             )
             .child(
                 div()
@@ -386,6 +700,61 @@ impl SettingsPage {
                     ),
             )
             .children(status)
+            .into_any_element()
+    }
+
+    fn render_about(&self) -> AnyElement {
+        let logo_w = 150.;
+        section("About")
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(28.))
+                    .py(px(22.))
+                    .border_b_1()
+                    .border_color(theme::line())
+                    .child(
+                        img(theme::stacked_logo())
+                            .flex_none()
+                            .w(px(logo_w))
+                            .h(px(logo_w * theme::LOGO_STACKED_ASPECT))
+                            .object_fit(ObjectFit::Contain),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.))
+                            .child(label_block(
+                                "ani-gui",
+                                format!(
+                                    "Version {}. A desktop app for watching anime with ani-cli. \
+                                     Show data comes from AniList, opening times from AniSkip.",
+                                    updater::CURRENT
+                                ),
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(8.))
+                                    .child(
+                                        button("settings-about-site", "Project page")
+                                            .kind(ButtonKind::Secondary)
+                                            .compact()
+                                            .on_click(|_, _, cx| cx.open_url(updater::REPO_URL)),
+                                    )
+                                    .child(
+                                        button("settings-about-anilist", "AniList")
+                                            .kind(ButtonKind::Ghost)
+                                            .compact()
+                                            .on_click(|_, _, cx| cx.open_url("https://anilist.co")),
+                                    ),
+                            ),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -464,11 +833,14 @@ impl Render for SettingsPage {
                             .line_height(px(theme::PAGE_TITLE))
                             .child("Settings"),
                     )
+                    .child(self.render_appearance(cx))
                     .child(self.render_playback(cx))
+                    .child(self.render_browsing(cx))
                     .child(self.render_downloads(cx))
                     .child(self.render_updates(cx))
                     .child(self.render_accounts())
-                    .child(self.render_diagnostics(cx)),
+                    .child(self.render_diagnostics(cx))
+                    .child(self.render_about()),
             )
     }
 }
@@ -572,6 +944,7 @@ fn check_row(check: Check) -> impl IntoElement {
 
 /// An on/off switch, styled like the autoplay one.
 fn switch(id: &'static str, on: bool) -> gpui::Stateful<gpui::Div> {
+    let light = theme::is_light();
     div()
         .id(id)
         .flex()
@@ -579,16 +952,33 @@ fn switch(id: &'static str, on: bool) -> gpui::Stateful<gpui::Div> {
         .items_center()
         .w(px(48.))
         .h(px(28.))
-        .p(px(3.))
+        .p(if light && !on { px(2.) } else { px(3.) })
         .rounded_full()
         .cursor_pointer()
-        .bg(if on { theme::accent() } else { theme::raised() })
-        .when(on, |d| d.justify_end())
-        .child(div().size(px(22.)).rounded_full().bg(if on {
-            theme::on_accent()
+        .bg(if on {
+            theme::accent()
+        } else if light {
+            theme::track()
         } else {
-            theme::text_dim()
-        }))
+            theme::raised()
+        })
+        .when(light && !on, |d| {
+            d.border_1().border_color(theme::control_border())
+        })
+        .when(on, |d| d.justify_end())
+        .child(
+            div()
+                .size(px(22.))
+                .rounded_full()
+                .bg(if light {
+                    theme::control()
+                } else if on {
+                    theme::on_accent()
+                } else {
+                    theme::text_dim()
+                })
+                .when(light, |d| d.shadow(theme::shadow_sm())),
+        )
 }
 
 /// The line under the Updates rows: what was found or went wrong, a link
@@ -655,7 +1045,7 @@ fn render_update_notice(notice: UpdateNotice) -> AnyElement {
                         .max_w(px(260.))
                         .w_full()
                         .rounded_full()
-                        .bg(theme::raised())
+                        .bg(theme::track())
                         .overflow_hidden()
                         .child(
                             div()
@@ -729,7 +1119,11 @@ fn label_block(label: &'static str, help: impl Into<SharedString>) -> impl IntoE
         )
 }
 
-fn setting_row(label: &'static str, help: &'static str, control: AnyElement) -> impl IntoElement {
+fn setting_row(
+    label: &'static str,
+    help: impl Into<SharedString>,
+    control: AnyElement,
+) -> impl IntoElement {
     div()
         .flex()
         .items_center()

@@ -15,6 +15,7 @@ use crate::db::{self, Db, lock};
 use crate::downloads::DownloadManager;
 use crate::model::{AniListMedia, DlStatus, Mode, Progress, ShowRecord, ShowSummary};
 use crate::ui::components::button::{ButtonKind, button, segmented};
+use crate::ui::components::chip::{ChipState, chip, icon_chip};
 use crate::ui::components::icon::icon;
 use crate::ui::components::image::{remote_image, rounded_image};
 use crate::ui::components::pick_dialog::pick_dialog;
@@ -24,6 +25,7 @@ use crate::ui::components::toast;
 use crate::ui::components::your_list::YourList;
 use crate::ui::metadata::ShowMeta;
 use crate::ui::reviews::ReviewsSection;
+use crate::ui::search::SearchFilter;
 use crate::ui::theme;
 use crate::ui::view_models::{self, EpisodeRow, ShowPageModel, media_title, mode_label};
 use crate::{catalog, lists, playback};
@@ -59,9 +61,22 @@ struct PrecomputedHeader {
     status: Option<SharedString>,
     airing: bool,
     facts: Vec<(&'static str, SharedString)>,
-    genres: SharedString,
+    genres: Vec<SharedString>,
+    /// Most telling first; spoilers are hidden unless asked for.
+    tags: Vec<HeaderTag>,
     synopsis: Option<SharedString>,
 }
+
+struct HeaderTag {
+    name: SharedString,
+    rank: u8,
+    spoiler: bool,
+}
+
+/// Tags shown under the genres, at most this many (spoilers aside).
+const HEADER_TAGS: usize = 10;
+/// Tags fewer AniList voters agree on than this are left out.
+const MIN_TAG_RANK: u8 = 40;
 
 impl PrecomputedHeader {
     fn from_parts(
@@ -91,10 +106,10 @@ impl PrecomputedHeader {
         } = media
             .map(|m| ShowMeta::from_media(m, db::now()))
             .unwrap_or_default();
-        let genres: SharedString = media
-            .map(|m| m.genres.join(", "))
-            .unwrap_or_default()
-            .into();
+        let genres: Vec<SharedString> = media
+            .map(|m| m.genres.iter().cloned().map(Into::into).collect())
+            .unwrap_or_default();
+        let tags = media.map(header_tags).unwrap_or_default();
         let synopsis = media
             .and_then(|m| m.synopsis.as_deref())
             .map(|s| view_models::clamp_words(&view_models::blurb(s), SYNOPSIS_CHARS).into());
@@ -109,9 +124,41 @@ impl PrecomputedHeader {
             airing,
             facts: facts.into_iter().map(|(k, v)| (k, v.into())).collect(),
             genres,
+            tags,
             synopsis,
         }
     }
+}
+
+/// The audience tag (Shounen, Seinen, …) first, then by how strongly each
+/// applies; weak ones dropped, and at most `HEADER_TAGS` that aren't
+/// spoilers.
+fn header_tags(media: &AniListMedia) -> Vec<HeaderTag> {
+    let mut tags: Vec<_> = media
+        .tags
+        .iter()
+        .filter(|t| t.rank >= MIN_TAG_RANK)
+        .collect();
+    tags.sort_by_key(|t| {
+        (
+            t.category.as_deref() != Some("Demographic"),
+            u8::MAX - t.rank,
+        )
+    });
+    let mut plain = 0;
+    tags.into_iter()
+        .filter(|t| {
+            t.spoiler || {
+                plain += 1;
+                plain <= HEADER_TAGS
+            }
+        })
+        .map(|t| HeaderTag {
+            name: t.name.clone().into(),
+            rank: t.rank,
+            spoiler: t.spoiler,
+        })
+        .collect()
 }
 
 struct Loaded {
@@ -159,6 +206,8 @@ pub struct ShowPage {
     quality: String,
     loaded: Option<Loaded>,
     header: PrecomputedHeader,
+    /// Spoiler tags shown on request, whatever the setting.
+    reveal_spoilers: bool,
     load_error: Option<String>,
     model: ShowPageModel,
     page: usize,
@@ -203,6 +252,7 @@ impl ShowPage {
             quality,
             loaded: None,
             header,
+            reveal_spoilers: false,
             load_error: None,
             model: ShowPageModel::default(),
             page: 0,
@@ -661,11 +711,21 @@ impl ShowPage {
                         Some(url) => remote_image(url).into_any_element(),
                         None => div().size_full().bg(theme::raised()).into_any_element(),
                     }))
-                    .child(div().absolute().inset_0().bg(linear_gradient(
-                        0.,
-                        linear_color_stop(theme::night_alpha(1.), 0.),
-                        linear_color_stop(theme::night_alpha(0.35), 0.75),
-                    )))
+                    // In Daylight a long fade to the pale page turns the art
+                    // milky, so it only softens the bottom edge.
+                    .child(div().absolute().inset_0().bg(if theme::is_light() {
+                        linear_gradient(
+                            0.,
+                            linear_color_stop(theme::night_alpha(1.), 0.),
+                            linear_color_stop(theme::night_alpha(0.), 0.48),
+                        )
+                    } else {
+                        linear_gradient(
+                            0.,
+                            linear_color_stop(theme::night_alpha(1.), 0.),
+                            linear_color_stop(theme::night_alpha(0.35), 0.75),
+                        )
+                    }))
                     .child(
                         div().absolute().top(px(20.)).left(px(24.)).child(
                             button("show-back", "‹ Back")
@@ -719,15 +779,7 @@ impl ShowPage {
                             .when(!h.strip.is_empty() || h.status.is_some(), |col| {
                                 col.child(metadata_strip(&h.strip, h.status.clone(), h.airing))
                             })
-                            .when(!h.genres.is_empty(), |col| {
-                                col.child(
-                                    div()
-                                        .text_size(px(theme::SMALL))
-                                        .text_color(theme::text_dim())
-                                        .truncate()
-                                        .child(h.genres.clone()),
-                                )
-                            })
+                            .children(self.render_tags(cx))
                             .children(h.synopsis.clone().map(|s| {
                                 div()
                                     .max_w(px(720.))
@@ -744,6 +796,70 @@ impl ShowPage {
                 header.child(facts_block(&h.facts))
             })
             .into_any_element()
+    }
+
+    /// Genre and tag chips; each opens Search listing shows with it.
+    fn render_tags(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let h = &self.header;
+        if h.genres.is_empty() && h.tags.is_empty() {
+            return None;
+        }
+        let spoilers_on =
+            self.reveal_spoilers || self.state(cx).is_some_and(|s| s.settings.show_spoiler_tags);
+        let hidden = h.tags.iter().filter(|t| t.spoiler).count();
+        let mut row = div().flex().flex_wrap().gap(px(6.)).max_w(px(760.));
+        for (i, genre) in h.genres.iter().enumerate() {
+            let filter = SearchFilter::Genre(genre.to_string());
+            row = row.child(
+                chip(("show-genre", i), genre.clone(), ChipState::On).on_click(
+                    cx.listener(move |page, _, _, cx| page.search_for(filter.clone(), cx)),
+                ),
+            );
+        }
+        for (i, tag) in h.tags.iter().enumerate() {
+            if tag.spoiler && !spoilers_on {
+                continue;
+            }
+            let filter = SearchFilter::Tag(tag.name.to_string());
+            row = row.child(
+                icon_chip(("show-tag", i), "tag", tag.name.clone(), ChipState::Off)
+                    .when(tag.spoiler, |c| c.border_color(theme::danger()))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme::text_muted())
+                            .child(format!("{}%", tag.rank)),
+                    )
+                    .on_click(
+                        cx.listener(move |page, _, _, cx| page.search_for(filter.clone(), cx)),
+                    ),
+            );
+        }
+        if hidden > 0 && !spoilers_on {
+            row = row.child(
+                button(
+                    "show-spoiler-tags",
+                    if hidden == 1 {
+                        "Show 1 spoiler tag".to_string()
+                    } else {
+                        format!("Show {hidden} spoiler tags")
+                    },
+                )
+                .kind(ButtonKind::Ghost)
+                .compact()
+                .on_click(cx.listener(|page, _, _, cx| {
+                    page.reveal_spoilers = true;
+                    cx.notify();
+                })),
+            );
+        }
+        Some(row.into_any_element())
+    }
+
+    fn search_for(&self, filter: SearchFilter, cx: &mut Context<Self>) {
+        self.root
+            .update(cx, |root, cx| root.search_for(filter, cx))
+            .ok();
     }
 
     fn render_controls(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1501,4 +1617,128 @@ fn episode_downloads(
             });
     }
     downloads
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::MediaTag;
+
+    fn tag(name: &str, rank: u8, spoiler: bool, category: Option<&str>) -> MediaTag {
+        MediaTag {
+            name: name.to_string(),
+            rank,
+            spoiler,
+            category: category.map(str::to_string),
+        }
+    }
+
+    fn media_with_tags(tags: Vec<MediaTag>) -> AniListMedia {
+        AniListMedia {
+            tags,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn header_tags_empty_input() {
+        let tags = header_tags(&AniListMedia::default());
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn header_tags_drops_below_min_rank_and_sorts_by_rank_desc() {
+        let media = media_with_tags(vec![
+            tag("Zero", 0, false, Some("Theme-Other")),
+            tag("JustBelow", MIN_TAG_RANK - 1, false, Some("Theme-Other")),
+            tag("LowDemo", MIN_TAG_RANK - 1, false, Some("Demographic")),
+            tag("LowSpoiler", MIN_TAG_RANK - 1, true, Some("Theme-Plot")),
+            tag("AtCutoff", MIN_TAG_RANK, false, Some("Theme-Other")),
+            tag("Highest", 92, false, Some("Theme-Fantasy")),
+            tag("Middle", 65, true, None),
+        ]);
+
+        let tags = header_tags(&media);
+        let got: Vec<(&str, u8, bool)> = tags
+            .iter()
+            .map(|t| (t.name.as_ref(), t.rank, t.spoiler))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Highest", 92, false),
+                ("Middle", 65, true),
+                ("AtCutoff", MIN_TAG_RANK, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn header_tags_puts_demographic_first_even_with_lower_rank() {
+        let media = media_with_tags(vec![
+            tag("Magic", 95, false, Some("Theme-Fantasy")),
+            tag("Shounen", 45, false, Some("Demographic")),
+            tag("Time Loop", 88, false, None),
+            tag("Seinen", 60, false, Some("Demographic")),
+            tag("Ensemble Cast", 75, false, Some("Cast-Main Cast")),
+        ]);
+
+        let tags = header_tags(&media);
+        let names: Vec<&str> = tags.iter().map(|t| t.name.as_ref()).collect();
+        assert_eq!(
+            names,
+            vec!["Seinen", "Shounen", "Magic", "Time Loop", "Ensemble Cast"]
+        );
+    }
+
+    #[test]
+    fn header_tags_caps_non_spoilers_at_limit_while_keeping_spoilers() {
+        let mut raw = Vec::new();
+        // 12 non-spoiler tags (ranks 90 down to 79), all >= MIN_TAG_RANK.
+        for i in 0..12u8 {
+            raw.push(tag(
+                &format!("Plain{i}"),
+                90 - i,
+                false,
+                Some("Theme-Action"),
+            ));
+        }
+        // Spoiler ranked within the top 10: must not consume a non-spoiler slot.
+        raw.push(tag("HighSpoiler", 95, true, Some("Theme-Plot")));
+        // Spoilers ranked below the 10th non-spoiler (still >= MIN_TAG_RANK): must be kept.
+        raw.push(tag("LateSpoilerA", 55, true, Some("Theme-Plot")));
+        raw.push(tag("LateSpoilerB", MIN_TAG_RANK, true, Some("Theme-Plot")));
+        // Spoiler below the rank cutoff: still dropped.
+        raw.push(tag(
+            "WeakSpoiler",
+            MIN_TAG_RANK - 1,
+            true,
+            Some("Theme-Plot"),
+        ));
+
+        let got = header_tags(&media_with_tags(raw));
+        let non_spoilers: Vec<&str> = got
+            .iter()
+            .filter(|t| !t.spoiler)
+            .map(|t| t.name.as_ref())
+            .collect();
+        let spoilers: Vec<&str> = got
+            .iter()
+            .filter(|t| t.spoiler)
+            .map(|t| t.name.as_ref())
+            .collect();
+
+        assert_eq!(non_spoilers.len(), HEADER_TAGS);
+        assert_eq!(
+            non_spoilers,
+            vec![
+                "Plain0", "Plain1", "Plain2", "Plain3", "Plain4", "Plain5", "Plain6", "Plain7",
+                "Plain8", "Plain9",
+            ]
+        );
+        assert_eq!(
+            spoilers,
+            vec!["HighSpoiler", "LateSpoilerA", "LateSpoilerB"]
+        );
+    }
 }

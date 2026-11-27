@@ -75,11 +75,17 @@ pub fn bar(window: &Window) -> Option<AnyElement> {
         theme::text_muted()
     };
 
+    let hover_bg = if theme::is_light() {
+        theme::ghost_hover()
+    } else {
+        theme::raised_hover()
+    };
+    let close_hover_alpha = if theme::is_light() { 0.14 } else { 0.22 };
     let mut buttons = div().flex().items_center().h_full().flex_none();
     if controls.minimize {
         buttons = buttons.child(
             control_button("window-minimize", "minus", 14., fg, theme::text())
-                .hover(|s| s.bg(theme::raised_hover()))
+                .hover(move |s| s.bg(hover_bg))
                 .on_click(|_, window, _| window.minimize_window()),
         );
     }
@@ -91,14 +97,14 @@ pub fn bar(window: &Window) -> Option<AnyElement> {
         };
         buttons = buttons.child(
             control_button("window-maximize", name, size, fg, theme::text())
-                .hover(|s| s.bg(theme::raised_hover()))
+                .hover(move |s| s.bg(hover_bg))
                 .on_click(|_, window, _| window.zoom_window()),
         );
     }
     buttons = buttons.child(
         control_button("window-close", "x", 14., fg, theme::danger())
             .rounded_tr(inner_radii.top_right)
-            .hover(|s| s.bg(gpui::Hsla::from(theme::danger()).opacity(0.22)))
+            .hover(move |s| s.bg(gpui::Hsla::from(theme::danger()).opacity(close_hover_alpha)))
             .on_click(|_, window, _| window.remove_window()),
     );
 
@@ -237,11 +243,20 @@ pub fn frame(content: impl IntoElement, window: &mut Window, _cx: &mut App) -> A
             .when(!tiling.left, |d| d.border_l(px(BORDER_WIDTH)))
             .when(!tiling.right, |d| d.border_r(px(BORDER_WIDTH)))
             .when(!tiling.is_tiled(), |d| {
-                d.shadow(vec![BoxShadow {
-                    color: gpui::black().opacity(0.4),
-                    offset: point(px(0.), px(2.)),
-                    blur_radius: px(6.),
-                    spread_radius: px(0.),
+                d.shadow(vec![if theme::is_light() {
+                    BoxShadow {
+                        color: gpui::black().opacity(0.16),
+                        offset: point(px(0.), px(3.)),
+                        blur_radius: px(12.),
+                        spread_radius: px(0.),
+                    }
+                } else {
+                    BoxShadow {
+                        color: gpui::black().opacity(0.4),
+                        offset: point(px(0.), px(2.)),
+                        blur_radius: px(6.),
+                        spread_radius: px(0.),
+                    }
                 }])
             }),
         radii,

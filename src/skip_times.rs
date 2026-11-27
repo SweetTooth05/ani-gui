@@ -197,6 +197,19 @@ pub fn eligible_prompt(
     None
 }
 
+/// Whether playback should immediately jump past the opening right now.
+///
+/// Only fires once per episode when the opening prompt is eligible, the
+/// auto-skip setting is enabled, and the intro segment is known.
+pub fn should_auto_skip(
+    eligible: Option<ActivePrompt>,
+    enabled: bool,
+    already_skipped: bool,
+    intro_known: bool,
+) -> bool {
+    eligible == Some(ActivePrompt::SkipIntro) && enabled && !already_skipped && intro_known
+}
+
 /// AniSkip accepts only positive integer episode numbers.
 pub fn aniskip_episode(ep: &str) -> Option<u32> {
     let trimmed = ep.trim();
@@ -758,5 +771,66 @@ mod tests {
         // Invalid episode / MAL id returns empty immediately without hitting network.
         assert!(fetch_aniskip(&db, 0, "1").is_empty());
         assert!(fetch_aniskip(&db, 52991, "1.5").is_empty());
+    }
+
+    #[test]
+    fn should_auto_skip_only_when_all_four_conditions_hold() {
+        assert!(should_auto_skip(
+            Some(ActivePrompt::SkipIntro),
+            true,
+            false,
+            true
+        ));
+
+        // Missing any single prerequisite suppresses auto-skip.
+        assert!(!should_auto_skip(None, true, false, true));
+        assert!(!should_auto_skip(
+            Some(ActivePrompt::NextEpisode),
+            true,
+            false,
+            true
+        ));
+        assert!(!should_auto_skip(
+            Some(ActivePrompt::SkipIntro),
+            false,
+            false,
+            true
+        ));
+        assert!(!should_auto_skip(
+            Some(ActivePrompt::SkipIntro),
+            true,
+            true,
+            true
+        ));
+        assert!(!should_auto_skip(
+            Some(ActivePrompt::SkipIntro),
+            true,
+            false,
+            false
+        ));
+
+        // Exhaustive check across all 24 combinations: only the one valid
+        // tuple triggers auto-skip, and NextEpisode never does.
+        for eligible in [
+            None,
+            Some(ActivePrompt::SkipIntro),
+            Some(ActivePrompt::NextEpisode),
+        ] {
+            for enabled in [false, true] {
+                for already_skipped in [false, true] {
+                    for intro_known in [false, true] {
+                        let expected = eligible == Some(ActivePrompt::SkipIntro)
+                            && enabled
+                            && !already_skipped
+                            && intro_known;
+                        assert_eq!(
+                            should_auto_skip(eligible, enabled, already_skipped, intro_known),
+                            expected,
+                            "eligible={eligible:?}, enabled={enabled}, already_skipped={already_skipped}, intro_known={intro_known}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

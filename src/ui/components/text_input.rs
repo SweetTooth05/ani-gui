@@ -572,7 +572,11 @@ impl Element for TextElement {
                             bounds.bottom(),
                         ),
                     ),
-                    gpui::Hsla::from(theme::accent()).opacity(0.3),
+                    gpui::Hsla::from(theme::accent()).opacity(if theme::is_light() {
+                        0.22
+                    } else {
+                        0.3
+                    }),
                 )),
                 None,
             )
@@ -668,13 +672,14 @@ impl Render for TextInput {
                     .text_size(px(20.))
                     .line_height(px(28.))
             })
-            .bg(theme::raised())
+            .bg(theme::control())
             .border_1()
             .border_color(if focused {
                 theme::accent()
             } else {
-                theme::line()
+                theme::control_border()
             })
+            .when(theme::is_light(), |d| d.shadow(theme::shadow_sm()))
             .text_color(theme::text())
             .child(TextElement { input: cx.entity() })
     }

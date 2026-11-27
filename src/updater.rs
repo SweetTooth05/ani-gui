@@ -37,6 +37,8 @@ use crate::paths;
 use crate::ui::components::toast;
 
 const REPO: &str = "SweetTooth05/ani-gui";
+/// The project page, for Settings › About.
+pub const REPO_URL: &str = "https://github.com/SweetTooth05/ani-gui";
 const API_LATEST: &str = "https://api.github.com/repos/SweetTooth05/ani-gui/releases/latest";
 const DOWNLOAD_PREFIX: &str = "https://github.com/SweetTooth05/ani-gui/releases/download/";
 /// Generic on purpose: nothing about the user goes to GitHub.

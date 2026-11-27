@@ -10,27 +10,26 @@ use crate::ui::components::icon::icon;
 use crate::ui::theme;
 use crate::updater::{self, SidebarTone, UpdateAction};
 
-const ITEMS: [(&str, Route); 6] = [
-    ("Home", Route::Home),
-    ("Search", Route::Search),
-    ("My List", Route::MyList),
-    ("Calendar", Route::Calendar),
-    ("Downloads", Route::Downloads),
-    ("Settings", Route::Settings),
+/// (label, icon, route).
+const ITEMS: [(&str, &str, Route); 6] = [
+    ("Home", "house", Route::Home),
+    ("Search", "search", Route::Search),
+    ("My List", "bookmark", Route::MyList),
+    ("Calendar", "calendar", Route::Calendar),
+    ("Downloads", "download", Route::Downloads),
+    ("Settings", "settings", Route::Settings),
 ];
 
-/// Logo width: the sidebar minus its padding and the nav items' inset, so the
-/// lockup lines up with the labels below it.
-const LOGO_W: f32 = theme::SIDEBAR_WIDTH - 4. * 14.;
-/// Height / width of `assets/brand/svg/ani-gui-compact-reversed.svg` (882 x 240).
-const LOGO_ASPECT: f32 = 240. / 882.;
+/// Logo width: the sidebar minus its padding and a small inset, wide enough
+/// for the アニグイ line under the wordmark to stay readable.
+const LOGO_W: f32 = theme::SIDEBAR_WIDTH - 2. * 14. - 2. * 4.;
 
 /// The sidebar entry a route belongs to (Show and Player pages have none).
 fn section(route: &Route) -> Option<&'static str> {
     ITEMS
         .iter()
-        .find(|(_, r)| r == route)
-        .map(|(label, _)| *label)
+        .find(|(_, _, r)| r == route)
+        .map(|(label, _, _)| *label)
 }
 
 /// Self-observing footer widget so updater progress repaints only this control.
@@ -124,7 +123,7 @@ impl Render for SidebarUpdateControl {
                             .h(px(3.))
                             .w_full()
                             .rounded_full()
-                            .bg(theme::raised())
+                            .bg(theme::track())
                             .overflow_hidden()
                             .child(
                                 div()
@@ -146,11 +145,12 @@ impl Render for SidebarUpdateControl {
                     .px(px(10.))
                     .py(px(9.))
                     .rounded(px(8.))
-                    .bg(theme::raised())
+                    .bg(theme::control())
                     .border_1()
-                    .border_color(theme::line())
+                    .border_color(theme::control_border())
+                    .when(theme::is_light(), |d| d.shadow(theme::shadow_sm()))
                     .cursor_pointer()
-                    .hover(|s| s.bg(theme::raised_hover()))
+                    .hover(|s| s.bg(theme::control_hover()))
                     .flex()
                     .flex_col()
                     .gap(px(3.))
@@ -237,7 +237,7 @@ impl Render for SidebarUpdateControl {
                 .rounded(px(8.))
                 .bg(theme::wash())
                 .cursor_pointer()
-                .hover(|s| s.bg(theme::raised()))
+                .hover(|s| s.bg(theme::ghost_hover()))
                 .flex()
                 .flex_col()
                 .gap(px(2.))
@@ -289,6 +289,7 @@ impl Render for SidebarUpdateControl {
 pub fn sidebar(active: &Route, cx: &mut Context<Root>) -> impl IntoElement {
     let active = section(active);
     let footer = update_control(cx);
+    let light = theme::is_light();
     div()
         .flex()
         .flex_col()
@@ -307,20 +308,27 @@ pub fn sidebar(active: &Route, cx: &mut Context<Root>) -> impl IntoElement {
                 .flex_col()
                 .gap(px(2.))
                 .child(
-                    div().px(px(14.)).pb(px(28.)).child(
-                        img(theme::LOGO)
-                            .w(px(LOGO_W))
-                            .h(px(LOGO_W * LOGO_ASPECT))
-                            .object_fit(ObjectFit::Contain),
-                    ),
+                    div()
+                        .id("sidebar-logo")
+                        .px(px(4.))
+                        .pb(px(26.))
+                        .cursor_pointer()
+                        .on_click(cx.listener(|root, _, _, cx| root.navigate(Route::Home, cx)))
+                        .child(
+                            img(theme::sidebar_logo())
+                                .w(px(LOGO_W))
+                                .h(px(LOGO_W * theme::LOGO_SIDEBAR_ASPECT))
+                                .object_fit(ObjectFit::Contain),
+                        ),
                 )
-                .children(ITEMS.into_iter().map(|(label, route)| {
+                .children(ITEMS.into_iter().map(|(label, icon_name, route)| {
                     let selected = active == Some(label);
                     div()
                         .id(label)
                         .relative()
                         .flex()
                         .items_center()
+                        .gap(px(12.))
                         .h(px(42.))
                         .px(px(14.))
                         .rounded(px(8.))
@@ -331,16 +339,23 @@ pub fn sidebar(active: &Route, cx: &mut Context<Root>) -> impl IntoElement {
                             FontWeight::MEDIUM
                         })
                         .when(selected, |item| {
-                            item.bg(theme::raised()).text_color(theme::text()).child(
-                                div()
-                                    .absolute()
-                                    .left(px(0.))
-                                    .top(px(11.))
-                                    .h(px(20.))
-                                    .w(px(3.))
-                                    .rounded(px(2.))
-                                    .bg(theme::accent()),
-                            )
+                            if light {
+                                item.bg(theme::accent_alpha(0.11))
+                                    .border_1()
+                                    .border_color(theme::accent_alpha(0.18))
+                                    .text_color(theme::text())
+                            } else {
+                                item.bg(theme::raised()).text_color(theme::text()).child(
+                                    div()
+                                        .absolute()
+                                        .left(px(0.))
+                                        .top(px(11.))
+                                        .h(px(20.))
+                                        .w(px(3.))
+                                        .rounded(px(2.))
+                                        .bg(theme::accent()),
+                                )
+                            }
                         })
                         .when(!selected, |item| {
                             item.text_color(theme::text_dim())
@@ -350,6 +365,11 @@ pub fn sidebar(active: &Route, cx: &mut Context<Root>) -> impl IntoElement {
                         .on_click(
                             cx.listener(move |root, _, _, cx| root.navigate(route.clone(), cx)),
                         )
+                        .child(icon(icon_name).size(px(18.)).text_color(if selected {
+                            theme::accent()
+                        } else {
+                            theme::text_muted()
+                        }))
                         .child(label)
                 })),
         )

@@ -2,14 +2,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef};
-use rusqlite::{Connection, OptionalExtension, Row, ToSql, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, ToSql, params};
 
 use crate::lists::{Account, ListStatus, PendingPush, RemoteEntry, Service};
-use crate::model::{DlStatus, DownloadRecord, Mode, Progress, Settings, ShowRecord, ShowSummary};
+use crate::model::{
+    DlStatus, DownloadRecord, Mode, Progress, SEEK_CHOICES, Settings, ShowRecord, ShowSummary,
+    UP_NEXT_CHOICES,
+};
 
 const SCHEMA_V1: &str = "
 CREATE TABLE shows (
@@ -451,51 +454,19 @@ impl Db {
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
             let (key, value) = row?;
-            match key.as_str() {
-                "mode" => {
-                    if let Ok(mode) = value.parse() {
-                        settings.mode = mode;
-                    }
-                }
-                "quality" if !value.is_empty() => settings.quality = value,
-                "download_dir" if !value.is_empty() => settings.download_dir = PathBuf::from(value),
-                "autoplay_next" => {
-                    if let Ok(on) = value.parse() {
-                        settings.autoplay_next = on;
-                    }
-                }
-                "auto_update" => {
-                    if let Ok(on) = value.parse() {
-                        settings.auto_update = on;
-                    }
-                }
-                _ => {}
-            }
+            apply_setting(&mut settings, &key, value);
         }
         Ok(settings)
     }
 
     pub fn save_settings(&self, s: &Settings) -> Result<()> {
-        let download_dir = s
-            .download_dir
-            .to_str()
-            .context("download directory is not valid UTF-8")?;
-        let entries = [
-            ("mode", s.mode.as_str()),
-            ("quality", s.quality.as_str()),
-            ("download_dir", download_dir),
-            (
-                "autoplay_next",
-                if s.autoplay_next { "true" } else { "false" },
-            ),
-            ("auto_update", if s.auto_update { "true" } else { "false" }),
-        ];
+        let entries = setting_entries(s)?;
         let tx = self.conn.unchecked_transaction()?;
         for (key, value) in entries {
             tx.execute(
                 "INSERT INTO settings (key, value) VALUES (?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [key, value],
+                params![key, value],
             )?;
         }
         tx.commit()?;
@@ -906,6 +877,32 @@ pub fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// Cheap read-only lookup of the display preferences (`theme`, `accent` and
+/// `title_language`) before the window opens, so the first frame uses the
+/// user's palette instead of flashing the default theme. Falls back to
+/// `Settings::default()` on any error or when the database does not exist yet.
+pub fn read_display_prefs(path: &Path) -> Settings {
+    read_display_prefs_inner(path).unwrap_or_default()
+}
+
+fn read_display_prefs_inner(path: &Path) -> Result<Settings> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(Duration::from_millis(50))?;
+    let mut settings = Settings::default();
+    let mut stmt = conn.prepare(
+        "SELECT key, value FROM settings WHERE key IN ('theme', 'accent', 'title_language')",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    for row in rows {
+        let (key, value) = row?;
+        apply_setting(&mut settings, &key, value);
+    }
+    Ok(settings)
+}
+
 fn progress_from_row(r: &Row<'_>) -> rusqlite::Result<Progress> {
     Ok(Progress {
         show_id: r.get(0)?,
@@ -1014,6 +1011,71 @@ impl ToSql for ListStatus {
 impl FromSql for ListStatus {
     fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
         parse_text(value)
+    }
+}
+
+/// Every setting as its stored (key, text). `apply_setting` reads them back.
+fn setting_entries(s: &Settings) -> Result<Vec<(&'static str, String)>> {
+    let flag = |on: bool| on.to_string();
+    let download_dir = s
+        .download_dir
+        .to_str()
+        .context("download directory is not valid UTF-8")?;
+    Ok(vec![
+        ("mode", s.mode.as_str().to_string()),
+        ("quality", s.quality.clone()),
+        ("download_dir", download_dir.to_string()),
+        ("autoplay_next", flag(s.autoplay_next)),
+        ("auto_update", flag(s.auto_update)),
+        ("theme", s.theme.as_str().to_string()),
+        ("accent", s.accent.as_str().to_string()),
+        ("title_language", s.title_language.as_str().to_string()),
+        ("start_page", s.start_page.as_str().to_string()),
+        ("clock", s.clock.as_str().to_string()),
+        ("poster_details", flag(s.poster_details)),
+        ("browse_preset", s.browse_preset.as_str().to_string()),
+        ("show_spoiler_tags", flag(s.show_spoiler_tags)),
+        ("auto_skip_intro", flag(s.auto_skip_intro)),
+        ("up_next_secs", s.up_next_secs.to_string()),
+        ("seek_secs", s.seek_secs.to_string()),
+        ("keep_awake", flag(s.keep_awake)),
+    ])
+}
+
+/// Sets the field stored under `key`, leaving it alone if `value` doesn't
+/// parse (or isn't one of the offered choices) and ignoring unknown keys.
+fn apply_setting(s: &mut Settings, key: &str, value: String) {
+    fn set<T: std::str::FromStr>(field: &mut T, value: &str) {
+        if let Ok(v) = value.parse() {
+            *field = v;
+        }
+    }
+    fn set_choice(field: &mut u32, value: &str, choices: &[u32]) {
+        if let Ok(v) = value.parse()
+            && choices.contains(&v)
+        {
+            *field = v;
+        }
+    }
+    match key {
+        "mode" => set(&mut s.mode, &value),
+        "quality" if !value.is_empty() => s.quality = value,
+        "download_dir" if !value.is_empty() => s.download_dir = PathBuf::from(value),
+        "autoplay_next" => set(&mut s.autoplay_next, &value),
+        "auto_update" => set(&mut s.auto_update, &value),
+        "theme" => set(&mut s.theme, &value),
+        "accent" => set(&mut s.accent, &value),
+        "title_language" => set(&mut s.title_language, &value),
+        "start_page" => set(&mut s.start_page, &value),
+        "clock" => set(&mut s.clock, &value),
+        "poster_details" => set(&mut s.poster_details, &value),
+        "browse_preset" => set(&mut s.browse_preset, &value),
+        "show_spoiler_tags" => set(&mut s.show_spoiler_tags, &value),
+        "auto_skip_intro" => set(&mut s.auto_skip_intro, &value),
+        "up_next_secs" => set_choice(&mut s.up_next_secs, &value, &UP_NEXT_CHOICES),
+        "seek_secs" => set_choice(&mut s.seek_secs, &value, &SEEK_CHOICES),
+        "keep_awake" => set(&mut s.keep_awake, &value),
+        _ => {}
     }
 }
 
@@ -1706,9 +1768,78 @@ mod tests {
             download_dir: PathBuf::from("/tmp/anime"),
             autoplay_next: false,
             auto_update: false,
+            theme: crate::model::Theme::Daylight,
+            accent: crate::model::Accent::Violet,
+            title_language: crate::model::TitleLanguage::Romaji,
+            start_page: crate::model::StartPage::Calendar,
+            clock: crate::model::ClockFormat::H12,
+            poster_details: false,
+            browse_preset: crate::model::BrowsePreset::TopRated,
+            show_spoiler_tags: true,
+            auto_skip_intro: true,
+            up_next_secs: 10,
+            seek_secs: 30,
+            keep_awake: false,
         };
         db.save_settings(&custom).unwrap();
         assert_eq!(db.load_settings().unwrap(), custom);
+
+        // Values that don't parse, or aren't offered, keep the old setting.
+        for (key, value) in [("theme", "neon"), ("seek_secs", "7"), ("keep_awake", "yes")] {
+            db.conn
+                .execute(
+                    "UPDATE settings SET value = ?2 WHERE key = ?1",
+                    params![key, value],
+                )
+                .unwrap();
+        }
+        let loaded = db.load_settings().unwrap();
+        assert_eq!(loaded.theme, crate::model::Theme::Night);
+        assert_eq!(loaded.seek_secs, 10);
+        assert!(loaded.keep_awake);
+    }
+
+    #[test]
+    fn read_display_prefs_reads_saved_and_defaults_on_missing() {
+        let dir =
+            std::env::temp_dir().join(format!("ani-gui-display-prefs-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("ani-gui.db");
+
+        // Missing file falls back to defaults without creating anything.
+        assert_eq!(read_display_prefs(&path), Settings::default());
+        assert!(!path.exists());
+
+        let custom = Settings {
+            mode: Mode::Dub,
+            theme: crate::model::Theme::Daylight,
+            accent: crate::model::Accent::Cyan,
+            title_language: crate::model::TitleLanguage::Romaji,
+            ..Settings::default()
+        };
+        let expected = Settings {
+            theme: custom.theme,
+            accent: custom.accent,
+            title_language: custom.title_language,
+            ..Settings::default()
+        };
+
+        {
+            let db = Db::open(&path).unwrap();
+            db.save_settings(&custom).unwrap();
+            // Readable even while the WAL writer is still open.
+            assert_eq!(read_display_prefs(&path), expected);
+        }
+
+        // Readable after the DB is closed, and only display prefs are loaded.
+        assert_eq!(read_display_prefs(&path), expected);
+
+        // Corrupt / non-SQLite file falls back to defaults.
+        let corrupt = dir.join("corrupt.db");
+        std::fs::write(&corrupt, b"not a sqlite database").unwrap();
+        assert_eq!(read_display_prefs(&corrupt), Settings::default());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

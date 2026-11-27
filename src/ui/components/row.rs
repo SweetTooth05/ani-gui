@@ -26,7 +26,7 @@ pub fn row(
             .text_size(px(20.))
             .text_color(theme::text_dim())
             .cursor_pointer()
-            .hover(|s| s.bg(theme::raised()).text_color(theme::text()))
+            .hover(|s| s.bg(theme::ghost_hover()).text_color(theme::text()))
             .child(label)
             .on_click(move |_, window, _| {
                 let page = scroll.bounds().size.width * 0.8;

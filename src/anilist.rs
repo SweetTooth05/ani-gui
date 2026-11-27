@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::model::{Airing, AniListMedia, FuzzyDate, Ranking};
+use crate::model::{Airing, AniListMedia, FuzzyDate, MediaTag, Ranking};
 use crate::net;
 
 pub const API: &str = "https://graphql.anilist.co";
@@ -18,7 +19,8 @@ const MEDIA_GQL: &str = "query ($id: Int) { Media(id: $id, type: ANIME) { \
     ...card streamingEpisodes { title thumbnail } meanScore popularity favourites season \
     startDate { year month day } endDate { year month day } duration source \
     studios(isMain: true) { nodes { name } } \
-    rankings { rank type allTime season year context } } }";
+    rankings { rank type allTime season year context } \
+    tags { name rank category isMediaSpoiler isGeneralSpoiler isAdult } } }";
 
 const CARDS_GQL: &str = "query ($ids: [Int]) { Page(perPage: 50) { \
     media(id_in: $ids, type: ANIME) { ...card } } }";
@@ -114,7 +116,30 @@ pub fn parse_media(v: &Value) -> AniListMedia {
             .as_array()
             .map(|r| r.iter().filter_map(parse_ranking).collect())
             .unwrap_or_default(),
+        tags: v["tags"]
+            .as_array()
+            .map(|t| parse_tags(t))
+            .unwrap_or_default(),
     }
+}
+
+/// Tags most relevant first, without adult-only ones.
+fn parse_tags(tags: &[Value]) -> Vec<MediaTag> {
+    let mut tags: Vec<MediaTag> = tags
+        .iter()
+        .filter(|t| t["isAdult"].as_bool() != Some(true))
+        .filter_map(|t| {
+            Some(MediaTag {
+                name: text(&t["name"])?,
+                rank: num::<u8>(&t["rank"]).unwrap_or(0).min(100),
+                spoiler: t["isMediaSpoiler"].as_bool() == Some(true)
+                    || t["isGeneralSpoiler"].as_bool() == Some(true),
+                category: text(&t["category"]),
+            })
+        })
+        .collect();
+    tags.sort_by_key(|t| std::cmp::Reverse(t.rank));
+    tags
 }
 
 /// A date with at least its year known.
@@ -317,6 +342,239 @@ pub fn recommendations(ids: &[i64]) -> Result<Vec<AniListMedia>> {
     Ok(parse_recommendations(&v, ids))
 }
 
+/// AniList's fixed genre list (without Hentai, which ani-gui never lists).
+pub const GENRES: [&str; 18] = [
+    "Action",
+    "Adventure",
+    "Comedy",
+    "Drama",
+    "Ecchi",
+    "Fantasy",
+    "Horror",
+    "Mahou Shoujo",
+    "Mecha",
+    "Music",
+    "Mystery",
+    "Psychological",
+    "Romance",
+    "Sci-Fi",
+    "Slice of Life",
+    "Sports",
+    "Supernatural",
+    "Thriller",
+];
+
+/// Who a show is written for: AniList's "Demographic" tags.
+pub const DEMOGRAPHICS: [&str; 5] = ["Shounen", "Shoujo", "Seinen", "Josei", "Kids"];
+
+/// Popular AniList tags offered as Search filters (names checked against
+/// AniList's `MediaTagCollection`).
+pub const THEME_TAGS: [&str; 30] = [
+    "Isekai",
+    "Iyashikei",
+    "School",
+    "Military",
+    "Martial Arts",
+    "Magic",
+    "Super Power",
+    "Time Manipulation",
+    "Reincarnation",
+    "Survival",
+    "Revenge",
+    "Tragedy",
+    "Gore",
+    "Vampire",
+    "Demons",
+    "Detective",
+    "Historical",
+    "Post-Apocalyptic",
+    "Space",
+    "Cyberpunk",
+    "Found Family",
+    "Female Protagonist",
+    "Ensemble Cast",
+    "Anti-Hero",
+    "Love Triangle",
+    "Coming of Age",
+    "Cute Girls Doing Cute Things",
+    "Battle Royale",
+    "Mythology",
+    "Idol",
+];
+
+/// (AniList value, label) for the single- and multi-choice filters.
+pub const FORMATS: [(&str, &str); 6] = [
+    ("TV", "TV"),
+    ("TV_SHORT", "TV Short"),
+    ("MOVIE", "Movie"),
+    ("SPECIAL", "Special"),
+    ("OVA", "OVA"),
+    ("ONA", "ONA"),
+];
+pub const STATUSES: [(&str, &str); 4] = [
+    ("RELEASING", "Airing"),
+    ("FINISHED", "Finished"),
+    ("NOT_YET_RELEASED", "Not yet aired"),
+    ("HIATUS", "On hiatus"),
+];
+pub const SEASONS: [(&str, &str); 4] = [
+    ("WINTER", "Winter"),
+    ("SPRING", "Spring"),
+    ("SUMMER", "Summer"),
+    ("FALL", "Fall"),
+];
+pub const SOURCES: [(&str, &str); 8] = [
+    ("ORIGINAL", "Original"),
+    ("MANGA", "Manga"),
+    ("LIGHT_NOVEL", "Light novel"),
+    ("WEB_NOVEL", "Web novel"),
+    ("NOVEL", "Novel"),
+    ("VISUAL_NOVEL", "Visual novel"),
+    ("VIDEO_GAME", "Video game"),
+    ("OTHER", "Other"),
+];
+pub const COUNTRIES: [(&str, &str); 4] = [
+    ("JP", "Japan"),
+    ("KR", "South Korea"),
+    ("CN", "China"),
+    ("TW", "Taiwan"),
+];
+pub const SORTS: [(&str, &str); 6] = [
+    ("POPULARITY_DESC", "Popularity"),
+    ("TRENDING_DESC", "Trending"),
+    ("SCORE_DESC", "Score"),
+    ("START_DATE_DESC", "Newest"),
+    ("FAVOURITES_DESC", "Favourites"),
+    ("TITLE_ROMAJI", "Title"),
+];
+
+/// A Search listing from AniList: every set field narrows it, `None` and
+/// empty lists leave it open. Values are AniList enum names (`FORMATS`, …).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+pub struct Browse {
+    pub search: Option<String>,
+    pub genres: Vec<String>,
+    pub genres_not: Vec<String>,
+    pub tags: Vec<String>,
+    pub tags_not: Vec<String>,
+    pub formats: Vec<String>,
+    pub status: Option<String>,
+    pub season: Option<String>,
+    pub year: Option<i32>,
+    pub source: Option<String>,
+    pub country: Option<String>,
+    /// Lowest average score shown, 0–100.
+    pub min_score: Option<u8>,
+    pub min_episodes: Option<u32>,
+    pub max_episodes: Option<u32>,
+    pub sort: String,
+}
+
+impl Default for Browse {
+    fn default() -> Self {
+        Browse {
+            search: None,
+            genres: Vec::new(),
+            genres_not: Vec::new(),
+            tags: Vec::new(),
+            tags_not: Vec::new(),
+            formats: Vec::new(),
+            status: None,
+            season: None,
+            year: None,
+            source: None,
+            country: None,
+            min_score: None,
+            min_episodes: None,
+            max_episodes: None,
+            sort: "POPULARITY_DESC".into(),
+        }
+    }
+}
+
+/// Results per Search page.
+pub const BROWSE_PAGE: u32 = 30;
+
+const BROWSE_GQL: &str = "query ($page: Int, $perPage: Int, $search: String, \
+    $genre_in: [String], $genre_not_in: [String], $tag_in: [String], $tag_not_in: [String], \
+    $format_in: [MediaFormat], $status: MediaStatus, $season: MediaSeason, $seasonYear: Int, \
+    $source: MediaSource, $countryOfOrigin: CountryCode, $averageScore_greater: Int, \
+    $episodes_greater: Int, $episodes_lesser: Int, $sort: [MediaSort]) { \
+    Page(page: $page, perPage: $perPage) { pageInfo { hasNextPage } \
+    media(type: ANIME, isAdult: false, search: $search, genre_in: $genre_in, \
+    genre_not_in: $genre_not_in, tag_in: $tag_in, tag_not_in: $tag_not_in, \
+    format_in: $format_in, status: $status, season: $season, seasonYear: $seasonYear, \
+    source: $source, countryOfOrigin: $countryOfOrigin, \
+    averageScore_greater: $averageScore_greater, episodes_greater: $episodes_greater, \
+    episodes_lesser: $episodes_lesser, sort: $sort) { ...card } } }";
+
+impl Browse {
+    /// The query's variables, with unset filters left out: AniList fails
+    /// with a 500 on some explicit nulls, and an empty list would match
+    /// nothing.
+    pub fn variables(&self, page: u32) -> Value {
+        let list = |v: &[String]| (!v.is_empty()).then(|| v.to_vec());
+        let search = self
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        // With a title typed, the best match comes first unless another
+        // order was picked.
+        let sort: Vec<&str> = match search {
+            Some(_) if self.sort == "POPULARITY_DESC" => vec!["SEARCH_MATCH", "POPULARITY_DESC"],
+            _ => vec![self.sort.as_str()],
+        };
+        let mut vars = json!({
+            "page": page.max(1),
+            "perPage": BROWSE_PAGE,
+            "search": search,
+            "genre_in": list(&self.genres),
+            "genre_not_in": list(&self.genres_not),
+            "tag_in": list(&self.tags),
+            "tag_not_in": list(&self.tags_not),
+            "format_in": list(&self.formats),
+            "status": self.status,
+            "season": self.season,
+            "seasonYear": self.year,
+            "source": self.source,
+            "countryOfOrigin": self.country,
+            // AniList's bounds are exclusive.
+            "averageScore_greater": self.min_score.map(|s| i64::from(s) - 1),
+            "episodes_greater": self.min_episodes.map(|n| i64::from(n) - 1),
+            "episodes_lesser": self.max_episodes.map(|n| i64::from(n) + 1),
+            "sort": sort,
+        });
+        if let Some(map) = vars.as_object_mut() {
+            map.retain(|_, v| !v.is_null());
+        }
+        vars
+    }
+}
+
+/// One page of a Search listing, plus whether more pages exist.
+pub fn browse(filters: &Browse, page: u32) -> Result<(Vec<AniListMedia>, bool)> {
+    let v = query(BROWSE_GQL, filters.variables(page))?;
+    Ok(parse_browse(&v))
+}
+
+pub fn parse_browse(v: &Value) -> (Vec<AniListMedia>, bool) {
+    let page = &v["data"]["Page"];
+    let media = page["media"]
+        .as_array()
+        .map(|m| {
+            m.iter()
+                .filter(|m| is_listable(m))
+                .map(parse_media)
+                .collect()
+        })
+        .unwrap_or_default();
+    (
+        media,
+        page["pageInfo"]["hasNextPage"].as_bool() == Some(true),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -458,7 +716,14 @@ mod tests {
 
     #[test]
     fn detail_query_keeps_heavy_fields_out_of_cards() {
-        for heavy in ["studios", "rankings", "startDate", "popularity", "source"] {
+        for heavy in [
+            "studios",
+            "rankings",
+            "startDate",
+            "popularity",
+            "source",
+            "tags",
+        ] {
             assert!(MEDIA_GQL.contains(heavy), "{heavy}");
             assert!(!CARD_FRAGMENT.contains(heavy), "{heavy}");
         }
@@ -529,5 +794,86 @@ mod tests {
             .map(|m| m.id)
             .collect();
         assert_eq!(ids, [20]);
+    }
+
+    #[test]
+    fn parse_tags_sorts_by_rank_and_drops_adult() {
+        let m = parse_media(&json!({ "id": 1, "tags": [
+            { "name": "Magic", "rank": 60, "category": "Theme-Fantasy", "isMediaSpoiler": false },
+            { "name": "Shounen", "rank": 90, "category": "Demographic" },
+            { "name": "Twist", "rank": 70, "isGeneralSpoiler": true },
+            { "name": "Nudity", "rank": 95, "isAdult": true },
+            { "name": "", "rank": 99 }
+        ] }));
+        let names: Vec<&str> = m.tags.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["Shounen", "Twist", "Magic"]);
+        assert!(m.tags[1].spoiler && !m.tags[0].spoiler);
+        assert_eq!(m.tags[0].category.as_deref(), Some("Demographic"));
+    }
+
+    #[test]
+    fn browse_variables_send_only_set_filters() {
+        let v = Browse::default().variables(0);
+        assert_eq!(v["page"], 1);
+        assert_eq!(v["sort"], json!(["POPULARITY_DESC"]));
+        for unset in [
+            "search",
+            "genre_in",
+            "tag_not_in",
+            "format_in",
+            "seasonYear",
+            "averageScore_greater",
+        ] {
+            assert!(v[unset].is_null(), "{unset}");
+        }
+
+        let v = Browse {
+            search: Some("  frieren ".into()),
+            genres: vec!["Fantasy".into()],
+            tags_not: vec!["Gore".into()],
+            formats: vec!["TV".into(), "MOVIE".into()],
+            season: Some("FALL".into()),
+            year: Some(2023),
+            min_score: Some(80),
+            min_episodes: Some(13),
+            max_episodes: Some(26),
+            ..Browse::default()
+        }
+        .variables(2);
+        assert_eq!(v["search"], "frieren");
+        assert_eq!(v["sort"], json!(["SEARCH_MATCH", "POPULARITY_DESC"]));
+        assert_eq!(v["genre_in"], json!(["Fantasy"]));
+        assert_eq!(v["tag_not_in"], json!(["Gore"]));
+        assert_eq!(v["format_in"], json!(["TV", "MOVIE"]));
+        assert_eq!(
+            (v["season"].as_str(), v["seasonYear"].as_i64()),
+            (Some("FALL"), Some(2023))
+        );
+        assert_eq!(v["averageScore_greater"], 79);
+        assert_eq!(
+            (
+                v["episodes_greater"].as_i64(),
+                v["episodes_lesser"].as_i64()
+            ),
+            (Some(12), Some(27))
+        );
+
+        let v = Browse {
+            search: Some("x".into()),
+            sort: "SCORE_DESC".into(),
+            ..Browse::default()
+        }
+        .variables(1);
+        assert_eq!(v["sort"], json!(["SCORE_DESC"]));
+    }
+
+    #[test]
+    fn parse_browse_reads_page_and_skips_adult() {
+        let (media, more) = parse_browse(&json!({ "data": { "Page": {
+            "pageInfo": { "hasNextPage": true },
+            "media": [{ "id": 1, "isAdult": true }, { "id": 2, "title": { "romaji": "B" } }]
+        } } }));
+        assert!(more);
+        assert_eq!(media.iter().map(|m| m.id).collect::<Vec<_>>(), [2]);
     }
 }

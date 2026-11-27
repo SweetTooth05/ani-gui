@@ -13,7 +13,8 @@ colour per character.
 | `svg/ani-gui-symbol-black.svg` / `-white.svg` | One-colour tile with the glyph knocked out (`-small-` versions too) |
 | `svg/ani-gui-horizontal.svg` | Main lockup on light backgrounds |
 | `svg/ani-gui-horizontal-reversed.svg` | Main lockup on dark backgrounds |
-| `svg/ani-gui-compact*.svg` | Lockup without アニグイ, for widths under 320 px (sidebar, headers) |
+| `svg/ani-gui-sidebar.svg` / `-reversed.svg` | App sidebar: tile beside the wordmark with アニグイ set large underneath, readable down to 160 px wide |
+| `svg/ani-gui-compact*.svg` | Lockup without アニグイ, for widths under 320 px (headers) |
 | `svg/ani-gui-stacked*.svg` | Square-ish spaces (splash, README header) |
 | `svg/ani-gui-wordmark*.svg` | Text only, where the tile already appears nearby |
 | `*-black.svg` / `*-white.svg` | Single-colour print, embossing, monochrome UIs |
@@ -39,8 +40,9 @@ Violet and cyan appear only in the アニグイ line, never in the tile.
 
 - Clear space on every side equals the tile's corner radius: a quarter of the tile's height.
 - Symbol: no smaller than 16 px. Use the `-small` cut at 32 px and below.
-- Horizontal lockup with アニグイ: at least 320 px wide (below that the katakana is too small to read). Use the
-  compact lockup from 320 px down to 120 px, and the symbol alone below 120 px.
+- Horizontal lockup with アニグイ: at least 320 px wide (below that the katakana is too small to read). The sidebar
+  lockup keeps アニグイ readable from 320 px down to 160 px. Use the compact lockup from 320 px down to 120 px, and the
+  symbol alone below 120 px.
 
 ## Don'ts
 

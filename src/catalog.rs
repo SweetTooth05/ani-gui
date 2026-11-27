@@ -16,13 +16,26 @@ const WEEK_SECS: i64 = 7 * 24 * 60 * 60;
 /// Bumped whenever the AniList queries ask for more fields. Old rows still
 /// decode (new fields default), so without a new key they would be served
 /// with those fields blank until they expire.
-const ANILIST_KEY: &str = "anilist:v2";
+const ANILIST_KEY: &str = "anilist:v3";
 
 pub fn trending(db: &Mutex<Db>) -> Vec<AniListMedia> {
     cached(db, &format!("{ANILIST_KEY}:trending"), || {
         anilist::trending(TRENDING_COUNT)
     })
     .unwrap_or_default()
+}
+
+/// One page of a Search listing (`anilist::Browse`), cached like the other
+/// AniList lists.
+pub fn browse(
+    db: &Mutex<Db>,
+    filters: &anilist::Browse,
+    page: u32,
+) -> Result<(Vec<AniListMedia>, bool)> {
+    let key = serde_json::to_string(&filters.variables(page))?;
+    fetch_cached(db, &format!("{ANILIST_KEY}:browse:{key}"), TTL_SECS, || {
+        anilist::browse(filters, page)
+    })
 }
 
 /// Airings from now until a week ahead (a stale cache may include past ones).

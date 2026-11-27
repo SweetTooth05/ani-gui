@@ -720,12 +720,9 @@ pub fn hero_pick(continue_items: &[ContinueItem], trending: &[AniListMedia]) -> 
     })
 }
 
+/// The title to show for `media`, in the user's title language.
 pub fn media_title(media: &AniListMedia) -> &str {
-    media
-        .title_english
-        .as_deref()
-        .filter(|t| !t.is_empty())
-        .unwrap_or(&media.title_romaji)
+    crate::model::pick_title(media.title_english.as_deref(), &media.title_romaji)
 }
 
 /// A synopsis as one paragraph for clamped previews, without AniList's
