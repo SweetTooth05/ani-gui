@@ -2,8 +2,11 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -13,7 +16,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(unix)]
 use nix::sys::signal::{Signal, killpg};
+#[cfg(unix)]
 use nix::unistd::Pid;
 use sha2::{Digest, Sha256};
 
@@ -48,64 +53,235 @@ const NO_RESULTS: &str = "No results found";
 /// launcher may lack on PATH (besides `~/.local/bin`). On macOS an app
 /// started from Finder gets only the system folders, so Homebrew's prefixes
 /// (Apple Silicon, then Intel) are added.
+#[cfg(unix)]
 const EXTRA_BIN_DIRS: &[&str] = if cfg!(target_os = "macos") {
     &["/opt/homebrew/bin", "/usr/local/bin"]
 } else {
     &["/usr/local/bin"]
 };
 
+/// Whether `path` is a runnable file (regular file with an execute bit on Unix;
+/// any regular file on Windows).
+pub(crate) fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::metadata(path).is_ok_and(|m| m.is_file())
+    }
+}
+
+/// Prevents spawned console children from flashing a console window on Windows.
+pub(crate) fn hide_window(cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// Kills the process tree rooted at `pid` (its whole process group on Unix;
+/// `taskkill /T /F` on Windows).
+pub(crate) fn kill_tree(pid: u32) {
+    #[cfg(unix)]
+    {
+        let pgid = Pid::from_raw(i32::try_from(pid).unwrap_or(i32::MAX));
+        let _ = killpg(pgid, Signal::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = taskkill_cmd(pid);
+        let _ = cmd.status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+    }
+}
+
+/// Like [`kill_tree`], without blocking the caller while `taskkill` runs on
+/// Windows (used from UI-thread cancellation paths).
+pub(crate) fn kill_tree_async(pid: u32) {
+    #[cfg(unix)]
+    {
+        kill_tree(pid);
+    }
+    #[cfg(windows)]
+    {
+        let mut cmd = taskkill_cmd(pid);
+        let _ = cmd.spawn();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+    }
+}
+
+#[cfg(windows)]
+fn taskkill_cmd(pid: u32) -> Command {
+    let mut cmd = Command::new("taskkill");
+    cmd.args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_window(&mut cmd);
+    cmd
+}
+
+/// Converts `path` for POSIX shell consumption (forward slashes on Windows,
+/// unchanged on Unix).
+pub(crate) fn sh_path(path: &Path) -> OsString {
+    #[cfg(windows)]
+    {
+        match path.to_str() {
+            Some(s) => OsString::from(s.replace('\\', "/")),
+            None => path.as_os_str().to_owned(),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        path.as_os_str().to_owned()
+    }
+}
+
+#[cfg(windows)]
+fn find_windows_shell() -> Option<PathBuf> {
+    let path = env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<PathBuf> = env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .collect();
+    for name in ["sh.exe", "bash.exe"] {
+        if let Some(found) = dirs.iter().map(|d| d.join(name)).find(|p| p.is_file()) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Builds a [`Command`] that executes a POSIX shell script (`ani-cli`).
+/// On Unix the kernel handles `#!`; on Windows we invoke the bundled
+/// `busybox.exe sh` or a `sh.exe`/`bash.exe` on `PATH`.
+pub(crate) fn script_command(program: &Path) -> io::Result<Command> {
+    #[cfg(unix)]
+    {
+        Ok(Command::new(program))
+    }
+    #[cfg(windows)]
+    {
+        if let Some(busybox) = crate::paths::exe_prefix()
+            .map(|p| crate::paths::bundled_busybox(&p))
+            .filter(|p| p.is_file())
+        {
+            let mut cmd = Command::new(busybox);
+            cmd.arg("sh").arg(sh_path(program));
+            hide_window(&mut cmd);
+            return Ok(cmd);
+        }
+        if let Some(shell) = find_windows_shell() {
+            let mut cmd = Command::new(shell);
+            cmd.arg(sh_path(program));
+            hide_window(&mut cmd);
+            return Ok(cmd);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no POSIX shell found (bundled busybox.exe or sh.exe/bash.exe on PATH)",
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(Command::new(program))
+    }
+}
+
 /// The `ani-cli` executable on PATH, else in `~/.local/bin` or one of
-/// [`EXTRA_BIN_DIRS`], else the copy a packaged build (.dmg, .deb,
-/// AppImage) ships. The user's own comes first: it can be updated with
-/// `ani-cli -U` when a provider changes, the bundled one only with the app.
+/// `EXTRA_BIN_DIRS` (on Unix), else the copy a packaged build (.dmg, .deb,
+/// AppImage, Windows installer) ships. The user's own comes first: it can be
+/// updated with `ani-cli -U` when a provider changes, the bundled one only
+/// with the app.
 pub fn find() -> Option<PathBuf> {
     let path = env::var_os("PATH").unwrap_or_default();
-    env::split_paths(&path)
-        .filter(|dir| dir.is_absolute())
+    let user_dirs = env::split_paths(&path).filter(|dir| dir.is_absolute());
+    #[cfg(unix)]
+    let search_dirs = user_dirs
         .chain(env::home_dir().map(|home| home.join(".local/bin")))
-        .chain(EXTRA_BIN_DIRS.iter().map(PathBuf::from))
+        .chain(EXTRA_BIN_DIRS.iter().map(PathBuf::from));
+    #[cfg(not(unix))]
+    let search_dirs = user_dirs;
+    search_dirs
         .map(|dir| dir.join("ani-cli"))
         .chain(crate::paths::exe_prefix().map(|p| crate::paths::bundled_ani_cli(&p)))
-        .find(|p| fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+        .find(|p| is_executable(p))
 }
 
 /// The error for a missing ani-cli, naming where [`find`] looked.
 pub fn not_installed() -> String {
-    let mut dirs: Vec<&str> = vec!["~/.local/bin"];
-    dirs.extend(EXTRA_BIN_DIRS);
-    let last = dirs.pop().unwrap_or_default();
-    format!(
-        "ani-cli is not installed (looked on PATH, in {} and {last})",
-        dirs.join(", ")
-    )
+    #[cfg(unix)]
+    {
+        let mut dirs: Vec<&str> = vec!["~/.local/bin"];
+        dirs.extend(EXTRA_BIN_DIRS);
+        let last = dirs.pop().unwrap_or_default();
+        format!(
+            "ani-cli is not installed (looked on PATH, in {} and {last})",
+            dirs.join(", ")
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        "ani-cli is not installed (looked on PATH and in the app's bundled tools)".to_string()
+    }
 }
 
 /// `ani-cli -V`, e.g. "5.1.8".
 pub fn version(path: &Path) -> Option<String> {
-    let out = run_capture(&[path.into(), "-V".into()], &[], VERSION_TIMEOUT, None).ok()?;
+    let mut cmd = script_command(path).ok()?;
+    cmd.arg("-V");
+    // Pin ANI_CLI_PLAYER so ani-cli's startup platform check doesn't fail
+    // before reaching -V when no external mpv/vlc binary is on PATH.
+    let out = run_capture(
+        cmd,
+        &[("PATH", tool_path()), ("ANI_CLI_PLAYER", "debug".into())],
+        VERSION_TIMEOUT,
+        None,
+    )
+    .ok()?;
     let version = out.stdout.lines().next()?.trim();
     (out.status.success() && !version.is_empty()).then(|| version.to_string())
 }
 
 /// Writes `<cache_dir>/shims/`: the `capture-mpv` player, the `menu` script
-/// running `exe --ani-cli-menu`, and `rofi`/`dmenu` links to it. Returns the
-/// directory, which goes first on ani-cli's PATH.
+/// running `exe --ani-cli-menu`, and `rofi`/`dmenu` links (or copies on
+/// Windows) to it. Returns the directory, which goes first on ani-cli's PATH.
 pub fn ensure_shims(cache_dir: &Path, exe: &Path) -> io::Result<PathBuf> {
     let dir = cache_dir.join(SHIMS_DIR);
     fs::create_dir_all(&dir)?;
     write_script(&dir, CAPTURE_NAME, CAPTURE_SHIM.as_bytes())?;
     let mut menu = b"#!/bin/sh\nexec ".to_vec();
-    menu.extend(sh_quote(exe.as_os_str().as_bytes()));
+    menu.extend(sh_quote_path(exe));
     menu.extend(format!(" {MENU_FLAG} \"$@\"\n").as_bytes());
     write_script(&dir, MENU_NAME, &menu)?;
     for alias in MENU_ALIASES {
-        let link = dir.join(alias);
-        if fs::read_link(&link).is_ok_and(|target| target == Path::new(MENU_NAME)) {
-            continue;
+        #[cfg(unix)]
+        {
+            let link = dir.join(alias);
+            if fs::read_link(&link).is_ok_and(|target| target == Path::new(MENU_NAME)) {
+                continue;
+            }
+            let tmp = temp_name(&dir, alias);
+            symlink(MENU_NAME, &tmp)?;
+            replace(&tmp, &link)?;
         }
-        let tmp = temp_name(&dir, alias);
-        symlink(MENU_NAME, &tmp)?;
-        replace(&tmp, &link)?;
+        #[cfg(not(unix))]
+        {
+            write_script(&dir, alias, &menu)?;
+        }
     }
     Ok(dir)
 }
@@ -113,12 +289,16 @@ pub fn ensure_shims(cache_dir: &Path, exe: &Path) -> io::Result<PathBuf> {
 /// Writes an executable script atomically unless it is already in place.
 fn write_script(dir: &Path, name: &str, content: &[u8]) -> io::Result<()> {
     let path = dir.join(name);
-    let mode = fs::metadata(&path).map(|m| m.permissions().mode() & 0o777);
-    if mode.is_ok_and(|m| m == 0o755) && fs::read(&path).is_ok_and(|c| c == content) {
+    #[cfg(unix)]
+    let mode_ok = fs::metadata(&path).is_ok_and(|m| m.permissions().mode() & 0o777 == 0o755);
+    #[cfg(not(unix))]
+    let mode_ok = true;
+    if mode_ok && fs::read(&path).is_ok_and(|c| c == content) {
         return Ok(());
     }
     let tmp = temp_name(dir, name);
     fs::write(&tmp, content)?;
+    #[cfg(unix)]
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))?;
     replace(&tmp, &path)
 }
@@ -133,6 +313,17 @@ fn replace(tmp: &Path, path: &Path) -> io::Result<()> {
     fs::rename(tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(tmp);
     })
+}
+
+fn sh_quote_path(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        sh_quote(path.as_os_str().as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        sh_quote(path.to_string_lossy().replace('\\', "/").as_bytes())
+    }
 }
 
 /// `s` in single quotes for `sh`.
@@ -990,8 +1181,9 @@ pub struct ResolveHandle {
 #[derive(Default)]
 struct Owner {
     cancelled: bool,
-    /// Process groups of its running ani-cli, removed once reaped.
-    groups: Vec<Pid>,
+    /// Process IDs (and process group leaders on Unix) of running ani-cli
+    /// children, removed once reaped.
+    groups: Vec<u32>,
 }
 
 /// Every live scope, for [`cancel_all_resolves`].
@@ -1017,15 +1209,19 @@ impl ResolveScope {
 
 impl Drop for ResolveScope {
     fn drop(&mut self) {
-        cancel(&self.owner);
+        cancel(&self.owner, false);
     }
 }
 
-fn cancel(owner: &Mutex<Owner>) {
+fn cancel(owner: &Mutex<Owner>, wait: bool) {
     let mut owner = lock(owner);
     owner.cancelled = true;
-    for pgid in owner.groups.drain(..) {
-        let _ = killpg(pgid, Signal::SIGKILL);
+    for pid in owner.groups.drain(..) {
+        if wait {
+            kill_tree(pid);
+        } else {
+            kill_tree_async(pid);
+        }
     }
 }
 
@@ -1033,7 +1229,7 @@ fn cancel(owner: &Mutex<Owner>) {
 pub fn cancel_all_resolves() {
     let owners: Vec<_> = lock(&SCOPES).iter().filter_map(Weak::upgrade).collect();
     for owner in owners {
-        cancel(&owner);
+        cancel(&owner, true);
     }
 }
 
@@ -1084,7 +1280,7 @@ fn resolve_unrecorded_with(
     let hist = TempDir(temp_name(shims, "unrecorded-hist"));
     fs::create_dir_all(&hist.0)?;
     let env = [
-        ("ANI_CLI_HIST_DIR", hist.0.as_os_str().to_owned()),
+        ("ANI_CLI_HIST_DIR", sh_path(&hist.0)),
         ("ANI_CLI_LOG", OsString::from("0")),
     ];
     let outcome = resolve_with(program, req, shims, &env, timeout, owner)?;
@@ -1138,15 +1334,15 @@ fn resolve_once(
     timeout: Duration,
     owner: Option<&ResolveHandle>,
 ) -> Result<Attempt> {
-    let mut cmd = vec![program.as_os_str().to_owned(), "--no-detach".into()];
-    cmd.extend(episode_args(req)?);
+    let mut cmd = script_command(program)?;
+    cmd.arg("--no-detach").args(episode_args(req)?);
     let menu_out = menu_out_path(shims);
     let mut env = shim_env(req, shims, &menu_out);
     // ani-cli runs the player unquoted, so a full path breaks on spaces; the
     // shim dir leads PATH and the bare name still matches its `*mpv*` case.
     env.push(("ANI_CLI_PLAYER", CAPTURE_NAME.into()));
     env.extend(extra_env.iter().cloned());
-    let run = run_capture(&cmd, &env, timeout, owner);
+    let run = run_capture(cmd, &env, timeout, owner);
     let picks = take_menu_out(&menu_out);
     let out = run?;
     if let Some(titles) = picks {
@@ -1198,12 +1394,14 @@ pub(crate) fn shim_env(
     shims: &Path,
     menu_out: &Path,
 ) -> Vec<(&'static str, OsString)> {
-    let mut path = OsString::from(shims.as_os_str());
-    path.push(":");
-    path.push(tool_path());
-    vec![
+    let tools = tool_path();
+    let path =
+        env::join_paths(std::iter::once(shims.to_path_buf()).chain(env::split_paths(&tools)))
+            .unwrap_or(tools);
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut env = vec![
         ("PATH", path),
-        ("ANI_CLI_MENU", shims.join(MENU_NAME).into_os_string()),
+        ("ANI_CLI_MENU", sh_path(&shims.join(MENU_NAME))),
         ("ANI_CLI_MENU_FLAGS", "".into()),
         ("ANI_CLI_MODE", req.mode.as_str().into()),
         ("ANI_CLI_DEFAULT_SOURCE", "search".into()),
@@ -1212,20 +1410,38 @@ pub(crate) fn shim_env(
         ("ANI_CLI_SKIP_INTRO", "0".into()),
         ("ANI_GUI_WANT_TITLES", req.want_titles.join("\n").into()),
         ("ANI_GUI_MENU_OUT", menu_out.as_os_str().to_owned()),
-    ]
+    ];
+    #[cfg(windows)]
+    if env::var_os("HOME").is_none()
+        && let Some(home) = env::home_dir()
+    {
+        env.push(("HOME", sh_path(&home)));
+    }
+    env
 }
 
-/// The PATH ani-cli finds its tools on: [`EXTRA_BIN_DIRS`] and
+/// The PATH ani-cli finds its tools on: on Unix [`EXTRA_BIN_DIRS`] and
 /// `~/.local/bin` (for sessions started from a desktop launcher), then the
-/// app's own PATH.
+/// app's own PATH; on Windows the app's PATH plus the bundled tools folder.
 pub fn tool_path() -> OsString {
     let current = env::var_os("PATH").unwrap_or_default();
-    let dirs = EXTRA_BIN_DIRS
-        .iter()
-        .map(PathBuf::from)
-        .chain(env::home_dir().map(|home| home.join(".local/bin")))
-        .chain(env::split_paths(&current));
-    env::join_paths(dirs).unwrap_or(current)
+    #[cfg(unix)]
+    {
+        let dirs = EXTRA_BIN_DIRS
+            .iter()
+            .map(PathBuf::from)
+            .chain(env::home_dir().map(|home| home.join(".local/bin")))
+            .chain(env::split_paths(&current));
+        env::join_paths(dirs).unwrap_or(current)
+    }
+    #[cfg(not(unix))]
+    {
+        let bundled = crate::paths::exe_prefix()
+            .map(|p| p.join("lib/ani-gui/bin"))
+            .filter(|d| d.is_dir());
+        let dirs = env::split_paths(&current).chain(bundled);
+        env::join_paths(dirs).unwrap_or(current)
+    }
 }
 
 /// A fresh path for one run's menu-out file.
@@ -1345,11 +1561,12 @@ struct Captured {
     stderr: String,
 }
 
-/// Runs `cmd` in its own process group with stdin from /dev/null, collecting
-/// stdout and stderr. Past `timeout` the whole group is killed and the error
-/// carries the output so far. While it runs, cancelling `owner` kills it.
+/// Runs `command` in its own process group (on Unix) with stdin from null,
+/// collecting stdout and stderr. Past `timeout` the whole tree is killed and
+/// the error carries the output so far. While it runs, cancelling `owner`
+/// kills it.
 fn run_capture(
-    cmd: &[OsString],
+    mut command: Command,
     env: &[(&str, OsString)],
     timeout: Duration,
     owner: Option<&ResolveHandle>,
@@ -1358,36 +1575,36 @@ fn run_capture(
     if cancelled() {
         bail!("cancelled");
     }
-    let (program, args) = cmd.split_first().context("empty command")?;
-    let mut command = Command::new(program);
+    let program = command.get_program().to_os_string();
     command
-        .args(args)
         .envs(env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+    hide_window(&mut command);
     let mut child =
         spawn(&mut command).with_context(|| format!("starting {}", program.to_string_lossy()))?;
     let stdout = OutputReader::spawn(child.stdout.take());
     let stderr = OutputReader::spawn(child.stderr.take());
-    // process_group(0) made the child the leader of its own group.
-    let pgid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
+    // process_group(0) made the child the leader of its own group on Unix.
+    let pid = child.id();
     if let Some(owner) = owner {
         let mut owner = lock(&owner.owner);
         if owner.cancelled {
-            let _ = killpg(pgid, Signal::SIGKILL);
+            kill_tree(pid);
         } else {
-            owner.groups.push(pgid);
+            owner.groups.push(pid);
         }
     }
-    // Reaps under the owner's lock and forgets the group, so a cancel never
-    // signals a group id that may have been reused.
+    // Reaps under the owner's lock and forgets the pid, so a cancel never
+    // signals a process id that may have been reused.
     let forget = |child: &mut Child, kill: bool| -> io::Result<Option<ExitStatus>> {
         let mut owner = owner.map(|o| lock(&o.owner));
         if kill {
-            // Killed before reaping, so the group id cannot have been reused.
-            let _ = killpg(pgid, Signal::SIGKILL);
+            // Killed before reaping, so the pid cannot have been reused.
+            kill_tree(pid);
         }
         let status = if kill {
             child.wait().map(Some)
@@ -1397,7 +1614,7 @@ fn run_capture(
         if !matches!(status, Ok(None))
             && let Some(owner) = owner.as_mut()
         {
-            owner.groups.retain(|g| *g != pgid);
+            owner.groups.retain(|g| *g != pid);
         }
         status
     };
@@ -1490,6 +1707,7 @@ impl OutputReader {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
+    #[cfg(unix)]
     use std::time::Instant;
 
     use super::*;
@@ -1544,13 +1762,13 @@ mod tests {
         assert!(parse_capture("").is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_times_out() {
-        let cmd: Vec<OsString> = ["sh", "-c", "echo started; sleep 5"]
-            .map(OsString::from)
-            .to_vec();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo started; sleep 5"]);
         let begun = Instant::now();
-        let err = run_capture(&cmd, &[], Duration::from_secs(1), None)
+        let err = run_capture(cmd, &[], Duration::from_secs(1), None)
             .err()
             .expect("sleeping script must time out")
             .to_string();
@@ -1562,8 +1780,10 @@ mod tests {
         assert!(err.contains("timed out"), "{err}");
         assert!(err.contains("started"), "partial output in error: {err}");
 
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo \"$X\"; echo oops >&2; exit 3"]);
         let ok = run_capture(
-            &["sh", "-c", "echo \"$X\"; echo oops >&2; exit 3"].map(OsString::from),
+            cmd,
             &[("X", "from-env".into())],
             Duration::from_secs(5),
             None,
@@ -1574,6 +1794,7 @@ mod tests {
         assert_eq!(ok.status.code(), Some(3));
     }
 
+    #[cfg(unix)]
     #[test]
     fn dropping_scope_kills_running_resolve() {
         let dir = temp_dir("cancel");
@@ -1676,6 +1897,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn script(path: &Path, body: &str) -> PathBuf {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -1698,6 +1920,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn ensure_shims_writes_scripts_and_links() {
         let dir = temp_dir("shims");
@@ -1736,6 +1959,33 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(not(unix))]
+    #[test]
+    fn ensure_shims_writes_scripts_and_aliases() {
+        let dir = temp_dir("shims-win");
+        let exe = Path::new(r"C:\Program Files\ani-gui\bin\ani-gui.exe");
+        let shims = ensure_shims(&dir.join("cache"), exe).unwrap();
+        assert_eq!(shims, dir.join("cache").join("shims"));
+        // Rewriting existing shims is fine.
+        ensure_shims(&dir.join("cache"), exe).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(shims.join("capture-mpv")).unwrap(),
+            CAPTURE_SHIM
+        );
+        let menu = fs::read_to_string(shims.join("menu")).unwrap();
+        assert_eq!(
+            menu,
+            format!(
+                "#!/bin/sh\nexec 'C:/Program Files/ani-gui/bin/ani-gui.exe' {MENU_FLAG} \"$@\"\n"
+            )
+        );
+        for alias in MENU_ALIASES {
+            assert_eq!(fs::read_to_string(shims.join(alias)).unwrap(), menu);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn episode_args_search_with_ascii_apostrophes() {
         let req = build_request(&frieren(), None, "1", Mode::Sub, "best");
@@ -1750,15 +2000,21 @@ mod tests {
         let expected = if cfg!(target_os = "macos") {
             "ani-cli is not installed (looked on PATH, in ~/.local/bin, \
              /opt/homebrew/bin and /usr/local/bin)"
-        } else {
+        } else if cfg!(unix) {
             "ani-cli is not installed (looked on PATH, in ~/.local/bin and /usr/local/bin)"
+        } else {
+            "ani-cli is not installed (looked on PATH and in the app's bundled tools)"
         };
         assert_eq!(not_installed(), expected);
     }
 
     #[test]
     fn shim_env_pins_ani_cli_settings() {
-        let dir = Path::new("/tmp/shims");
+        let dir = if cfg!(windows) {
+            Path::new(r"C:\Temp\shims")
+        } else {
+            Path::new("/tmp/shims")
+        };
         let value = |env: &[(&str, OsString)], key: &str| {
             let found: Vec<_> = env.iter().filter(|(k, _)| *k == key).collect();
             assert_eq!(found.len(), 1, "{key}");
@@ -1774,10 +2030,20 @@ mod tests {
             assert_eq!(value(&env, "ANI_CLI_PLAYER_FLAGS"), "");
             assert_eq!(value(&env, "ANI_CLI_SKIP_INTRO"), "0");
             assert_eq!(value(&env, "ANI_CLI_MENU_FLAGS"), "");
-            let path = value(&env, "PATH");
-            let first = format!("/tmp/shims:{}:", EXTRA_BIN_DIRS[0]);
-            assert!(path.starts_with(&first), "{path}");
-            assert!(path.ends_with(&*tool_path().to_string_lossy()), "{path}");
+            let path = env
+                .iter()
+                .find(|(k, _)| *k == "PATH")
+                .map(|(_, v)| v.clone())
+                .unwrap();
+            let entries: Vec<PathBuf> = env::split_paths(&path).collect();
+            assert_eq!(entries[0], dir);
+            #[cfg(unix)]
+            {
+                let path = path.to_string_lossy();
+                let first = format!("/tmp/shims:{}:", EXTRA_BIN_DIRS[0]);
+                assert!(path.starts_with(&first), "{path}");
+                assert!(path.ends_with(&*tool_path().to_string_lossy()), "{path}");
+            }
         }
     }
 
@@ -1791,6 +2057,7 @@ mod tests {
         assert!(episode_args(&req).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_rejects_bad_episode_without_running_ani_cli() {
         let dir = temp_dir("bad-ep");
@@ -1954,6 +2221,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_needs_pick_when_menu_out_written() {
         let dir = temp_dir("needs-pick");
@@ -1992,6 +2260,7 @@ exit 1"#,
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_retries_romaji_on_no_results() {
         let dir = temp_dir("romaji");
@@ -2068,6 +2337,7 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
 
     /// A fake ani-cli that, like the real one, runs `$ANI_CLI_PLAYER` unquoted
     /// with the stream's arguments.
+    #[cfg(unix)]
     fn fake_player_run(path: &Path, title: &str) -> PathBuf {
         script(
             path,
@@ -2077,6 +2347,7 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
         )
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_works_with_space_in_cache_dir() {
         let dir = temp_dir("space");
@@ -2103,6 +2374,7 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_needs_pick_when_single_result_mismatches() {
         // With one search result ani-cli plays it without asking the menu.
@@ -2130,6 +2402,7 @@ echo 'https://hls.dramahot.top/p/0a1b2c3d4e5f/master.m3u8'"#,
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_unrecorded_keeps_the_users_history_untouched() {
         let dir = temp_dir("unrecorded");
@@ -2178,12 +2451,17 @@ printf '2\tReHMC7TQnch3C6z8j\tFrieren: Beyond Journey'"'"'s End\n' >> "$ANI_CLI_
     #[ignore = "runs the installed ani-cli against live providers; needs `cargo build` first"]
     fn live_resolve_frieren() {
         // The menu shim runs the real binary, not this test harness.
+        let bin = if cfg!(windows) {
+            "ani-gui.exe"
+        } else {
+            "ani-gui"
+        };
         let exe = std::env::current_exe()
             .unwrap()
             .parent()
             .and_then(Path::parent)
             .unwrap()
-            .join("ani-gui");
+            .join(bin);
         assert!(exe.exists(), "run `cargo build` first: {}", exe.display());
         let dir = temp_dir("live");
         let shims = ensure_shims(&dir.join("cache"), &exe).unwrap();
@@ -2351,6 +2629,7 @@ printf '2\tReHMC7TQnch3C6z8j\tFrieren: Beyond Journey'"'"'s End\n' >> "$ANI_CLI_
         assert!(sanitize_webvtt(sprites).is_thumbnail);
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_fetches_repairs_and_selects_most_complete_subtitle() {
         use std::io::{BufRead, BufReader, Write};

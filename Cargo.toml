@@ -14,10 +14,10 @@ getrandom = "0.3.4"
 gpui = "0.2.2"
 image = { version = "0.25.10", default-features = false }
 # OS keychain for MyAnimeList/AniList tokens: Secret Service (pure-Rust zbus,
-# no libdbus needed) on Linux, Apple Keychain on macOS. No plaintext store.
-keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "async-secret-service", "async-io", "crypto-rust"] }
+# no libdbus needed) on Linux, Apple Keychain on macOS, Windows Credential
+# Manager on Windows. No plaintext store.
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "async-secret-service", "async-io", "crypto-rust", "windows-native"] }
 libloading = "0.8.9"
-nix = { version = "0.31.4", features = ["fs", "process", "signal", "term"] }
 regex = "1.13.2"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -27,6 +27,9 @@ tar = { version = "0.4.46", default-features = false }
 unicode-segmentation = "1.13.3"
 ureq = { version = "3.5.2", features = ["json"] }
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31.4", features = ["fs", "process", "signal", "term"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 # Session-bus screen-saver inhibition while video plays (already in the tree via gpui).
 zbus = { version = "5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
@@ -35,6 +38,14 @@ zbus = { version = "5.19.0", default-features = false, features = ["async-io", "
 # CFStrings for the IOKit power assertion that keeps the display awake
 # (already in the tree via gpui).
 core-foundation = "0.10.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Display keep-awake (SetThreadExecutionState) and local timezone offset
+# (already in the tree via gpui's dependencies).
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Power", "Win32_System_Time"] }
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+embed-resource = "3.0.12"
 
 [patch.crates-io]
 xattr = { path = "vendor/xattr" }
