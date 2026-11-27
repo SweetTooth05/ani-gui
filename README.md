@@ -10,14 +10,14 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="license: GPL-3.0"></a>
 </p>
 
-A native Linux desktop app for watching anime, built in Rust with
-[GPUI](https://www.gpui.rs/). It browses AllAnime and AniList, plays episodes
-inside its own window through libmpv, and uses
+A native desktop app for watching anime on Linux, macOS and Windows, built in
+Rust with [GPUI](https://www.gpui.rs/). It browses AllAnime and AniList, plays
+episodes inside its own window through libmpv, and uses
 [ani-cli](https://github.com/pystardust/ani-cli) to find streams. Because
 ani-cli does the stream extraction, ani-gui keeps working as ani-cli updates.
 
 **Docs:** [Features and player keys](docs/features.md) ·
-[Install guide](docs/install.md) (updates, uninstalling, macOS) ·
+[Install guide](docs/install.md) (updates, uninstalling, macOS, Windows) ·
 [MyAnimeList and AniList](docs/accounts.md) ·
 [Where your data lives](docs/data.md) ·
 [Troubleshooting](docs/troubleshooting.md) ·
@@ -26,12 +26,20 @@ ani-cli does the stream extraction, ani-gui keeps working as ani-cli updates.
 ## Install
 
 <p align="center">
+  <a href="https://github.com/SweetTooth05/ani-gui/releases/latest/download/ani-gui-windows-x86_64-setup.exe"><img src="https://img.shields.io/badge/Download-Windows%20(x64)-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows (x64)"></a>
+  <br>
   <a href="https://github.com/SweetTooth05/ani-gui/releases/latest/download/ani-gui-macos-arm64.dmg"><img src="https://img.shields.io/badge/Download-macOS%20(Apple%20Silicon)-111?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS (Apple Silicon)"></a>
   <a href="https://github.com/SweetTooth05/ani-gui/releases/latest/download/ani-gui-macos-x86_64.dmg"><img src="https://img.shields.io/badge/Download-macOS%20(Intel)-111?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS (Intel)"></a>
   <br>
   <a href="https://github.com/SweetTooth05/ani-gui/releases/latest/download/ani-gui-linux-amd64.deb"><img src="https://img.shields.io/badge/Download-Linux%20(.deb)-E95420?style=for-the-badge&logo=ubuntu&logoColor=white" alt="Download for Linux (.deb)"></a>
   <a href="https://github.com/SweetTooth05/ani-gui/releases/latest/download/ani-gui-linux-x86_64.AppImage"><img src="https://img.shields.io/badge/Download-Linux%20(AppImage)-333?style=for-the-badge&logo=linux&logoColor=white" alt="Download for Linux (AppImage)"></a>
 </p>
+
+**Windows 10 or later (x64)**: run the installer (no administrator account
+needed). The first time, Windows SmartScreen says "Windows protected your PC"
+because the installer isn't code-signed: click **More info → Run anyway**.
+Nothing else to install; video playback and ani-cli are built in. ani-gui
+appears in the Start menu and keeps itself up to date.
 
 **macOS 15 or later** (Apple menu → About This Mac tells you Apple Silicon or Intel):
 open the `.dmg` and drag **ani-gui** onto **Applications**. The first time,
@@ -47,21 +55,21 @@ Nothing else to install; video playback and ani-cli are built in.
 
 All downloads include ani-cli. The app keeps itself up to date (the `.deb` and
 AppImage tell you when a new version is out). More options, such as installing
-into `~/.local` from the terminal or building from source, are in the
-[install guide](docs/install.md).
+into `~/.local` from the terminal, portable archives or building from source,
+are in the [install guide](docs/install.md).
 
 ## Dependencies
 
-None for the downloads above, on a desktop with a Vulkan-capable GPU (Linux)
-or macOS. Optional extras:
+None for the downloads above, on a desktop with a Vulkan-capable GPU (Linux),
+macOS, or Windows 10/11. Optional extras:
 
 | Package | Why |
 |---|---|
 | `yt-dlp`, `ffmpeg` | Downloading episodes to watch offline (the `.deb` suggests them) |
 | [`ani-cli`](https://github.com/pystardust/ani-cli) | Your own copy is used instead of the built-in one, so `ani-cli -U` can update it when a site changes |
 
-Building from source needs [Rust](https://rustup.rs) and, on Linux, the
-packages listed in the [install guide](docs/install.md#from-source).
+Building from source needs [Rust](https://rustup.rs) and the platform
+dependencies listed in the [install guide](docs/install.md).
 
 ## License
 

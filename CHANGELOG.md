@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Windows (x64, Windows 10+) support**: per-user Inno Setup 6 installer
+  (`ani-gui-windows-x86_64-setup.exe`, no administrator privileges required)
+  and portable `.tar.gz` archive (`ani-gui-<version>-x86_64-pc-windows-msvc.tar.gz`)
+  with `libmpv-2.dll`, `ani-cli` and `busybox.exe` bundled, plus Windows CI and
+  release builds and a Windows download button in the README.
+
 ## [0.0.2] — 2026-11-25
 
 ### Added

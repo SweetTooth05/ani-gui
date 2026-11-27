@@ -124,14 +124,23 @@ their own Client ID in Settings.
      then packaging (on ubuntu-22.04, for an older glibc)
    - **Build aarch64-apple-darwin** (macos-15) and **Build
      x86_64-apple-darwin** (macos-15-intel): the same, packaged as an
-     ad hoc signed `ani-gui.app` (`make app`)
+     ad hoc signed `ani-gui.app` (`make app`) and `.dmg`
+   - **Build x86_64-pc-windows-msvc** (windows-latest): `cargo test`, the
+     release build, then `packaging/windows/build-windows.sh` (prefix tarball
+     and Inno Setup 6 installer)
    - **Sign and publish**: waits for your approval if you set up the
      environment. Approve only tags you pushed yourself.
 7. The release contains:
    - `ani-gui-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz`: `bin/ani-gui`, the
      desktop entry and icons, laid out as an install prefix
+   - `ani-gui-linux-amd64.deb` and `ani-gui-linux-x86_64.AppImage`
    - `ani-gui-X.Y.Z-aarch64-apple-darwin.tar.gz` and
      `ani-gui-X.Y.Z-x86_64-apple-darwin.tar.gz`: `ani-gui.app` at the top
+   - `ani-gui-macos-arm64.dmg` and `ani-gui-macos-x86_64.dmg`
+   - `ani-gui-X.Y.Z-x86_64-pc-windows-msvc.tar.gz`: `bin/ani-gui.exe`,
+     `bin/libmpv-2.dll`, `lib/ani-gui/bin/ani-cli` and
+     `lib/ani-gui/bin/busybox.exe`, laid out as an install prefix
+   - `ani-gui-windows-x86_64-setup.exe`: per-user Inno Setup 6 installer
    - `SHA256SUMS`
    - `SHA256SUMS.sig`
 
@@ -177,14 +186,29 @@ Both commands must succeed: `Signature Verified Successfully`, then `OK`.
 
 ## macOS builds
 
-The build job is a matrix: Linux, `aarch64-apple-darwin` on `macos-15` and
-`x86_64-apple-darwin` on `macos-15-intel`. Each writes
-`dist/ani-gui-<version>-<target>.tar.gz`; the release job signs every archive
-it receives, and the updater picks its asset by the target triple it was
-built for (`build.rs`). On macOS the updater replaces the whole
-`ani-gui.app`, so the archive must hold exactly `ani-gui.app/` at its top
-with `Contents/MacOS/ani-gui` inside. The app is signed ad hoc, not with a
-Developer ID, and isn't notarized.
+The build job is a matrix: Linux, `aarch64-apple-darwin` on `macos-15`,
+`x86_64-apple-darwin` on `macos-15-intel`, and `x86_64-pc-windows-msvc` on
+`windows-latest`. Each writes `dist/ani-gui-<version>-<target>.tar.gz`; the
+release job signs every archive and installer it receives, and the updater
+picks its asset by the target triple it was built for (`build.rs`). On macOS
+the updater replaces the whole `ani-gui.app`, so the archive must hold exactly
+`ani-gui.app/` at its top with `Contents/MacOS/ani-gui` inside. The app is
+signed ad hoc, not with a Developer ID, and isn't notarized.
+
+## Windows builds
+
+The `x86_64-pc-windows-msvc` matrix entry runs on `windows-latest` under Git
+Bash and calls `packaging/windows/build-windows.sh`. That script stages the
+prefix tree (`bin/ani-gui.exe`, `bin/libmpv-2.dll`, `lib/ani-gui/bin/ani-cli`,
+`lib/ani-gui/bin/busybox.exe`), verifies the pinned SHA-256 hashes for
+`libmpv` and `busybox-w32`, runs smoke checks (ani-cli version via
+`busybox.exe sh` and `LoadLibraryW` on `libmpv-2.dll`), packs
+`ani-gui-<version>-x86_64-pc-windows-msvc.tar.gz` for portable use and the
+in-app updater, and invokes Inno Setup 6 (`packaging/windows/ani-gui.iss`) to
+produce `ani-gui-windows-x86_64-setup.exe`. Neither the installer nor the
+application executable is Authenticode-signed, so SmartScreen prompts on first
+run; in-app updates are verified against the embedded Ed25519 key in
+`SHA256SUMS.sig`.
 
 ## Rotating the key
 
