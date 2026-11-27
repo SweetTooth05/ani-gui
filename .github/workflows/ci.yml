@@ -81,6 +81,48 @@ jobs:
           packaging/macos/build-dmg.sh target/release/ani-gui.app target/ani-gui.dmg
           ls -l target/ani-gui.dmg
 
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Disable Git CRLF conversion
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test
+
+      - name: build release
+        run: cargo build --release
+
+      - name: Ensure Inno Setup 6
+        run: |
+          if ! command -v iscc >/dev/null 2>&1 \
+            && [ ! -x "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ] \
+            && [ ! -x "/c/Program Files/Inno Setup 6/ISCC.exe" ]; then
+            choco install innosetup -y --no-progress
+          fi
+
+      - name: package windows
+        run: |
+          packaging/windows/build-windows.sh target/release/ani-gui.exe target/dist
+          ls -lh target/dist
+
   packaging:
     runs-on: ubuntu-latest
     steps:

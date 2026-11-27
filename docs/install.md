@@ -1,8 +1,8 @@
 # Installing ani-gui
 
 The quickest way is a download button in the [README](../README.md#install).
-This page covers the details and the other ways: Linux first, then
-[macOS](#macos).
+This page covers the details and the other ways: [Linux](#linux),
+[macOS](#macos) and [Windows](#windows).
 
 ## Linux
 
@@ -222,4 +222,104 @@ On macOS, your library and settings live in
 `~/Library/Caches/ani-gui/`. Downloads go to `~/Movies/ani-gui` by default.
 ani-cli's watch history is in the same place as on Linux. To uninstall, drag
 `ani-gui.app` to the Bin.
+
+
+## Windows
+
+ani-gui runs on 64-bit Windows 10 or later (`x86_64-pc-windows-msvc`). Both
+the installer and the portable archive bundle `libmpv-2.dll` (video playback),
+`ani-cli` and `busybox.exe` ([busybox-w32](https://frippery.org/busybox/),
+used to run `ani-cli`), so nothing else needs to be installed to watch anime.
+
+### Installer
+
+Download `ani-gui-windows-x86_64-setup.exe` with the
+[README](../README.md#install)'s button or from the
+[latest release](https://github.com/SweetTooth05/ani-gui/releases/latest) and
+run it:
+
+- Installs per user into `%LOCALAPPDATA%\Programs\ani-gui` (no administrator
+  privileges needed).
+- Adds a Start menu shortcut (and an optional Desktop shortcut).
+- The first time you run it, Windows Defender SmartScreen shows **"Windows
+  protected your PC"** because the installer isn't code-signed: click
+  **More info → Run anyway**.
+
+If you have your own `ani-cli` on `PATH`, ani-gui prefers it over the built-in
+one. Downloading episodes to watch offline needs `yt-dlp` and `ffmpeg` (for
+example `winget install yt-dlp.yt-dlp Gyan.FFmpeg`); watching doesn't.
+
+### Portable archive
+
+Each release also includes `ani-gui-<version>-x86_64-pc-windows-msvc.tar.gz`,
+which unpacks to a single directory holding the same prefix tree:
+
+```text
+ani-gui-<version>-x86_64-pc-windows-msvc/
+├── bin/
+│   ├── ani-gui.exe
+│   └── libmpv-2.dll
+└── lib/
+    └── ani-gui/
+        └── bin/
+            ├── ani-cli
+            └── busybox.exe
+```
+
+Extract it anywhere you can write to (Windows 10/11 includes `tar`):
+
+```powershell
+tar -xzf ani-gui-<version>-x86_64-pc-windows-msvc.tar.gz
+```
+
+Then run `bin\ani-gui.exe`. To verify a download's signature by hand first,
+see [releasing.md](releasing.md#verifying-a-release-by-hand).
+
+### Updates on Windows
+
+ani-gui updates itself in place (replacing `bin\ani-gui.exe` from the signed
+`ani-gui-<version>-x86_64-pc-windows-msvc.tar.gz` release archive), with the
+same Ed25519 signature checks as on Linux and macOS. Both the default
+`%LOCALAPPDATA%\Programs\ani-gui` install and a portable copy in a writable
+folder update automatically without administrator privileges.
+
+### Uninstall on Windows
+
+Open **Settings → Apps → Installed apps** (or **Apps & features** on
+Windows 10), select **ani-gui** and choose **Uninstall**. For a portable
+archive, delete the extracted folder. Your library and settings stay in your
+user data folder; delete that folder too for a clean slate.
+
+### From source on Windows
+
+You need the [Rust](https://rustup.rs) MSVC toolchain
+(`x86_64-pc-windows-msvc`, with the Visual Studio C++ Build Tools):
+
+```powershell
+git clone https://github.com/SweetTooth05/ani-gui.git
+cd ani-gui
+cargo build --release
+```
+
+That produces `target\release\ani-gui.exe`. To run it directly from a source
+build:
+
+- **Video playback**: download `mpv-dev-x86_64-*.7z` from
+  [shinchiro/mpv-winbuild-cmake](https://github.com/shinchiro/mpv-winbuild-cmake/releases)
+  and place `libmpv-2.dll` beside `ani-gui.exe`.
+- **Stream lookup (`ani-cli`)**: install [Git for Windows](https://gitforwindows.org/)
+  (which supplies `sh`, `curl`, `grep` and `sed`) or place `busybox.exe`
+  ([busybox-w32](https://frippery.org/busybox/)) and `ani-cli` in
+  `lib\ani-gui\bin\` relative to the install prefix (or put `ani-cli` on
+  `PATH`).
+
+To build the full portable `.tar.gz` and Inno Setup 6 installer
+(`ani-gui-windows-x86_64-setup.exe`), install [7-Zip](https://www.7-zip.org/)
+and [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`iscc`), then run from
+Git Bash:
+
+```sh
+packaging/windows/build-windows.sh target/release/ani-gui.exe dist
+```
+
 

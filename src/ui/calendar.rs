@@ -531,6 +531,7 @@ fn until_label(secs: i64) -> String {
 }
 
 /// Seconds the local time zone is east of UTC at `ts`.
+#[cfg(unix)]
 pub fn local_offset(ts: i64) -> i64 {
     let t: nix::libc::time_t = ts;
     // SAFETY: `tm` is plain data that localtime_r fills; both pointers are
@@ -542,6 +543,57 @@ pub fn local_offset(ts: i64) -> i64 {
         }
         tm.tm_gmtoff
     }
+}
+
+/// Seconds the local time zone is east of UTC at `ts`.
+#[cfg(target_os = "windows")]
+pub fn local_offset(ts: i64) -> i64 {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{
+        FileTimeToSystemTime, SystemTimeToFileTime, SystemTimeToTzSpecificLocalTime,
+    };
+
+    // Seconds between 1601-01-01 (Windows FILETIME epoch) and 1970-01-01.
+    const UNIX_EPOCH_OFFSET_SECS: i64 = 11_644_473_600;
+    const TICKS_PER_SEC: i64 = 10_000_000;
+
+    let Some(utc_ticks) = ts
+        .checked_add(UNIX_EPOCH_OFFSET_SECS)
+        .and_then(|s| s.checked_mul(TICKS_PER_SEC))
+        .and_then(|t| u64::try_from(t).ok())
+    else {
+        return 0;
+    };
+    let utc_ft = FILETIME {
+        dwLowDateTime: utc_ticks as u32,
+        dwHighDateTime: (utc_ticks >> 32) as u32,
+    };
+    // SAFETY: `utc_st`, `local_st`, and `local_ft` are plain POD structs passed
+    // by valid pointers; NULL requests the active system time zone.
+    unsafe {
+        let mut utc_st: SYSTEMTIME = std::mem::zeroed();
+        if FileTimeToSystemTime(&utc_ft, &mut utc_st) == 0 {
+            return 0;
+        }
+        let mut local_st: SYSTEMTIME = std::mem::zeroed();
+        if SystemTimeToTzSpecificLocalTime(ptr::null(), &utc_st, &mut local_st) == 0 {
+            return 0;
+        }
+        let mut local_ft: FILETIME = std::mem::zeroed();
+        if SystemTimeToFileTime(&local_st, &mut local_ft) == 0 {
+            return 0;
+        }
+        let local_ticks =
+            (u64::from(local_ft.dwHighDateTime) << 32) | u64::from(local_ft.dwLowDateTime);
+        let diff_ticks = local_ticks as i128 - utc_ticks as i128;
+        (diff_ticks / i128::from(TICKS_PER_SEC)) as i64
+    }
+}
+
+#[cfg(not(any(unix, target_os = "windows")))]
+pub fn local_offset(_ts: i64) -> i64 {
+    0
 }
 
 /// Days since the epoch, in the zone `tz_offset_secs` east of UTC.

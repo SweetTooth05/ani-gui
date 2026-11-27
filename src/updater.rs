@@ -9,16 +9,22 @@
 //!
 //! On Linux an install extracts `bin/ani-gui` next to the installed binary
 //! and renames it over the old one. The running process keeps its old
-//! inode, so the new version starts the next time the app does. On macOS
-//! the unit is the `ani-gui.app` bundle: the new bundle is extracted beside
+//! inode, so the new version starts the next time the app does. On Windows
+//! an install extracts `bin/ani-gui.exe` beside the installed binary,
+//! renames the running `.exe` aside to `ani-gui.exe.old`, and renames the
+//! new one into place (deleting `.old` on the next launch). On macOS the
+//! unit is the `ani-gui.app` bundle: the new bundle is extracted beside
 //! the old one and swapped in by renaming the old one aside. Dev builds,
 //! installs the user can't write and root are never replaced: they are only
 //! told that an update exists.
 
 use std::collections::HashSet;
-use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
+#[cfg(unix)]
+use std::fs::Permissions;
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -88,7 +94,7 @@ const BUNDLE_EXE: [&str; 3] = ["Contents", "MacOS", "ani-gui"];
 /// below takes it as data, so both layouts are tested on every platform.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Layout {
-    /// A prefix tree: `<prefix>/bin/ani-gui` (Linux).
+    /// A prefix tree: `<prefix>/bin/ani-gui` (Linux) or `<prefix>\bin\ani-gui.exe` (Windows).
     Prefix,
     /// An `ani-gui.app` bundle (macOS).
     AppBundle,
@@ -103,7 +109,8 @@ const LAYOUT: Layout = if cfg!(target_os = "macos") {
 /// What an update replaces.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallTarget {
-    /// An installed binary, replaced by the archive's `<stem>/bin/ani-gui`.
+    /// An installed binary, replaced by the archive's `<stem>/bin/ani-gui`
+    /// (or `<stem>/bin/ani-gui.exe` on Windows).
     Binary(PathBuf),
     /// An app bundle such as `/Applications/ani-gui.app`, replaced whole by
     /// the archive's `ani-gui.app`.
@@ -469,7 +476,7 @@ fn install_with_progress(
     let actual = download_with_progress(
         &agent,
         &picked.archive.url,
-        &mut archive.file,
+        archive.file_mut(),
         MAX_ARCHIVE,
         |downloaded| {
             on_phase(InstallPhase::Downloading { downloaded, total });
@@ -481,19 +488,42 @@ fn install_with_progress(
         picked.archive.name
     );
     on_phase(InstallPhase::Installing);
-    archive.file.seek(SeekFrom::Start(0))?;
+    archive.file_mut().seek(SeekFrom::Start(0))?;
     match dest {
-        InstallTarget::Binary(exe) => {
-            replace_binary(&archive.file, &archive_stem(release.version, target), exe)
-        }
-        InstallTarget::Bundle(app) => replace_bundle(&archive.file, app),
+        InstallTarget::Binary(exe) => replace_binary(
+            archive.file_mut(),
+            &archive_stem(release.version, target),
+            target,
+            exe,
+        ),
+        InstallTarget::Bundle(app) => replace_bundle(archive.file_mut(), app),
     }
 }
 
-/// Writes the archive's `<top>/bin/ani-gui` into `out`. Only that one
+/// Whether `target` is a Windows Rust target triple (e.g. `x86_64-pc-windows-msvc`).
+fn is_windows_target(target: &str) -> bool {
+    target.contains("-windows-")
+}
+
+/// The executable filename inside `<top>/bin/` for `target`.
+fn binary_name(target: &str) -> &'static str {
+    if is_windows_target(target) {
+        "ani-gui.exe"
+    } else {
+        "ani-gui"
+    }
+}
+
+/// Writes the archive's `<top>/bin/<bin_name>` into `out`. Only that one
 /// regular file is read; any entry whose path is absolute or climbs out
 /// with `..` rejects the whole archive.
-fn extract_binary(archive: impl Read, top: &str, out: &mut impl Write, limit: u64) -> Result<()> {
+fn extract_binary(
+    archive: impl Read,
+    top: &str,
+    bin_name: &str,
+    out: &mut impl Write,
+    limit: u64,
+) -> Result<()> {
     let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
     let mut found = false;
     for entry in tar.entries().context("reading the archive")? {
@@ -507,30 +537,47 @@ fn extract_binary(archive: impl Read, top: &str, out: &mut impl Write, limit: u6
                 _ => bail!("the archive has an unsafe path: {}", path.display()),
             }
         }
-        if parts != [top, "bin", "ani-gui"] {
+        if parts != [top, "bin", bin_name] {
             continue;
         }
-        ensure!(!found, "the archive has bin/ani-gui twice");
+        ensure!(!found, "the archive has bin/{bin_name} twice");
         ensure!(
             entry.header().entry_type() == tar::EntryType::Regular,
-            "bin/ani-gui in the archive isn't a regular file"
+            "bin/{bin_name} in the archive isn't a regular file"
         );
         ensure!(
             entry.size() <= limit,
-            "bin/ani-gui in the archive is too large"
+            "bin/{bin_name} in the archive is too large"
         );
-        let copied =
-            io::copy(&mut (&mut entry).take(limit + 1), out).context("extracting bin/ani-gui")?;
-        ensure!(copied <= limit, "bin/ani-gui in the archive is too large");
+        let copied = io::copy(&mut (&mut entry).take(limit + 1), out)
+            .with_context(|| format!("extracting bin/{bin_name}"))?;
+        ensure!(
+            copied <= limit,
+            "bin/{bin_name} in the archive is too large"
+        );
         found = true;
     }
-    ensure!(found, "the archive has no {top}/bin/ani-gui");
+    ensure!(found, "the archive has no {top}/bin/{bin_name}");
     Ok(())
 }
 
 /// Whether `magic` starts an ELF executable (the Linux binary).
 fn is_elf(magic: &[u8; 4]) -> bool {
     magic == b"\x7fELF"
+}
+
+/// Whether `magic` starts a Windows PE/COFF executable (`MZ` DOS header).
+fn is_pe(magic: &[u8; 4]) -> bool {
+    magic[..2] == *b"MZ"
+}
+
+/// Whether `magic` starts a native prefix-layout executable for `target`.
+fn is_expected_binary(target: &str, magic: &[u8; 4]) -> bool {
+    if is_windows_target(target) {
+        is_pe(magic)
+    } else {
+        is_elf(magic)
+    }
 }
 
 /// Whether `magic` starts a Mach-O executable: 64-bit or 32-bit
@@ -542,28 +589,98 @@ fn is_mach_o(magic: &[u8; 4]) -> bool {
     )
 }
 
-/// Extracts the new binary beside `exe`, checks it, and renames it over
-/// `exe` in one step.
-fn replace_binary(archive: impl Read, top: &str, exe: &Path) -> Result<()> {
-    let dir = exe.parent().context("the install path has no folder")?;
-    let mut new = TempFile::new(dir, "new")?;
-    extract_binary(archive, top, &mut new.file, MAX_BINARY)?;
+/// Reads the first 4 bytes of `file` from offset 0.
+fn read_magic(file: &mut File) -> io::Result<[u8; 4]> {
     let mut magic = [0u8; 4];
-    new.file
-        .read_exact_at(&mut magic, 0)
-        .context("the new binary is empty")?;
-    ensure!(
-        is_elf(&magic),
-        "bin/ani-gui in the archive isn't an executable for this system"
-    );
-    new.file.set_permissions(Permissions::from_mode(0o755))?;
-    new.file.sync_all().context("saving the new binary")?;
-    fs::rename(&new.path, exe).with_context(|| format!("replacing {}", exe.display()))?;
-    new.keep = true;
-    // Makes the rename itself durable; the swap has happened either way.
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut magic)?;
+    Ok(magic)
+}
+
+/// Makes directory-entry renames durable on Unix. On Windows, directories
+/// can't be opened with `File::open` for `FlushFileBuffers`.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
     if let Err(err) = File::open(dir).and_then(|d| d.sync_all()) {
         eprintln!("ani-gui: update: syncing {}: {err}", dir.display());
     }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
+/// The sibling path a running binary is renamed to on Windows before moving
+/// the replacement into place (`<exe>.old`, e.g. `ani-gui.exe.old`).
+#[cfg(any(not(unix), test))]
+fn old_exe_path(exe: &Path) -> PathBuf {
+    let mut name = exe.as_os_str().to_os_string();
+    name.push(".old");
+    PathBuf::from(name)
+}
+
+/// Puts the binary at `new` in place of `exe` by renaming `exe` aside to
+/// `<exe>.old` first, then renaming `new` into `exe`. Needed on Windows,
+/// where a running `.exe` can be renamed but not overwritten or deleted.
+/// If the second rename fails, `<exe>.old` is renamed back. `rename` is
+/// `fs::rename` except in tests.
+#[cfg(any(not(unix), test))]
+fn swap_binary_aside(
+    new: &Path,
+    exe: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> Result<()> {
+    let aside = old_exe_path(exe);
+    // Clear a leftover from a previous update that is no longer running.
+    let _ = fs::remove_file(&aside);
+    rename(exe, &aside).with_context(|| format!("moving {} aside", exe.display()))?;
+    if let Err(err) = rename(new, exe) {
+        if let Err(back) = rename(&aside, exe) {
+            bail!(
+                "moving the new binary into place: {err}; putting the old one back \
+                 also failed ({back}), it is at {}",
+                aside.display()
+            );
+        }
+        return Err(err).context("moving the new binary into place");
+    }
+    // While running on Windows, `<exe>.old` is still mapped by this process,
+    // so removing it here is expected to fail; startup cleans it up next launch.
+    let _ = fs::remove_file(&aside);
+    Ok(())
+}
+
+/// Best-effort deletion of a leftover `<exe>.old` from a previous Windows
+/// self-update.
+#[cfg(any(not(unix), test))]
+fn cleanup_old_exe(exe: &Path) {
+    let _ = fs::remove_file(old_exe_path(exe));
+}
+
+/// Extracts the new binary beside `exe`, checks it, and swaps it into place.
+/// On Unix that is a single atomic rename over `exe`; on Windows the running
+/// binary is renamed aside to `<exe>.old` first and rolled back on failure.
+fn replace_binary(archive: impl Read, top: &str, target: &str, exe: &Path) -> Result<()> {
+    let dir = exe.parent().context("the install path has no folder")?;
+    let bin_name = binary_name(target);
+    let mut new = TempFile::new(dir, "new")?;
+    extract_binary(archive, top, bin_name, new.file_mut(), MAX_BINARY)?;
+    let magic = read_magic(new.file_mut()).context("the new binary is empty")?;
+    ensure!(
+        is_expected_binary(target, &magic),
+        "bin/{bin_name} in the archive isn't an executable for this system"
+    );
+    #[cfg(unix)]
+    new.file_mut()
+        .set_permissions(Permissions::from_mode(0o755))?;
+    new.file_mut().sync_all().context("saving the new binary")?;
+    // Close the handle before renaming so Windows doesn't reject the move.
+    new.close();
+    #[cfg(unix)]
+    fs::rename(&new.path, exe).with_context(|| format!("replacing {}", exe.display()))?;
+    #[cfg(not(unix))]
+    swap_binary_aside(&new.path, exe, |from, to| fs::rename(from, to))?;
+    new.keep = true;
+    // Makes the rename itself durable; the swap has happened either way.
+    sync_dir(dir);
     Ok(())
 }
 
@@ -576,9 +693,7 @@ fn replace_bundle(archive: impl Read, app: &Path) -> Result<()> {
     check_bundle(&new.path)?;
     swap_bundle(&new.path, app, |from, to| fs::rename(from, to))?;
     // Makes the renames durable; the swap has happened either way.
-    if let Err(err) = File::open(dir).and_then(|d| d.sync_all()) {
-        eprintln!("ani-gui: update: syncing {}: {err}", dir.display());
-    }
+    sync_dir(dir);
     Ok(())
 }
 
@@ -669,22 +784,19 @@ fn extract_bundle(archive: impl Read, top: &str, dest: &Path, limit: u64) -> Res
         match kind {
             // May exist already as the parent of an earlier entry, but not as
             // a file (a link at this path was refused above).
-            tar::EntryType::Directory => DirBuilder::new()
-                .recursive(true)
-                .mode(0o755)
-                .create(&out)
+            tar::EntryType::Directory => create_dir_mode(&out, true)
                 .with_context(|| format!("creating {}", out.display()))?,
             tar::EntryType::Regular => {
-                DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o755)
-                    .create(parent)
+                create_dir_mode(parent, true)
                     .with_context(|| format!("creating {}", parent.display()))?;
-                let executable = entry.header().mode().is_ok_and(|m| m & 0o111 != 0);
-                let mut file = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(if executable { 0o755 } else { 0o644 })
+                let mut opts = OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    let executable = entry.header().mode().is_ok_and(|m| m & 0o111 != 0);
+                    opts.mode(if executable { 0o755 } else { 0o644 });
+                }
+                let mut file = opts
                     .open(&out)
                     .with_context(|| format!("the archive repeats {}", path.display()))?;
                 let budget = limit - written;
@@ -707,13 +819,15 @@ fn extract_bundle(archive: impl Read, top: &str, dest: &Path, limit: u64) -> Res
                     path.display(),
                     target.display()
                 );
-                DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o755)
-                    .create(parent)
+                create_dir_mode(parent, true)
                     .with_context(|| format!("creating {}", parent.display()))?;
-                std::os::unix::fs::symlink(&target, &out)
-                    .with_context(|| format!("the archive repeats {}", path.display()))?;
+                create_symlink(&target, &out).with_context(|| {
+                    if cfg!(unix) {
+                        format!("the archive repeats {}", path.display())
+                    } else {
+                        format!("creating symlink {}", path.display())
+                    }
+                })?;
                 links.insert(rel.to_vec());
             }
             other => bail!(
@@ -723,6 +837,32 @@ fn extract_bundle(archive: impl Read, top: &str, dest: &Path, limit: u64) -> Res
         }
     }
     Ok(())
+}
+
+/// Creates a directory (with mode 0755 on Unix).
+fn create_dir_mode(path: &Path, recursive: bool) -> io::Result<()> {
+    let mut builder = DirBuilder::new();
+    builder.recursive(recursive);
+    #[cfg(unix)]
+    builder.mode(0o755);
+    builder.create(path)
+}
+
+/// Creates a symlink on Unix; returns `Unsupported` elsewhere (only macOS
+/// app bundles use archive symlinks).
+fn create_symlink(target: &Path, link: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, link);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "symlinks aren't supported on this system",
+        ))
+    }
 }
 
 /// Checks an extracted bundle: every symlink resolves inside it, and
@@ -739,9 +879,8 @@ fn check_bundle(app: &Path) -> Result<()> {
         meta.is_file(),
         "Contents/MacOS/ani-gui in the archive isn't a regular file"
     );
-    let mut magic = [0u8; 4];
-    File::open(&exe)
-        .and_then(|f| f.read_exact_at(&mut magic, 0))
+    let magic = File::open(&exe)
+        .and_then(|mut f| read_magic(&mut f))
         .context("Contents/MacOS/ani-gui in the archive is empty")?;
     ensure!(
         is_mach_o(&magic),
@@ -830,10 +969,7 @@ struct TempDir {
 impl TempDir {
     fn new(dir: &Path, what: &str) -> Result<TempDir> {
         let path = temp_path(dir, what);
-        DirBuilder::new()
-            .mode(0o755)
-            .create(&path)
-            .with_context(|| format!("creating {}", path.display()))?;
+        create_dir_mode(&path, false).with_context(|| format!("creating {}", path.display()))?;
         Ok(TempDir { path })
     }
 }
@@ -849,30 +985,40 @@ impl Drop for TempDir {
 /// on one filesystem), removed again unless kept.
 struct TempFile {
     path: PathBuf,
-    file: File,
+    file: Option<File>,
     keep: bool,
 }
 
 impl TempFile {
     fn new(dir: &Path, what: &str) -> Result<TempFile> {
         let path = temp_path(dir, what);
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        let file = opts
             .open(&path)
             .with_context(|| format!("creating {}", path.display()))?;
         Ok(TempFile {
             path,
-            file,
+            file: Some(file),
             keep: false,
         })
+    }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("temp file already closed")
+    }
+
+    fn close(&mut self) {
+        self.file.take();
     }
 }
 
 impl Drop for TempFile {
     fn drop(&mut self) {
+        // Close the handle before unlinking: Windows won't remove an open file.
+        self.file.take();
         if !self.keep {
             let _ = fs::remove_file(&self.path);
         }
@@ -884,6 +1030,8 @@ impl Drop for TempFile {
 pub enum NotEligible {
     UnknownPath,
     DevBuild,
+    /// Unix only: Windows has no root user.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Root,
     NotOwned,
     NotWritable,
@@ -920,9 +1068,9 @@ impl NotEligible {
 }
 
 /// What ani-gui may replace when it runs as `exe`: a release build outside
-/// cargo's `target/`, run by its owner, in a folder that user can write.
-/// With [`Layout::AppBundle`] that is the bundle `exe` runs from, which must
-/// be a real folder owned by the same user.
+/// cargo's `target/`, run by its owner (on Unix), in a folder that user can
+/// write. With [`Layout::AppBundle`] that is the bundle `exe` runs from,
+/// which must be a real folder owned by the same user.
 fn self_update_target(
     exe: &Path,
     dev_build: bool,
@@ -931,30 +1079,61 @@ fn self_update_target(
     if dev_build || in_cargo_target(exe) {
         return Err(NotEligible::DevBuild);
     }
-    let euid = euid();
-    if euid == 0 {
-        return Err(NotEligible::Root);
-    }
+    #[cfg(unix)]
+    let euid = {
+        let euid = euid();
+        if euid == 0 {
+            return Err(NotEligible::Root);
+        }
+        euid
+    };
     let meta = fs::metadata(exe).map_err(|_| NotEligible::UnknownPath)?;
+    #[cfg(unix)]
     if meta.uid() != euid {
         return Err(NotEligible::NotOwned);
     }
+    #[cfg(not(unix))]
+    let _ = meta;
     let target = match layout {
         Layout::Prefix => InstallTarget::Binary(exe.to_path_buf()),
         Layout::AppBundle => {
             let exe = fs::canonicalize(exe).map_err(|_| NotEligible::UnknownPath)?;
             let app = app_bundle_of(&exe).ok_or(NotEligible::NotInBundle)?;
             let meta = fs::symlink_metadata(&app).map_err(|_| NotEligible::UnknownPath)?;
-            if !meta.is_dir() || meta.uid() != euid {
+            if !meta.is_dir() {
+                return Err(NotEligible::NotOwned);
+            }
+            #[cfg(unix)]
+            if meta.uid() != euid {
                 return Err(NotEligible::NotOwned);
             }
             InstallTarget::Bundle(app)
         }
     };
     let dir = target.dir().map_err(|_| NotEligible::UnknownPath)?;
-    nix::unistd::access(dir, nix::unistd::AccessFlags::W_OK)
-        .map_err(|_| NotEligible::NotWritable)?;
+    if !dir_is_writable(dir) {
+        return Err(NotEligible::NotWritable);
+    }
     Ok(target)
+}
+
+/// Checks whether the current user can create files in `dir` by creating and
+/// immediately removing a temporary probe file.
+#[cfg(any(not(unix), test))]
+fn dir_is_writable_by_probe(dir: &Path) -> bool {
+    TempFile::new(dir, "probe").is_ok()
+}
+
+/// Whether the current user can write into `dir`.
+fn dir_is_writable(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        nix::unistd::access(dir, nix::unistd::AccessFlags::W_OK).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        dir_is_writable_by_probe(dir)
+    }
 }
 
 /// The `….app` folder when `exe` is `<…>.app/Contents/MacOS/ani-gui`.
@@ -970,6 +1149,7 @@ fn app_bundle_of(exe: &Path) -> Option<PathBuf> {
     (name.len() > ".app".len() && name.ends_with(".app")).then(|| up.to_path_buf())
 }
 
+#[cfg(unix)]
 fn euid() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { nix::libc::geteuid() }
@@ -990,15 +1170,19 @@ fn in_cargo_target(exe: &Path) -> bool {
 }
 
 /// The installed binary's path, read once: after an update replaces it,
-/// `/proc/self/exe` reads "<path> (deleted)".
+/// Linux's `/proc/self/exe` reads "<path> (deleted)" and Windows renames
+/// the running `.exe` aside to `.old`.
 fn exe_path() -> Option<PathBuf> {
     static EXE: OnceLock<Option<PathBuf>> = OnceLock::new();
     EXE.get_or_init(|| {
         let exe = std::env::current_exe().ok()?;
-        let text = exe.to_str()?;
-        Some(PathBuf::from(
-            text.strip_suffix(" (deleted)").unwrap_or(text),
-        ))
+        #[cfg(target_os = "linux")]
+        if let Some(text) = exe.to_str()
+            && let Some(stripped) = text.strip_suffix(" (deleted)")
+        {
+            return Some(PathBuf::from(stripped));
+        }
+        Some(exe)
     })
     .clone()
 }
@@ -1382,6 +1566,10 @@ pub fn init(cx: &mut App) {
     cx.spawn(async move |cx| {
         let (saved, install_path) = cx
             .background_spawn(async move {
+                #[cfg(not(unix))]
+                if let Some(exe) = &exe {
+                    cleanup_old_exe(exe);
+                }
                 let install_path = exe.map_or(Err(NotEligible::UnknownPath), |exe| {
                     self_update_target(&exe, cfg!(debug_assertions), LAYOUT)
                 });
@@ -1400,6 +1588,13 @@ pub fn init(cx: &mut App) {
             return;
         }
         cx.background_executor().timer(STARTUP_DELAY).await;
+        #[cfg(not(unix))]
+        if let Some(exe) = exe_path() {
+            cx.background_spawn(async move {
+                cleanup_old_exe(&exe);
+            })
+            .detach();
+        }
         loop {
             let Ok(due) = updates.read_with(cx, |u, _| check_due(u.saved.last_check, now())) else {
                 return;
@@ -1664,7 +1859,16 @@ pub fn restart(cx: &mut App) {
         toast::error(cx, "Couldn't find ani-gui to restart it");
         return;
     };
-    match Command::new(&exe).spawn() {
+    let mut cmd = Command::new(&exe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // Put the new process in its own process group so it stays independent
+        // as this process quits.
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+    match cmd.spawn() {
         Ok(_) => cx.quit(),
         Err(err) => toast::error(cx, format!("Couldn't restart ani-gui: {err}")),
     }
@@ -2011,7 +2215,7 @@ mod tests {
 
     fn extract(archive: &[u8]) -> Result<Vec<u8>> {
         let mut out = Vec::new();
-        extract_binary(archive, TOP, &mut out, 1 << 20)?;
+        extract_binary(archive, TOP, "ani-gui", &mut out, 1 << 20)?;
         Ok(out)
     }
 
@@ -2039,7 +2243,7 @@ mod tests {
         assert!(extract(&twice).is_err());
         // Too large.
         let mut out = Vec::new();
-        assert!(extract_binary(&good[..], TOP, &mut out, 4).is_err());
+        assert!(extract_binary(&good[..], TOP, "ani-gui", &mut out, 4).is_err());
         // Not a gzip at all.
         assert!(extract(b"plain").is_err());
     }
@@ -2080,30 +2284,44 @@ mod tests {
         assert!(in_cargo_target(Path::new(
             "/s/target/x86_64-unknown-linux-gnu/release/ani-gui"
         )));
+        assert!(in_cargo_target(Path::new(
+            "C:/src/ani-gui/target/x86_64-pc-windows-msvc/release/ani-gui.exe"
+        )));
         assert!(!in_cargo_target(Path::new("/home/u/.local/bin/ani-gui")));
         assert!(!in_cargo_target(Path::new("/home/u/target/bin/ani-gui")));
 
-        if euid() == 0 {
-            assert_eq!(target(&exe, false), Err(NotEligible::Root));
-        } else {
-            assert_eq!(target(&exe, false), Ok(InstallTarget::Binary(exe.clone())));
-            fs::set_permissions(&bin, Permissions::from_mode(0o555)).unwrap();
-            assert_eq!(target(&exe, false), Err(NotEligible::NotWritable));
-            fs::set_permissions(&bin, Permissions::from_mode(0o755)).unwrap();
-            // A root-owned system binary, e.g. /usr/bin/env.
-            let system = Path::new("/usr/bin/env");
-            if system.exists() {
-                assert!(target(system, false).is_err());
-            }
-        }
-        assert_eq!(
-            target(&dir.join("missing"), false).unwrap_err(),
+        #[cfg(unix)]
+        {
             if euid() == 0 {
-                NotEligible::Root
+                assert_eq!(target(&exe, false), Err(NotEligible::Root));
             } else {
-                NotEligible::UnknownPath
+                assert_eq!(target(&exe, false), Ok(InstallTarget::Binary(exe.clone())));
+                fs::set_permissions(&bin, Permissions::from_mode(0o555)).unwrap();
+                assert_eq!(target(&exe, false), Err(NotEligible::NotWritable));
+                fs::set_permissions(&bin, Permissions::from_mode(0o755)).unwrap();
+                // A root-owned system binary, e.g. /usr/bin/env.
+                let system = Path::new("/usr/bin/env");
+                if system.exists() {
+                    assert!(target(system, false).is_err());
+                }
             }
-        );
+            assert_eq!(
+                target(&dir.join("missing"), false).unwrap_err(),
+                if euid() == 0 {
+                    NotEligible::Root
+                } else {
+                    NotEligible::UnknownPath
+                }
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(target(&exe, false), Ok(InstallTarget::Binary(exe.clone())));
+            assert_eq!(
+                target(&dir.join("missing"), false),
+                Err(NotEligible::UnknownPath)
+            );
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2115,6 +2333,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     #[test]
     fn replace_is_atomic_and_failures_leave_the_old_binary() {
         let dir = temp_dir("replace");
@@ -2125,7 +2344,7 @@ mod tests {
         let mut running = File::open(&exe).unwrap();
 
         let archive = tarball(&[(&format!("{TOP}/bin/ani-gui"), ELF)]);
-        replace_binary(&archive[..], TOP, &exe).unwrap();
+        replace_binary(&archive[..], TOP, T, &exe).unwrap();
         assert_eq!(fs::read(&exe).unwrap(), ELF);
         assert_eq!(fs::metadata(&exe).unwrap().mode() & 0o777, 0o755);
         let mut old = Vec::new();
@@ -2135,11 +2354,11 @@ mod tests {
 
         // Not an executable: refused, old binary intact, no temp files.
         let script = tarball(&[(&format!("{TOP}/bin/ani-gui"), b"#!/bin/sh\nrm -rf ~\n")]);
-        assert!(replace_binary(&script[..], TOP, &exe).is_err());
+        assert!(replace_binary(&script[..], TOP, T, &exe).is_err());
         let empty = tarball(&[(&format!("{TOP}/bin/ani-gui"), b"")]);
-        assert!(replace_binary(&empty[..], TOP, &exe).is_err());
+        assert!(replace_binary(&empty[..], TOP, T, &exe).is_err());
         let broken = &archive[..archive.len() / 2];
-        assert!(replace_binary(broken, TOP, &exe).is_err());
+        assert!(replace_binary(broken, TOP, T, &exe).is_err());
         assert_eq!(fs::read(&exe).unwrap(), ELF);
         assert!(leftovers(&dir).is_empty());
         fs::remove_dir_all(&dir).unwrap();
@@ -2298,6 +2517,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fs::read(&exe).unwrap(), ELF);
+        #[cfg(unix)]
         assert_eq!(fs::metadata(&exe).unwrap().mode() & 0o777, 0o755);
         assert!(leftovers(&dir).is_empty());
         fs::remove_dir_all(&dir).unwrap();
@@ -2381,11 +2601,16 @@ mod tests {
             https_only: false,
         };
         let dir = temp_dir("dist");
-        let (dest, exe, magic) = match LAYOUT {
+        let (dest, exe, magic): (_, _, &[u8]) = match LAYOUT {
             Layout::Prefix => {
-                let exe = dir.join("ani-gui");
-                fs::write(&exe, b"\x7fELF old").unwrap();
-                (InstallTarget::Binary(exe.clone()), exe, &b"\x7fELF"[..])
+                let exe = dir.join(binary_name(TARGET));
+                let (placeholder, magic): (&[u8], &[u8]) = if is_windows_target(TARGET) {
+                    (b"MZ\x90\x00 old", b"MZ")
+                } else {
+                    (b"\x7fELF old", b"\x7fELF")
+                };
+                fs::write(&exe, placeholder).unwrap();
+                (InstallTarget::Binary(exe.clone()), exe, magic)
             }
             Layout::AppBundle => {
                 let app = dir.join(BUNDLE);
@@ -2396,7 +2621,7 @@ mod tests {
         let release = latest_newer(&source, v("0.0.1")).unwrap().unwrap();
         install(&source, &release, TARGET, &dest, RELEASE_PUBLIC_KEYS).unwrap();
         let installed = fs::read(&exe).unwrap();
-        assert_eq!(&installed[..4], magic);
+        assert!(installed.starts_with(magic));
         assert!(installed.len() > 1 << 20);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2405,11 +2630,13 @@ mod tests {
     // macOS app bundles. Everything here is plain file-system work, so it runs
     // on every platform.
 
+    #[cfg(unix)]
     const MAC: &str = "aarch64-apple-darwin";
     const MACHO: &[u8] = b"\xcf\xfa\xed\xfe new ani-gui";
     const PLIST: &[u8] = b"<?xml version=\"1.0\"?><plist version=\"1.0\"><dict/></plist>";
 
     /// One entry of a test bundle archive.
+    #[cfg(unix)]
     enum E<'a> {
         Dir(&'a str),
         File(&'a str, &'a [u8], u32),
@@ -2417,6 +2644,7 @@ mod tests {
     }
 
     /// A gzipped tar of `entries`, written raw so hostile names survive.
+    #[cfg(unix)]
     fn bundle_tarball(entries: &[E]) -> Vec<u8> {
         let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         let mut tar = tar::Builder::new(gz);
@@ -2442,6 +2670,7 @@ mod tests {
     }
 
     /// The entries of a well-formed `ani-gui.app` whose binary is `exe`.
+    #[cfg(unix)]
     fn good_bundle(exe: &[u8]) -> Vec<u8> {
         bundle_tarball(&[
             E::Dir("ani-gui.app/"),
@@ -2469,10 +2698,12 @@ mod tests {
         fs::write(app.join("Contents/Info.plist"), PLIST).unwrap();
         let exe = macos.join("ani-gui");
         fs::write(&exe, exe_bytes).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&exe, Permissions::from_mode(0o755)).unwrap();
         exe
     }
 
+    #[cfg(unix)]
     fn extract_to(archive: &[u8], dir: &Path) -> Result<PathBuf> {
         let dest = dir.join("out");
         let _ = fs::remove_dir_all(&dest);
@@ -2507,6 +2738,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn bundle_installs_are_eligible_only_inside_a_writable_bundle() {
         let dir = temp_dir("bundle-eligible");
@@ -2552,6 +2784,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn bundle_extraction_keeps_the_tree_modes_and_inner_links() {
         let dir = temp_dir("bundle-extract");
@@ -2593,6 +2826,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn bundle_extraction_rejects_traversal_links_and_odd_entries() {
         let dir = temp_dir("bundle-hostile");
@@ -2719,6 +2953,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn bundle_replace_swaps_atomically_and_failures_keep_the_old_app() {
         let dir = temp_dir("bundle-replace");
@@ -2790,6 +3025,7 @@ mod tests {
     }
 
     /// The whole flow for a macOS bundle against a local server.
+    #[cfg(unix)]
     #[test]
     fn end_to_end_update_replaces_an_app_bundle() {
         let key = test_key(42);
@@ -2808,6 +3044,252 @@ mod tests {
         install(&source, &release, MAC, &dest, &[public]).unwrap();
         assert_eq!(fs::read(&exe).unwrap(), MACHO);
         assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Windows prefix installs. Everything here uses plain std::fs so it runs
+    // on every platform.
+
+    const WIN: &str = "x86_64-pc-windows-msvc";
+    const WIN_TOP: &str = "ani-gui-1.1.0-x86_64-pc-windows-msvc";
+    const PE: &[u8] = b"MZ\x90\x00 new ani-gui";
+
+    fn windows_tarball(top: &str, exe: &[u8]) -> Vec<u8> {
+        tarball(&[
+            (&format!("{top}/bin/ani-gui.exe"), exe),
+            (&format!("{top}/bin/libmpv-2.dll"), b"MZ\x90\x00 dll"),
+            (&format!("{top}/lib/ani-gui/bin/ani-cli"), b"#!/bin/sh\n"),
+            (
+                &format!("{top}/lib/ani-gui/bin/busybox.exe"),
+                b"MZ\x90\x00 busybox",
+            ),
+        ])
+    }
+
+    #[test]
+    fn windows_asset_selection_and_binary_extraction() {
+        assert!(is_windows_target(WIN));
+        assert!(!is_windows_target(T));
+        assert_eq!(binary_name(WIN), "ani-gui.exe");
+        assert_eq!(binary_name(T), "ani-gui");
+        assert!(is_expected_binary(WIN, b"MZ\x90\x00"));
+        assert!(!is_expected_binary(WIN, b"\x7fELF"));
+        assert!(!is_expected_binary(T, b"MZ\x90\x00"));
+
+        let p = DOWNLOAD_PREFIX;
+        let url = |name: &str| format!("{p}v1.1.0/{name}");
+        let win_asset = "ani-gui-1.1.0-x86_64-pc-windows-msvc.tar.gz";
+        let names = [
+            "ani-gui-1.1.0-x86_64-unknown-linux-gnu.tar.gz",
+            win_asset,
+            SUMS,
+            SIG,
+        ];
+        let assets: Vec<_> = names.iter().map(|n| (*n, url(n))).collect();
+        let pairs: Vec<(&str, &str)> = assets.iter().map(|(n, u)| (*n, u.as_str())).collect();
+        let release = parse_release(&release_json("v1.1.0", false, false, &pairs))
+            .unwrap()
+            .unwrap();
+        let picked = pick_assets(&release, WIN, p).unwrap();
+        assert_eq!(picked.archive.name, win_asset);
+
+        // Extracts only `<top>/bin/ani-gui.exe` from the full Windows prefix tree.
+        let good = windows_tarball(WIN_TOP, PE);
+        let mut out = Vec::new();
+        extract_binary(&good[..], WIN_TOP, binary_name(WIN), &mut out, 1 << 20).unwrap();
+        assert_eq!(out, PE);
+
+        // "./" prefixes are harmless.
+        let dotted = tarball(&[(&format!("./{WIN_TOP}/bin/ani-gui.exe"), PE)]);
+        let mut out = Vec::new();
+        extract_binary(&dotted[..], WIN_TOP, binary_name(WIN), &mut out, 1 << 20).unwrap();
+        assert_eq!(out, PE);
+
+        // Linux entry name (`bin/ani-gui` without `.exe`) does not satisfy Windows.
+        let linux_entry = tarball(&[(&format!("{WIN_TOP}/bin/ani-gui"), PE)]);
+        let mut out = Vec::new();
+        assert!(
+            extract_binary(
+                &linux_entry[..],
+                WIN_TOP,
+                binary_name(WIN),
+                &mut out,
+                1 << 20
+            )
+            .is_err()
+        );
+
+        // Duplicates, oversize, traversal, and symlinks are still rejected.
+        let twice = tarball(&[
+            (&format!("{WIN_TOP}/bin/ani-gui.exe"), PE),
+            (&format!("{WIN_TOP}/bin/ani-gui.exe"), PE),
+        ]);
+        assert!(
+            extract_binary(
+                &twice[..],
+                WIN_TOP,
+                binary_name(WIN),
+                &mut Vec::new(),
+                1 << 20
+            )
+            .is_err()
+        );
+        assert!(extract_binary(&good[..], WIN_TOP, binary_name(WIN), &mut Vec::new(), 4).is_err());
+        for bad in [
+            format!("{WIN_TOP}/../{WIN_TOP}/bin/ani-gui.exe"),
+            format!("/{WIN_TOP}/bin/ani-gui.exe"),
+        ] {
+            let archive = raw_tarball(&bad, tar::EntryType::Regular, PE);
+            let err = extract_binary(
+                &archive[..],
+                WIN_TOP,
+                binary_name(WIN),
+                &mut Vec::new(),
+                1 << 20,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("unsafe path"), "{bad}: {err}");
+        }
+        let link = raw_tarball(
+            &format!("{WIN_TOP}/bin/ani-gui.exe"),
+            tar::EntryType::Symlink,
+            b"",
+        );
+        assert!(
+            extract_binary(
+                &link[..],
+                WIN_TOP,
+                binary_name(WIN),
+                &mut Vec::new(),
+                1 << 20
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn windows_swap_renames_aside_rolls_back_and_cleans_up() {
+        assert_eq!(
+            old_exe_path(Path::new("/prefix/bin/ani-gui.exe")),
+            PathBuf::from("/prefix/bin/ani-gui.exe.old")
+        );
+
+        let dir = temp_dir("win-swap");
+        let exe = dir.join("ani-gui.exe");
+        let aside = old_exe_path(&exe);
+        let new = dir.join(".ani-gui-new-test");
+
+        // Happy path: even if a stale `.old` exists, `exe` is moved aside and `new` moves in.
+        fs::write(&exe, b"MZ\x90\x00 old").unwrap();
+        fs::write(&aside, b"stale old").unwrap();
+        fs::write(&new, PE).unwrap();
+        let mut moves = Vec::new();
+        swap_binary_aside(&new, &exe, |from, to| {
+            moves.push((from.to_path_buf(), to.to_path_buf()));
+            fs::rename(from, to)
+        })
+        .unwrap();
+        assert_eq!(
+            moves,
+            vec![(exe.clone(), aside.clone()), (new.clone(), exe.clone())]
+        );
+        assert_eq!(fs::read(&exe).unwrap(), PE);
+        assert!(!new.exists());
+        assert!(!aside.exists());
+
+        // Second rename (`new -> exe`) fails: `<exe>.old` is renamed back.
+        fs::write(&exe, b"MZ\x90\x00 v1").unwrap();
+        fs::write(&new, PE).unwrap();
+        let mut calls = 0;
+        let err = swap_binary_aside(&new, &exe, |from, to| {
+            calls += 1;
+            if calls == 2 {
+                return Err(io::Error::other("disk full"));
+            }
+            fs::rename(from, to)
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("disk full"), "{err:#}");
+        assert_eq!(calls, 3);
+        assert_eq!(fs::read(&exe).unwrap(), b"MZ\x90\x00 v1");
+        assert_eq!(fs::read(&new).unwrap(), PE);
+        assert!(!aside.exists());
+
+        // First rename (`exe -> aside`) fails: nothing changes.
+        let err = swap_binary_aside(&new, &exe, |_, _| Err(io::Error::other("busy"))).unwrap_err();
+        assert!(format!("{err:#}").contains("moving"), "{err:#}");
+        assert_eq!(fs::read(&exe).unwrap(), b"MZ\x90\x00 v1");
+        assert_eq!(fs::read(&new).unwrap(), PE);
+
+        // Both second rename and rollback fail: error reports where the old binary is.
+        let mut calls = 0;
+        let err = swap_binary_aside(&new, &exe, |from, to| {
+            calls += 1;
+            if calls == 1 {
+                fs::rename(from, to)
+            } else {
+                Err(io::Error::other("gone"))
+            }
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("it is at"), "{err:#}");
+        assert!(format!("{err:#}").contains("ani-gui.exe.old"), "{err:#}");
+
+        // Startup cleanup removes a leftover `ani-gui.exe.old` and leaves `ani-gui.exe` intact.
+        fs::write(&exe, PE).unwrap();
+        fs::write(&aside, b"MZ\x90\x00 leftover").unwrap();
+        cleanup_old_exe(&exe);
+        assert!(!aside.exists());
+        assert_eq!(fs::read(&exe).unwrap(), PE);
+        // Calling cleanup again when `.old` is absent is a harmless no-op.
+        cleanup_old_exe(&exe);
+        assert_eq!(fs::read(&exe).unwrap(), PE);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn windows_end_to_end_update_replaces_binary() {
+        let key = test_key(42);
+        let public = key.verifying_key().to_bytes();
+        let top = format!("ani-gui-99.0.0-{WIN}");
+        let source = fake_github_with(&key, WIN, windows_tarball(&top, PE), None);
+        let dir = temp_dir("e2e-win");
+        let exe = dir.join("ani-gui.exe");
+        let dll = dir.join("libmpv-2.dll");
+        fs::write(&exe, b"MZ\x90\x00 old").unwrap();
+        fs::write(&dll, b"existing dll").unwrap();
+
+        let release = latest_newer(&source, v("1.0.0")).unwrap().unwrap();
+        let dest = InstallTarget::Binary(exe.clone());
+        install(&source, &release, WIN, &dest, &[public]).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), PE);
+        // Sibling files in `bin/` are untouched.
+        assert_eq!(fs::read(&dll).unwrap(), b"existing dll");
+        assert!(leftovers(&dir).is_empty());
+
+        // An ELF binary packaged as `bin/ani-gui.exe` is rejected as the wrong executable format.
+        let wrong_magic = windows_tarball(&top, ELF);
+        assert!(replace_binary(&wrong_magic[..], &top, WIN, &exe).is_err());
+        assert_eq!(fs::read(&exe).unwrap(), PE);
+        assert!(leftovers(&dir).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn writability_probe_checks_dir_without_leftovers() {
+        let dir = temp_dir("probe");
+        assert!(dir_is_writable_by_probe(&dir));
+        assert!(leftovers(&dir).is_empty());
+        assert!(!dir_is_writable_by_probe(&dir.join("missing")));
+        #[cfg(unix)]
+        if euid() != 0 {
+            fs::set_permissions(&dir, Permissions::from_mode(0o555)).unwrap();
+            assert!(!dir_is_writable_by_probe(&dir));
+            fs::set_permissions(&dir, Permissions::from_mode(0o755)).unwrap();
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 

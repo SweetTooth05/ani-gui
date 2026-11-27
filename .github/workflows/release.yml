@@ -49,6 +49,9 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: version
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: true
       matrix:
@@ -63,14 +66,23 @@ jobs:
             os: macos-15
           - target: x86_64-apple-darwin
             os: macos-15-intel
+          # Windows: built natively with MSVC, packaged as a prefix tarball
+          # and an Inno Setup 6 installer.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
           # Every entry writes dist/ani-gui-<version>-<target>.tar.gz. The
           # archive name must carry the target triple: the updater picks its
-          # asset by it. Linux also writes the .deb and AppImage, macOS a .dmg;
-          # the release job lists all of them in the signed SHA256SUMS.
+          # asset by it. Linux also writes the .deb and AppImage, macOS a .dmg,
+          # Windows a setup .exe; the release job lists all of them in the
+          # signed SHA256SUMS.
     env:
       TARGET: ${{ matrix.target }}
       VERSION: ${{ needs.version.outputs.version }}
     steps:
+      - name: Disable Git CRLF conversion (Windows)
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -187,6 +199,24 @@ jobs:
             "$app/Contents/Frameworks/libmpv.2.dylib"
           packaging/macos/build-dmg.sh "$app" "dist/ani-gui-macos-$arch.dmg"
 
+      - name: Ensure Inno Setup 6 (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          if ! command -v iscc >/dev/null 2>&1 \
+            && [ ! -x "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ] \
+            && [ ! -x "/c/Program Files/Inno Setup 6/ISCC.exe" ]; then
+            choco install innosetup -y --no-progress
+          fi
+
+      # Writes dist/ani-gui-<version>-x86_64-pc-windows-msvc.tar.gz (prefix
+      # tree for portable use and the in-app updater) and
+      # dist/ani-gui-windows-x86_64-setup.exe (fixed name for the README).
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          set -euo pipefail
+          packaging/windows/build-windows.sh "target/$TARGET/release/ani-gui.exe" dist
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: archive-${{ matrix.target }}
@@ -195,6 +225,7 @@ jobs:
             dist/*.deb
             dist/*.AppImage
             dist/*.dmg
+            dist/*.exe
           if-no-files-found: error
           retention-days: 7
 
@@ -227,7 +258,7 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s failglob
-          sha256sum -- *.tar.gz *.deb *.AppImage *.dmg > SHA256SUMS
+          sha256sum -- *.tar.gz *.deb *.AppImage *.dmg *.exe > SHA256SUMS
           cat SHA256SUMS
 
       - name: Sign SHA256SUMS
@@ -263,7 +294,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          files=(dist/*.tar.gz dist/*.deb dist/*.AppImage dist/*.dmg
+          files=(dist/*.tar.gz dist/*.deb dist/*.AppImage dist/*.dmg dist/*.exe
             dist/SHA256SUMS dist/SHA256SUMS.sig)
           # A release made by hand on GitHub for this tag gets the files
           # attached rather than failing the run.

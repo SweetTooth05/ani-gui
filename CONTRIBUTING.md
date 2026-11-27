@@ -1,8 +1,8 @@
 # Contributing to ani-gui
 
-Thanks for your interest! ani-gui is a native Linux desktop app for
-[ani-cli](https://github.com/pystardust/ani-cli), written in Rust with GPUI.
-Contributions of all sizes are welcome: bug reports, docs, and code.
+Thanks for your interest! ani-gui is a native desktop app (Linux, macOS and
+Windows) for [ani-cli](https://github.com/pystardust/ani-cli), written in Rust
+with GPUI. Contributions of all sizes are welcome: bug reports, docs, and code.
 
 ## Ground rules
 
@@ -12,8 +12,9 @@ Contributions of all sizes are welcome: bug reports, docs, and code.
   `cx.background_spawn`; views update when the result arrives.
 - **No `unwrap()`/`expect()` on fallible I/O, network or parse paths** outside
   tests. Errors go to the UI.
-- **libmpv is loaded at runtime** (`libmpv.so.2` via `libloading`), never
-  linked, so a missing library is an error message, not a crash.
+- **libmpv is loaded at runtime** (`libmpv.so.2`, `libmpv.2.dylib` or
+  `libmpv-2.dll` via `libloading`), never linked, so a missing library is an
+  error message, not a crash.
 
 ## Getting started
 
@@ -26,7 +27,7 @@ cd ani-gui
 cargo run
 ```
 
-You need a working `ani-cli` and `libmpv2` to test playback.
+You need a working `ani-cli` and `libmpv` to test playback.
 
 ## Before opening a PR
 
@@ -37,7 +38,7 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 desktop-file-validate assets/ani-gui.desktop
-shellcheck install.sh
+shellcheck install.sh packaging/*.sh packaging/*/*.sh
 ```
 
 Tests that hit live services or need the installed ani-cli are `#[ignore]`d;

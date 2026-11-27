@@ -29,25 +29,43 @@ const LIBRARIES: &[&str] = if cfg!(target_os = "macos") {
         "/opt/homebrew/lib/libmpv.dylib",
         "/usr/local/lib/libmpv.dylib",
     ]
+} else if cfg!(target_os = "windows") {
+    &["libmpv-2.dll", "mpv-2.dll"]
 } else {
     // libmpv.so.1 (mpv 0.32–0.35, e.g. Ubuntu 22.04) has the same render API.
     &["libmpv.so.2", "libmpv.so.1"]
 };
 
-/// The libmpv a packaged build ships (inside the .app, or the AppImage's
-/// `usr/lib`), then [`LIBRARIES`].
+/// The libmpv a packaged build ships (beside the exe on Windows, inside the
+/// .app on macOS, or the AppImage's `usr/lib`), then [`LIBRARIES`].
 fn library_candidates() -> Vec<String> {
-    let bundled: &[&str] = if cfg!(target_os = "macos") {
-        &["Frameworks/libmpv.2.dylib"]
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if cfg!(target_os = "windows") {
+        if let Some(dir) = std::env::current_exe()
+            .ok()
+            .and_then(|e| e.parent().map(std::path::Path::to_path_buf))
+        {
+            for name in LIBRARIES {
+                paths.push(dir.join(name));
+            }
+        }
     } else {
-        &["lib/libmpv.so.2", "lib/libmpv.so.1"]
-    };
-    crate::paths::exe_prefix()
+        let bundled: &[&str] = if cfg!(target_os = "macos") {
+            &["Frameworks/libmpv.2.dylib"]
+        } else {
+            &["lib/libmpv.so.2", "lib/libmpv.so.1"]
+        };
+        if let Some(prefix) = crate::paths::exe_prefix() {
+            for rel in bundled {
+                paths.push(prefix.join(rel));
+            }
+        }
+    }
+    paths
         .into_iter()
-        .flat_map(|prefix| bundled.iter().map(move |rel| prefix.join(rel)))
         .filter(|path| path.is_file())
         .map(|path| path.to_string_lossy().into_owned())
-        .chain(LIBRARIES.iter().map(|name| name.to_string()))
+        .chain(LIBRARIES.iter().map(|name| (*name).to_string()))
         .collect()
 }
 const HWDEC: &CStr = c"auto-copy";
@@ -908,6 +926,8 @@ mod tests {
         // The real candidates for this platform.
         if cfg!(target_os = "macos") {
             assert_eq!(LIBRARIES[0], "libmpv.2.dylib");
+        } else if cfg!(target_os = "windows") {
+            assert_eq!(LIBRARIES, ["libmpv-2.dll", "mpv-2.dll"]);
         } else {
             assert_eq!(LIBRARIES, ["libmpv.so.2", "libmpv.so.1"]);
         }
