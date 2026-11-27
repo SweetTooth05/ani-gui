@@ -1,21 +1,32 @@
 use std::collections::VecDeque;
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
+#[cfg(unix)]
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::{Child, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
+#[cfg(unix)]
 use nix::libc;
+#[cfg(unix)]
 use nix::pty::{Winsize, grantpt, unlockpt};
+#[cfg(unix)]
 use nix::sys::signal::{Signal, killpg};
+#[cfg(unix)]
 use nix::unistd::{Pid, setsid};
 use regex::Regex;
 
@@ -29,11 +40,13 @@ const STALL_AFTER: Duration = Duration::from_secs(60);
 /// file on every run, which concurrent runs can clobber.
 const MAX_RUNNING: usize = 2;
 /// Time a killed download gets to exit on SIGTERM before SIGKILL.
+#[cfg(unix)]
 const KILL_GRACE: Duration = Duration::from_secs(5);
 /// How long output is still read after ani-cli exits, in case something it
-/// left behind holds the terminal open.
+/// left behind holds the terminal/pipes open.
 const EXIT_GRACE: Duration = Duration::from_secs(2);
 /// Time `shutdown` gives downloads to exit on SIGTERM before SIGKILL.
+#[cfg(unix)]
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 /// Non-progress output lines kept for the error message.
 const TAIL_LINES: usize = 40;
@@ -163,8 +176,8 @@ struct Item {
     progress: Option<DlProgress>,
     /// What to run; None for records from an earlier session.
     job: Option<Job>,
-    /// Process group of the running ani-cli.
-    pgid: Option<Pid>,
+    /// PID (and process group leader on Unix) of the running ani-cli.
+    pid: Option<u32>,
     cancel: bool,
 }
 
@@ -220,7 +233,7 @@ impl DownloadManager {
                     record,
                     progress: None,
                     job: None,
-                    pgid: None,
+                    pid: None,
                     cancel: false,
                 }
             })
@@ -262,7 +275,7 @@ impl DownloadManager {
                         req,
                         dir: dir.to_path_buf(),
                     }),
-                    pgid: None,
+                    pid: None,
                     cancel: false,
                 },
             );
@@ -347,8 +360,8 @@ impl DownloadManager {
     }
 
     /// For app exit: records every active download as failed ("app closed")
-    /// and stops its process group, SIGTERM first and SIGKILL if it outlives
-    /// a short grace.
+    /// and stops its process tree (SIGTERM then SIGKILL on Unix; tree kill on
+    /// Windows).
     pub fn shutdown(&self) {
         let ids: Vec<String> = {
             let mut items = lock(&self.inner.items);
@@ -368,17 +381,31 @@ impl DownloadManager {
                 .collect()
         };
         self.inner.notify();
-        if !self.inner.signal_groups(&ids, Some(Signal::SIGTERM)) {
-            return;
-        }
-        let deadline = Instant::now() + SHUTDOWN_GRACE;
-        while Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(20));
-            if !self.inner.signal_groups(&ids, None) {
+        #[cfg(unix)]
+        {
+            if !self.inner.signal_groups(&ids, Some(Signal::SIGTERM)) {
                 return;
             }
+            let deadline = Instant::now() + SHUTDOWN_GRACE;
+            while Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+                if !self.inner.signal_groups(&ids, None) {
+                    return;
+                }
+            }
+            self.inner.signal_groups(&ids, Some(Signal::SIGKILL));
         }
-        self.inner.signal_groups(&ids, Some(Signal::SIGKILL));
+        #[cfg(not(unix))]
+        {
+            let pids: Vec<u32> = lock(&self.inner.items)
+                .iter()
+                .filter(|i| ids.contains(&i.record.id))
+                .filter_map(|i| i.pid)
+                .collect();
+            for pid in pids {
+                anicli::kill_tree(pid);
+            }
+        }
     }
 
     /// Called (from a worker thread) after every change to the snapshot.
@@ -392,13 +419,21 @@ impl DownloadManager {
     }
 }
 
-/// Marks an active download cancelled and SIGTERMs its process group; the
-/// worker escalates to SIGKILL and records the outcome.
+#[cfg(unix)]
+fn pgid(pid: u32) -> Pid {
+    Pid::from_raw(i32::try_from(pid).unwrap_or(i32::MAX))
+}
+
+/// Marks an active download cancelled and stops its process group/tree; the
+/// worker escalates (on Unix) and records the outcome.
 fn request_stop(item: &mut Item) {
     if matches!(item.record.status, DlStatus::Queued | DlStatus::Running) {
         item.cancel = true;
-        if let Some(pgid) = item.pgid {
-            let _ = killpg(pgid, Signal::SIGTERM);
+        if let Some(pid) = item.pid {
+            #[cfg(unix)]
+            let _ = killpg(pgid(pid), Signal::SIGTERM);
+            #[cfg(not(unix))]
+            anicli::kill_tree_async(pid);
         }
     }
 }
@@ -479,21 +514,21 @@ impl Inner {
         let started = SystemTime::now()
             .checked_sub(Duration::from_secs(2))
             .unwrap_or(UNIX_EPOCH);
-        let (mut child, master) = match spawn_in_pty(&program, &req, &dir, &shims, &menu_out) {
+        let (mut child, output) = match spawn_download(&program, &req, &dir, &shims, &menu_out) {
             Ok(spawned) => spawned,
             Err(err) => return Outcome::Failed(format!("starting ani-cli: {err}")),
         };
-        // setsid made the child the leader of its own process group.
-        let pgid = Pid::from_raw(i32::try_from(child.id()).unwrap_or(i32::MAX));
+        // On Unix, setsid made the child the leader of its own process group.
+        let pid = child.id();
         let started_event = {
             let mut items = lock(&self.items);
             if self.closing.load(Ordering::SeqCst) {
-                // shutdown() already settled this record but couldn't see the group.
-                let _ = killpg(pgid, Signal::SIGKILL);
+                // shutdown() already settled this record but couldn't see the process.
+                anicli::kill_tree(pid);
                 None
             } else if let Some(item) = items.iter_mut().find(|i| i.record.id == id) {
                 item.record.status = DlStatus::Running;
-                item.pgid = Some(pgid);
+                item.pid = Some(pid);
                 self.persist(&item.record);
                 Some(DownloadEvent::Started {
                     id: item.record.id.clone(),
@@ -509,14 +544,14 @@ impl Inner {
         }
         self.notify();
 
-        let tail = self.watch(id, pgid, master, &mut child);
+        let tail = self.watch(id, pid, output, &mut child);
         let status = child.wait();
         let needs_pick = anicli::take_menu_out(&menu_out).is_some();
         let (cancelled, title) = {
             let mut items = lock(&self.items);
             match items.iter_mut().find(|i| i.record.id == id) {
                 Some(item) => {
-                    item.pgid = None;
+                    item.pid = None;
                     (item.cancel, item.record.title.clone())
                 }
                 None => (true, String::new()),
@@ -541,34 +576,17 @@ impl Inner {
         }
     }
 
-    /// Reads the download's terminal until every process holding it is gone
+    /// Reads the download's output until every process holding it is gone
     /// (or shortly after `child` exits), updating progress, and kills the
-    /// group on cancel or stall.
-    fn watch(&self, id: &str, pgid: Pid, master: File, child: &mut Child) -> Watched {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        thread::spawn(move || {
-            let mut master = master;
-            let mut chunk = [0u8; 4096];
-            loop {
-                match master.read(&mut chunk) {
-                    // EIO once the last slave fd closes.
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tx.send(chunk[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => break,
-                }
-            }
-        });
+    /// process tree on cancel or stall.
+    fn watch(&self, id: &str, pid: u32, output: ChildOutput, child: &mut Child) -> Watched {
+        let rx = output.into_lines();
 
-        let mut pending = Vec::new();
         let mut tail = VecDeque::new();
         let mut last = DlProgress::default();
         let mut advanced_at = Instant::now();
         let mut stalled = false;
+        #[cfg(unix)]
         let mut term_sent: Option<Instant> = None;
         let mut kill_sent = false;
         let mut exited_at: Option<Instant> = None;
@@ -597,44 +615,44 @@ impl Inner {
         };
         loop {
             match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(chunk) => {
-                    pending.extend_from_slice(&chunk);
-                    while let Some(end) = pending.iter().position(|&b| b == b'\n' || b == b'\r') {
-                        let line: Vec<u8> = pending.drain(..=end).collect();
-                        handle(&line[..end], &mut last, &mut advanced_at);
-                    }
-                }
+                Ok(line) => handle(&line, &mut last, &mut advanced_at),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
             if exited_at.is_none() && self.reap(id, child) {
                 exited_at = Some(Instant::now());
             }
-            // Once reaped the group id may be reused, so no more signals; a
-            // straggler still holding the terminal gets a moment to flush.
+            // Once reaped the pid may be reused, so no more signals; a
+            // straggler still holding the terminal/pipes gets a moment to flush.
             if let Some(at) = exited_at {
                 if at.elapsed() >= EXIT_GRACE {
                     break;
                 }
                 continue;
             }
+            #[cfg(unix)]
             match term_sent {
                 None => {
                     stalled = advanced_at.elapsed() >= self.stall_after;
                     if stalled || self.cancel_requested(id) {
-                        let _ = killpg(pgid, Signal::SIGTERM);
+                        let _ = killpg(pgid(pid), Signal::SIGTERM);
                         term_sent = Some(Instant::now());
                     }
                 }
                 Some(at) if !kill_sent && at.elapsed() >= KILL_GRACE => {
-                    let _ = killpg(pgid, Signal::SIGKILL);
+                    let _ = killpg(pgid(pid), Signal::SIGKILL);
                     kill_sent = true;
                 }
                 Some(_) => {}
             }
-        }
-        if !pending.is_empty() {
-            handle(&pending, &mut last, &mut advanced_at);
+            #[cfg(not(unix))]
+            if !kill_sent {
+                stalled = advanced_at.elapsed() >= self.stall_after;
+                if stalled || self.cancel_requested(id) {
+                    anicli::kill_tree(pid);
+                    kill_sent = true;
+                }
+            }
         }
         if stalled {
             Watched::Stalled
@@ -643,25 +661,26 @@ impl Inner {
         }
     }
 
-    /// Whether `child` has exited. Reaps it and forgets its group under the
-    /// items lock, so nobody signals a group id that may have been reused.
+    /// Whether `child` has exited. Reaps it and forgets its pid under the
+    /// items lock, so nobody signals a process id that may have been reused.
     fn reap(&self, id: &str, child: &mut Child) -> bool {
         let mut items = lock(&self.items);
         let exited = matches!(child.try_wait(), Ok(Some(_)));
         if exited && let Some(item) = items.iter_mut().find(|i| i.record.id == id) {
-            item.pgid = None;
+            item.pid = None;
         }
         exited
     }
 
     /// Sends `signal` (None only probes) to the groups of `ids` not yet
     /// reaped; true if any of them still exists.
+    #[cfg(unix)]
     fn signal_groups(&self, ids: &[String], signal: Option<Signal>) -> bool {
         let items = lock(&self.items);
         let mut any = false;
         for item in items.iter().filter(|i| ids.contains(&i.record.id)) {
-            if let Some(pgid) = item.pgid {
-                any |= killpg(pgid, signal).is_ok();
+            if let Some(pid) = item.pid {
+                any |= killpg(pgid(pid), signal).is_ok();
             }
         }
         any
@@ -764,8 +783,113 @@ enum Watched {
     Stalled,
 }
 
+/// Output handle(s) for a running download: a single PTY master on Unix, or
+/// separate stdout/stderr pipes on Windows.
+struct ChildOutput {
+    #[cfg(unix)]
+    master: File,
+    #[cfg(not(unix))]
+    stdout: Option<std::process::ChildStdout>,
+    #[cfg(not(unix))]
+    stderr: Option<std::process::ChildStderr>,
+}
+
+impl ChildOutput {
+    /// Spawns reader thread(s) that split each stream on `\r` or `\n` and
+    /// forward complete lines so stdout and stderr never interleave mid-line.
+    fn into_lines(self) -> mpsc::Receiver<Vec<u8>> {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        #[cfg(unix)]
+        {
+            let master = self.master;
+            thread::spawn(move || read_lines(master, tx));
+        }
+        #[cfg(not(unix))]
+        {
+            if let Some(stdout) = self.stdout {
+                let tx = tx.clone();
+                thread::spawn(move || read_lines(stdout, tx));
+            }
+            if let Some(stderr) = self.stderr {
+                thread::spawn(move || read_lines(stderr, tx));
+            }
+        }
+        rx
+    }
+}
+
+fn read_lines(mut reader: impl Read, tx: mpsc::Sender<Vec<u8>>) {
+    let mut chunk = [0u8; 4096];
+    let mut pending = Vec::new();
+    loop {
+        match reader.read(&mut chunk) {
+            // On a PTY, EIO once the last slave fd closes; on a pipe, Ok(0).
+            Ok(0) => break,
+            Ok(n) => {
+                pending.extend_from_slice(&chunk[..n]);
+                while let Some(end) = pending.iter().position(|&b| b == b'\n' || b == b'\r') {
+                    let mut line: Vec<u8> = pending.drain(..=end).collect();
+                    line.truncate(end);
+                    if tx.send(line).is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    if !pending.is_empty() {
+        let _ = tx.send(pending);
+    }
+}
+
+#[cfg(unix)]
+fn spawn_download(
+    program: &Path,
+    req: &EpisodeRequest,
+    dir: &Path,
+    shims: &Path,
+    menu_out: &Path,
+) -> io::Result<(Child, ChildOutput)> {
+    let (child, master) = spawn_in_pty(program, req, dir, shims, menu_out)?;
+    Ok((child, ChildOutput { master }))
+}
+
+/// Starts `ani-cli -d …` on Windows with plain pipes (no PTY) and a hidden
+/// console window, passing unbuffered UTF-8 Python settings so yt-dlp flushes
+/// progress lines immediately over pipes.
+#[cfg(not(unix))]
+fn spawn_download(
+    program: &Path,
+    req: &EpisodeRequest,
+    dir: &Path,
+    shims: &Path,
+    menu_out: &Path,
+) -> io::Result<(Child, ChildOutput)> {
+    let args = anicli::episode_args(req).map_err(io::Error::other)?;
+    let mut cmd = anicli::script_command(program)?;
+    cmd.arg("-d")
+        .args(args)
+        .envs(anicli::shim_env(req, shims, menu_out))
+        .env("ANI_CLI_PLAYER", "download")
+        .env("ANI_CLI_DOWNLOAD_DIR", anicli::sh_path(dir))
+        .env("ANI_CLI_TMP_DIR", anicli::sh_path(dir))
+        .env("PYTHONUNBUFFERED", "1")
+        .env("PYTHONUTF8", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    anicli::hide_window(&mut cmd);
+    let mut child = anicli::spawn(&mut cmd)?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    Ok((child, ChildOutput { stdout, stderr }))
+}
+
 /// Starts `ani-cli -d …` in a new session on a fresh pseudo-terminal (so
 /// yt-dlp/ffmpeg print live progress) and returns the pty's master side.
+#[cfg(unix)]
 fn spawn_in_pty(
     program: &Path,
     req: &EpisodeRequest,
@@ -779,6 +903,7 @@ fn spawn_in_pty(
     cmd.arg("-d")
         .args(args)
         .envs(anicli::shim_env(req, shims, menu_out))
+        .env("ANI_CLI_PLAYER", "download")
         .env("ANI_CLI_DOWNLOAD_DIR", dir)
         .stdin(Stdio::null())
         .stdout(slave.try_clone()?)
@@ -796,6 +921,7 @@ fn spawn_in_pty(
 
 /// A 24x100 pseudo-terminal whose two fds are close-on-exec from the start,
 /// so children spawned by other threads never inherit them.
+#[cfg(unix)]
 fn open_pty() -> io::Result<(OwnedFd, File)> {
     let master = pty::open_master()?;
     grantpt(&master)?;
@@ -819,7 +945,7 @@ fn open_pty() -> io::Result<(OwnedFd, File)> {
     Ok((master.into(), slave))
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 mod pty {
     use std::io;
 
@@ -896,6 +1022,18 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn file_changed_time(meta: &fs::Metadata) -> SystemTime {
+    #[cfg(unix)]
+    {
+        u64::try_from(meta.ctime())
+            .map_or(UNIX_EPOCH, |secs| UNIX_EPOCH + Duration::from_secs(secs))
+    }
+    #[cfg(not(unix))]
+    {
+        meta.created().unwrap_or(UNIX_EPOCH)
+    }
+}
+
 /// The newest video file in `dir` for episode `ep`. ani-cli names downloads
 /// "<its own title> Episode <ep>.mp4", and its title can differ from ours, so
 /// a file whose name also contains `title` wins, else any for the episode
@@ -921,9 +1059,8 @@ fn find_download(dir: &Path, title: &str, ep: &str, since: SystemTime) -> Option
             }
             let meta = entry.metadata().ok()?;
             let modified = meta.modified().ok()?;
-            // A downloader may backdate mtime to the server's; ctime it can't.
-            let changed = u64::try_from(meta.ctime())
-                .map_or(UNIX_EPOCH, |secs| UNIX_EPOCH + Duration::from_secs(secs));
+            // A downloader may backdate mtime to the server's; ctime/btime it can't.
+            let changed = file_changed_time(&meta);
             Some((modified, modified.max(changed), path, name))
         })
         .collect();
@@ -957,8 +1094,10 @@ fn norm_name(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(unix)]
     use std::time::Instant;
 
     use super::*;
@@ -1092,508 +1231,16 @@ mod tests {
         dir
     }
 
-    /// A stand-in for ani-cli: `body` runs under `sh` with the real arguments.
-    fn fake_ani_cli(dir: &Path, body: &str) -> PathBuf {
-        fs::create_dir_all(dir).unwrap();
-        let path = dir.join("fake-ani-cli");
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
-
-    fn show() -> ShowSummary {
-        ShowSummary {
-            id: "ReHMC7TQnch3C6z8j".into(),
-            title: "Sousou no Frieren".into(),
-            english_title: Some("Frieren: Beyond Journey's End".into()),
-            sub_count: 28,
-            dub_count: 28,
-            ..Default::default()
-        }
-    }
-
-    fn req() -> EpisodeRequest {
-        EpisodeRequest {
-            query: "Frieren: Beyond Journey's End".into(),
-            want_titles: vec![
-                "Frieren: Beyond Journey's End".into(),
-                "Sousou no Frieren".into(),
-            ],
-            select_index: Some(1),
-            ep: "3".into(),
-            mode: Mode::Dub,
-            quality: "720".into(),
-        }
-    }
-
-    /// The fake ani-cli lives in `<dir>/bin`; shims go under `<dir>/cache`.
-    fn manager(program: PathBuf, stall_after: Duration) -> (DownloadManager, Arc<Mutex<Db>>) {
-        let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
-        let cache = program.parent().unwrap().parent().unwrap().join("cache");
-        let m = DownloadManager::with_runner(db.clone(), Some(program), cache, stall_after);
-        (m, db)
-    }
-
-    fn wait_for(
-        m: &DownloadManager,
-        id: &str,
-        done: impl Fn(&DownloadRecord) -> bool,
-    ) -> DownloadRecord {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let rec = m
-                .snapshot()
-                .into_iter()
-                .find(|(r, _)| r.id == id)
-                .map(|(r, _)| r);
-            if let Some(rec) = rec.filter(|r| done(r)) {
-                return rec;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for {id}: {:?}",
-                m.snapshot()
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    fn finished(r: &DownloadRecord) -> bool {
-        matches!(
-            r.status,
-            DlStatus::Done | DlStatus::Failed | DlStatus::Cancelled
-        )
-    }
-
     #[test]
-    fn download_runs_to_done_under_pty() {
-        let dir = temp_dir("done");
-        let script = fake_ani_cli(
-            &dir.join("bin"),
-            r#"printf '%s\n' "$@" > "$ANI_CLI_DOWNLOAD_DIR/args.txt"
-printf '%s|%s|%s\n' "$ANI_CLI_MENU" "$ANI_GUI_WANT_TITLES" "${PATH%%:*}" > "$ANI_CLI_DOWNLOAD_DIR/env.txt"
-test -t 1 && echo yes > "$ANI_CLI_DOWNLOAD_DIR/tty.txt"
-printf '[download]  10.0%% of ~100.00MiB at  1.00MiB/s ETA 01:30\r'
-printf '[download]  55.5%% of ~100.00MiB at  2.00MiB/s ETA 00:20\r'
-echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Beyond Journeys End Episode 3.mp4"
-printf '[download] 100%% of  100.00MiB in 00:00:40 at 2.50MiB/s\n'"#,
-        );
-        let (m, db) = manager(script, Duration::from_secs(60));
-        let changes = Arc::new(AtomicUsize::new(0));
-        let counter = changes.clone();
-        m.set_on_change(Box::new(move || {
-            counter.fetch_add(1, Ordering::Relaxed);
-        }));
-        let out = dir.join("out");
-        let id = m.start(&show(), req(), &out).unwrap();
-
-        let rec = wait_for(&m, &id, finished);
-        assert_eq!(rec.status, DlStatus::Done, "{rec:?}");
-        assert_eq!(
-            rec.path.as_deref(),
-            out.join("Frieren Beyond Journeys End Episode 3.mp4")
-                .to_str()
-        );
-        assert_eq!(rec.progress, 100.0);
-        assert_eq!(
-            (rec.show_id.as_str(), rec.ep.as_str(), rec.mode),
-            ("ReHMC7TQnch3C6z8j", "3", Mode::Dub)
-        );
-        assert_eq!(rec.quality, "720");
-        assert_eq!(
-            fs::read_to_string(out.join("args.txt")).unwrap(),
-            "-d\n-S\n1\n-e\n3\n-q\n720\n--dub\nFrieren%3A Beyond Journey%27s End\n"
-        );
-        let shims = dir.join("cache").join("shims");
-        assert_eq!(
-            fs::read_to_string(out.join("env.txt")).unwrap(),
-            format!(
-                "{}|Frieren: Beyond Journey's End\nSousou no Frieren|{}\n",
-                shims.join("menu").display(),
-                shims.display()
-            )
-        );
-        assert_eq!(fs::read_to_string(out.join("tty.txt")).unwrap(), "yes\n");
-        assert!(changes.load(Ordering::Relaxed) >= 2);
-        assert_eq!(db.lock().unwrap().list_downloads().unwrap(), [rec]);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn download_failure_reports_detail_then_retry_succeeds() {
-        let dir = temp_dir("fail");
-        let script = fake_ani_cli(
-            &dir.join("bin"),
-            r#"if [ ! -e "$ANI_CLI_DOWNLOAD_DIR/second" ]; then
-  touch "$ANI_CLI_DOWNLOAD_DIR/second"
-  printf '\033[1;31mEpisode is released, but no valid sources!\033[0m\n' >&2
-  exit 1
-fi
-echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode 3.mkv""#,
-        );
-        let (m, db) = manager(script, Duration::from_secs(60));
-        let out = dir.join("out");
-        let id = m.start(&show(), req(), &out).unwrap();
-
-        let rec = wait_for(&m, &id, finished);
-        assert_eq!(rec.status, DlStatus::Failed);
-        assert_eq!(
-            rec.error.as_deref(),
-            Some("Episode is released, but no valid sources!")
-        );
-        assert_eq!(
-            db.lock().unwrap().list_downloads().unwrap()[0].status,
-            DlStatus::Failed
-        );
-
-        m.retry(&id).unwrap();
-        let rec = wait_for(&m, &id, |r| r.status == DlStatus::Done);
-        assert_eq!(rec.error, None);
-        assert_eq!(
-            rec.path.as_deref(),
-            out.join("Frieren Episode 3.mkv").to_str()
-        );
-        assert!(
-            m.retry(&id).is_err(),
-            "only failed or cancelled downloads retry"
-        );
-        assert!(m.retry("nope").is_err());
-
-        m.remove(&id);
-        assert!(m.snapshot().is_empty());
-        assert!(db.lock().unwrap().list_downloads().unwrap().is_empty());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn cancel_kills_process_group() {
-        let dir = temp_dir("cancel");
-        let script = fake_ani_cli(
-            &dir.join("bin"),
-            r#"sleep 30 &
-echo $! > "$ANI_CLI_DOWNLOAD_DIR/child.pid"
-printf '[download]   1.0%% of ~100.00MiB at  1.00MiB/s ETA 09:00\n'
-wait"#,
-        );
-        let (m, _db) = manager(script, Duration::from_secs(60));
-        let out = dir.join("out");
-        let id = m.start(&show(), req(), &out).unwrap();
-        let (_, progress) = {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                let snap = m.snapshot().into_iter().find(|(r, _)| r.id == id).unwrap();
-                if snap.1.as_ref().and_then(|p| p.percent) == Some(1.0) {
-                    break snap;
-                }
-                assert!(Instant::now() < deadline, "no progress: {snap:?}");
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        };
-        assert_eq!(progress.unwrap().eta.as_deref(), Some("09:00"));
-
-        m.cancel(&id);
-        let rec = wait_for(&m, &id, finished);
-        assert_eq!(rec.status, DlStatus::Cancelled);
-        let child: i32 = fs::read_to_string(out.join("child.pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(child), None).is_ok() {
-            assert!(
-                Instant::now() < deadline,
-                "grandchild {child} survived cancel"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn start_rejects_bad_episode_without_running_ani_cli() {
-        let dir = temp_dir("bad-ep");
-        let ran = dir.join("ran");
-        let script = fake_ani_cli(&dir.join("bin"), &format!("touch '{}'", ran.display()));
-        let (m, db) = manager(script, Duration::from_secs(60));
-        let bad = EpisodeRequest {
-            ep: "1\\|x$|touch FILE|e;#".into(),
-            ..req()
-        };
-        let err = m.start(&show(), bad, &dir.join("out")).unwrap_err();
-        assert!(err.to_string().contains("not a valid episode"), "{err}");
-        std::thread::sleep(Duration::from_millis(300));
-        assert!(!ran.exists(), "ani-cli ran for an invalid episode");
-        assert!(m.snapshot().is_empty());
-        assert!(db.lock().unwrap().list_downloads().unwrap().is_empty());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A fake ani-cli that logs its episode to `<dir>/started.log`, then
-    /// waits for `<dir>/release` before finishing the download.
-    fn gated_ani_cli(dir: &Path) -> PathBuf {
-        fake_ani_cli(
-            &dir.join("bin"),
-            &format!(
-                r#"while [ $# -gt 0 ]; do [ "$1" = -e ] && ep=$2; shift; done
-echo "$ep" >> '{log}'
-while [ ! -e '{release}' ]; do sleep 0.05; done
-echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode $ep.mp4""#,
-                log = dir.join("started.log").display(),
-                release = dir.join("release").display(),
-            ),
-        )
-    }
-
-    fn started_eps(dir: &Path) -> Vec<String> {
-        let mut eps: Vec<String> = fs::read_to_string(dir.join("started.log"))
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect();
-        eps.sort();
-        eps
-    }
-
-    fn start_ep(m: &DownloadManager, dir: &Path, ep: u32) -> String {
-        let req = EpisodeRequest {
-            ep: ep.to_string(),
-            ..req()
-        };
-        m.start(&show(), req, &dir.join(format!("out{ep}")))
-            .unwrap()
-    }
-
-    fn status_of(m: &DownloadManager, id: &str) -> DlStatus {
-        m.snapshot()
+    fn read_lines_splits_cr_and_lf() {
+        let (tx, rx) = mpsc::channel();
+        let data = b"first\rsecond\nthird\r\ntrailing";
+        read_lines(&data[..], tx);
+        let lines: Vec<String> = rx
             .into_iter()
-            .find(|(r, _)| r.id == id)
-            .map(|(r, _)| r.status)
-            .unwrap()
-    }
-
-    #[test]
-    fn downloads_run_two_at_a_time() {
-        let dir = temp_dir("queue");
-        let (m, _db) = manager(gated_ani_cli(&dir), Duration::from_secs(60));
-        let ids: Vec<String> = (1..=4).map(|ep| start_ep(&m, &dir, ep)).collect();
-        wait_for(&m, &ids[1], |r| r.status == DlStatus::Running);
-        wait_for(&m, &ids[0], |r| r.status == DlStatus::Running);
-        std::thread::sleep(Duration::from_millis(400));
-        assert_eq!(started_eps(&dir), ["1", "2"]);
-        assert_eq!(status_of(&m, &ids[2]), DlStatus::Queued);
-        assert_eq!(status_of(&m, &ids[3]), DlStatus::Queued);
-
-        fs::write(dir.join("release"), b"").unwrap();
-        for id in &ids {
-            assert_eq!(wait_for(&m, id, finished).status, DlStatus::Done);
-        }
-        assert_eq!(started_eps(&dir), ["1", "2", "3", "4"]);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn cancel_while_queued_never_runs_then_retry_requeues() {
-        let dir = temp_dir("queue-cancel");
-        let (m, db) = manager(gated_ani_cli(&dir), Duration::from_secs(60));
-        let ids: Vec<String> = (1..=3).map(|ep| start_ep(&m, &dir, ep)).collect();
-        wait_for(&m, &ids[0], |r| r.status == DlStatus::Running);
-        wait_for(&m, &ids[1], |r| r.status == DlStatus::Running);
-        m.cancel(&ids[2]);
-        assert_eq!(status_of(&m, &ids[2]), DlStatus::Cancelled);
-        let saved = db.lock().unwrap().list_downloads().unwrap();
-        let saved = saved.iter().find(|r| r.id == ids[2]).unwrap();
-        assert_eq!(saved.status, DlStatus::Cancelled);
-
-        fs::write(dir.join("release"), b"").unwrap();
-        for id in &ids[..2] {
-            assert_eq!(wait_for(&m, id, finished).status, DlStatus::Done);
-        }
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(started_eps(&dir), ["1", "2"]);
-        assert_eq!(status_of(&m, &ids[2]), DlStatus::Cancelled);
-
-        m.retry(&ids[2]).unwrap();
-        assert_eq!(wait_for(&m, &ids[2], finished).status, DlStatus::Done);
-        assert_eq!(started_eps(&dir), ["1", "2", "3"]);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn shutdown_drops_queued_downloads() {
-        let dir = temp_dir("queue-shutdown");
-        let (m, _db) = manager(gated_ani_cli(&dir), Duration::from_secs(60));
-        let ids: Vec<String> = (1..=3).map(|ep| start_ep(&m, &dir, ep)).collect();
-        wait_for(&m, &ids[0], |r| r.status == DlStatus::Running);
-        wait_for(&m, &ids[1], |r| r.status == DlStatus::Running);
-        m.shutdown();
-        fs::write(dir.join("release"), b"").unwrap();
-        std::thread::sleep(Duration::from_millis(600));
-        assert_eq!(started_eps(&dir), ["1", "2"]);
-        for id in &ids {
-            assert_eq!(status_of(&m, id), DlStatus::Failed);
-        }
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn download_needs_pick_fails_with_hint() {
-        let dir = temp_dir("pick");
-        let script = fake_ani_cli(
-            &dir.join("bin"),
-            r#"printf '["A","B"]' > "$ANI_GUI_MENU_OUT"
-printf 'Invalid anime selection\n' >&2
-exit 1"#,
-        );
-        let (m, _db) = manager(script, Duration::from_secs(60));
-        let id = m.start(&show(), req(), &dir.join("out")).unwrap();
-        let rec = wait_for(&m, &id, finished);
-        assert_eq!(rec.status, DlStatus::Failed);
-        assert_eq!(
-            rec.error.as_deref(),
-            Some("Pick the matching title on the show page first")
-        );
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn download_stall_fails() {
-        let dir = temp_dir("stall");
-        let script = fake_ani_cli(
-            &dir.join("bin"),
-            r#"printf '[download]  40.0%% of ~100.00MiB at  1.00MiB/s ETA 01:00\n'
-sleep 30"#,
-        );
-        let (m, _db) = manager(script, Duration::from_secs(1));
-        let begun = Instant::now();
-        let id = m.start(&show(), req(), &dir.join("out")).unwrap();
-        let rec = wait_for(&m, &id, finished);
-        assert_eq!(rec.status, DlStatus::Failed);
-        assert_eq!(rec.error.as_deref(), Some("stalled"));
-        assert_eq!(rec.progress, 40.0);
-        assert!(begun.elapsed() < Duration::from_secs(8));
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn pty_fds_are_cloexec() {
-        use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-        use std::os::fd::AsFd;
-
-        let (master, slave) = open_pty().unwrap();
-        for fd in [master.as_fd(), slave.as_fd()] {
-            let flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD).unwrap());
-            assert!(flags.contains(FdFlag::FD_CLOEXEC));
-        }
-        assert!(nix::unistd::isatty(&slave).unwrap());
-    }
-
-    #[test]
-    fn concurrent_downloads_all_finish() {
-        let dir = temp_dir("concurrent");
-        let script = fake_ani_cli(
-            &dir.join("bin"),
-            r#"while [ $# -gt 0 ]; do [ "$1" = -e ] && ep=$2; shift; done
-case "$ep" in
-  1|3|5) ;;
-  *) for p in 10 20 30 40 50 60 70 80; do
-       printf '[download]  %s.0%% of ~10.00MiB at  1.00MiB/s ETA 00:01\n' "$p"
-       sleep 0.25
-     done ;;
-esac
-echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode $ep.mp4""#,
-        );
-        let (m, _db) = manager(script, Duration::from_secs(1));
-        let ids: Vec<String> = (1..=6)
-            .map(|ep| {
-                let req = EpisodeRequest {
-                    ep: ep.to_string(),
-                    ..req()
-                };
-                m.start(&show(), req, &dir.join(format!("out{ep}")))
-                    .unwrap()
-            })
+            .map(|l| String::from_utf8(l).unwrap())
             .collect();
-        for (ep, id) in (1..=6).zip(&ids) {
-            let rec = wait_for(&m, id, finished);
-            assert_eq!(rec.status, DlStatus::Done, "episode {ep}: {rec:?}");
-            assert_eq!(
-                rec.path.as_deref(),
-                dir.join(format!("out{ep}/Frieren Episode {ep}.mp4"))
-                    .to_str()
-            );
-        }
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn exited_download_does_not_wait_for_lingering_pty_holder() {
-        let dir = temp_dir("linger");
-        // The background sleep keeps the pty open long after ani-cli exits 0.
-        let script = fake_ani_cli(
-            &dir.join("bin"),
-            r#"echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode 3.mp4"
-sleep 8 &
-exit 0"#,
-        );
-        let (m, _db) = manager(script, Duration::from_secs(1));
-        let begun = Instant::now();
-        let id = m.start(&show(), req(), &dir.join("out")).unwrap();
-        let rec = wait_for(&m, &id, finished);
-        assert_eq!(rec.status, DlStatus::Done, "{rec:?}");
-        assert!(
-            begun.elapsed() < Duration::from_secs(5),
-            "{:?}",
-            begun.elapsed()
-        );
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn shutdown_stops_active_downloads() {
-        let dir = temp_dir("shutdown");
-        let script = fake_ani_cli(
-            &dir.join("bin"),
-            r#"trap '' TERM
-sleep 30 &
-echo $! > "$ANI_CLI_DOWNLOAD_DIR/child.pid"
-printf '[download]   5.0%% of ~100.00MiB at  1.00MiB/s ETA 09:00\n'
-wait"#,
-        );
-        let (m, db) = manager(script, Duration::from_secs(60));
-        let out = dir.join("out");
-        let id = m.start(&show(), req(), &out).unwrap();
-        wait_for(&m, &id, |r| {
-            r.status == DlStatus::Running && r.progress == 5.0
-        });
-
-        let begun = Instant::now();
-        m.shutdown();
-        assert!(
-            begun.elapsed() < Duration::from_secs(4),
-            "{:?}",
-            begun.elapsed()
-        );
-        let child: i32 = fs::read_to_string(out.join("child.pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(child), None).is_ok() {
-            assert!(
-                Instant::now() < deadline,
-                "grandchild {child} survived shutdown"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        // The worker winding down afterwards must not overwrite the record.
-        std::thread::sleep(Duration::from_millis(500));
-        let saved = db.lock().unwrap().list_downloads().unwrap().remove(0);
-        assert_eq!(saved.status, DlStatus::Failed);
-        assert_eq!(saved.error.as_deref(), Some("app closed"));
-        assert_eq!(m.snapshot()[0].0, saved);
-        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(lines, ["first", "second", "third", "", "trailing"]);
     }
 
     #[test]
@@ -1628,39 +1275,548 @@ wait"#,
         );
     }
 
-    #[test]
-    fn download_events_report_started_finished_and_failed() {
-        let dir = temp_dir("events");
-        let ok_script = fake_ani_cli(
-            &dir.join("bin-ok"),
-            r#"printf 'ok' > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode 3.mp4""#,
-        );
-        let (m, _db) = manager(ok_script, Duration::from_secs(60));
-        let id = m.start(&show(), req(), &dir.join("out-ok")).unwrap();
-        let rec = wait_for(&m, &id, finished);
-        assert_eq!(rec.status, DlStatus::Done, "{rec:?}");
-        let events = m.take_events();
-        assert_eq!(events.len(), 2, "{events:?}");
-        assert!(matches!(
-            &events[0],
-            DownloadEvent::Started { id: eid, ep, .. } if eid == &id && ep == "3"
-        ));
-        assert!(matches!(
-            &events[1],
-            DownloadEvent::Finished { id: eid, ep, .. } if eid == &id && ep == "3"
-        ));
-        assert!(m.take_events().is_empty());
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
 
-        let fail_script = fake_ani_cli(&dir.join("bin-fail"), "echo 'boom' >&2; exit 1");
-        let (m2, _db2) = manager(fail_script, Duration::from_secs(60));
-        let id2 = m2.start(&show(), req(), &dir.join("out-fail")).unwrap();
-        let rec2 = wait_for(&m2, &id2, finished);
-        assert_eq!(rec2.status, DlStatus::Failed, "{rec2:?}");
-        let events2 = m2.take_events();
-        assert!(matches!(
-            &events2.last(),
-            Some(DownloadEvent::Failed { id: eid, error, .. }) if eid == &id2 && error.contains("boom")
-        ));
-        fs::remove_dir_all(&dir).unwrap();
+        /// A stand-in for ani-cli: `body` runs under `sh` with the real arguments.
+        fn fake_ani_cli(dir: &Path, body: &str) -> PathBuf {
+            fs::create_dir_all(dir).unwrap();
+            let path = dir.join("fake-ani-cli");
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+
+        fn show() -> ShowSummary {
+            ShowSummary {
+                id: "ReHMC7TQnch3C6z8j".into(),
+                title: "Sousou no Frieren".into(),
+                english_title: Some("Frieren: Beyond Journey's End".into()),
+                sub_count: 28,
+                dub_count: 28,
+                ..Default::default()
+            }
+        }
+
+        fn req() -> EpisodeRequest {
+            EpisodeRequest {
+                query: "Frieren: Beyond Journey's End".into(),
+                want_titles: vec![
+                    "Frieren: Beyond Journey's End".into(),
+                    "Sousou no Frieren".into(),
+                ],
+                select_index: Some(1),
+                ep: "3".into(),
+                mode: Mode::Dub,
+                quality: "720".into(),
+            }
+        }
+
+        /// The fake ani-cli lives in `<dir>/bin`; shims go under `<dir>/cache`.
+        fn manager(program: PathBuf, stall_after: Duration) -> (DownloadManager, Arc<Mutex<Db>>) {
+            let db = Arc::new(Mutex::new(Db::open_in_memory().unwrap()));
+            let cache = program.parent().unwrap().parent().unwrap().join("cache");
+            let m = DownloadManager::with_runner(db.clone(), Some(program), cache, stall_after);
+            (m, db)
+        }
+
+        fn wait_for(
+            m: &DownloadManager,
+            id: &str,
+            done: impl Fn(&DownloadRecord) -> bool,
+        ) -> DownloadRecord {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let rec = m
+                    .snapshot()
+                    .into_iter()
+                    .find(|(r, _)| r.id == id)
+                    .map(|(r, _)| r);
+                if let Some(rec) = rec.filter(|r| done(r)) {
+                    return rec;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {id}: {:?}",
+                    m.snapshot()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn finished(r: &DownloadRecord) -> bool {
+            matches!(
+                r.status,
+                DlStatus::Done | DlStatus::Failed | DlStatus::Cancelled
+            )
+        }
+
+        #[test]
+        fn download_runs_to_done_under_pty() {
+            let dir = temp_dir("done");
+            let script = fake_ani_cli(
+                &dir.join("bin"),
+                r#"printf '%s\n' "$@" > "$ANI_CLI_DOWNLOAD_DIR/args.txt"
+printf '%s|%s|%s\n' "$ANI_CLI_MENU" "$ANI_GUI_WANT_TITLES" "${PATH%%:*}" > "$ANI_CLI_DOWNLOAD_DIR/env.txt"
+test -t 1 && echo yes > "$ANI_CLI_DOWNLOAD_DIR/tty.txt"
+printf '[download]  10.0%% of ~100.00MiB at  1.00MiB/s ETA 01:30\r'
+printf '[download]  55.5%% of ~100.00MiB at  2.00MiB/s ETA 00:20\r'
+echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Beyond Journeys End Episode 3.mp4"
+printf '[download] 100%% of  100.00MiB in 00:00:40 at 2.50MiB/s\n'"#,
+            );
+            let (m, db) = manager(script, Duration::from_secs(60));
+            let changes = Arc::new(AtomicUsize::new(0));
+            let counter = changes.clone();
+            m.set_on_change(Box::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }));
+            let out = dir.join("out");
+            let id = m.start(&show(), req(), &out).unwrap();
+
+            let rec = wait_for(&m, &id, finished);
+            assert_eq!(rec.status, DlStatus::Done, "{rec:?}");
+            assert_eq!(
+                rec.path.as_deref(),
+                out.join("Frieren Beyond Journeys End Episode 3.mp4")
+                    .to_str()
+            );
+            assert_eq!(rec.progress, 100.0);
+            assert_eq!(
+                (rec.show_id.as_str(), rec.ep.as_str(), rec.mode),
+                ("ReHMC7TQnch3C6z8j", "3", Mode::Dub)
+            );
+            assert_eq!(rec.quality, "720");
+            assert_eq!(
+                fs::read_to_string(out.join("args.txt")).unwrap(),
+                "-d\n-S\n1\n-e\n3\n-q\n720\n--dub\nFrieren%3A Beyond Journey%27s End\n"
+            );
+            let shims = dir.join("cache").join("shims");
+            assert_eq!(
+                fs::read_to_string(out.join("env.txt")).unwrap(),
+                format!(
+                    "{}|Frieren: Beyond Journey's End\nSousou no Frieren|{}\n",
+                    shims.join("menu").display(),
+                    shims.display()
+                )
+            );
+            assert_eq!(fs::read_to_string(out.join("tty.txt")).unwrap(), "yes\n");
+            assert!(changes.load(Ordering::Relaxed) >= 2);
+            assert_eq!(db.lock().unwrap().list_downloads().unwrap(), [rec]);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn download_failure_reports_detail_then_retry_succeeds() {
+            let dir = temp_dir("fail");
+            let script = fake_ani_cli(
+                &dir.join("bin"),
+                r#"if [ ! -e "$ANI_CLI_DOWNLOAD_DIR/second" ]; then
+  touch "$ANI_CLI_DOWNLOAD_DIR/second"
+  printf '\033[1;31mEpisode is released, but no valid sources!\033[0m\n' >&2
+  exit 1
+fi
+echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode 3.mkv""#,
+            );
+            let (m, db) = manager(script, Duration::from_secs(60));
+            let out = dir.join("out");
+            let id = m.start(&show(), req(), &out).unwrap();
+
+            let rec = wait_for(&m, &id, finished);
+            assert_eq!(rec.status, DlStatus::Failed);
+            assert_eq!(
+                rec.error.as_deref(),
+                Some("Episode is released, but no valid sources!")
+            );
+            assert_eq!(
+                db.lock().unwrap().list_downloads().unwrap()[0].status,
+                DlStatus::Failed
+            );
+
+            m.retry(&id).unwrap();
+            let rec = wait_for(&m, &id, |r| r.status == DlStatus::Done);
+            assert_eq!(rec.error, None);
+            assert_eq!(
+                rec.path.as_deref(),
+                out.join("Frieren Episode 3.mkv").to_str()
+            );
+            assert!(
+                m.retry(&id).is_err(),
+                "only failed or cancelled downloads retry"
+            );
+            assert!(m.retry("nope").is_err());
+
+            m.remove(&id);
+            assert!(m.snapshot().is_empty());
+            assert!(db.lock().unwrap().list_downloads().unwrap().is_empty());
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn cancel_kills_process_group() {
+            let dir = temp_dir("cancel");
+            let script = fake_ani_cli(
+                &dir.join("bin"),
+                r#"sleep 30 &
+echo $! > "$ANI_CLI_DOWNLOAD_DIR/child.pid"
+printf '[download]   1.0%% of ~100.00MiB at  1.00MiB/s ETA 09:00\n'
+wait"#,
+            );
+            let (m, _db) = manager(script, Duration::from_secs(60));
+            let out = dir.join("out");
+            let id = m.start(&show(), req(), &out).unwrap();
+            let (_, progress) = {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    let snap = m.snapshot().into_iter().find(|(r, _)| r.id == id).unwrap();
+                    if snap.1.as_ref().and_then(|p| p.percent) == Some(1.0) {
+                        break snap;
+                    }
+                    assert!(Instant::now() < deadline, "no progress: {snap:?}");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            };
+            assert_eq!(progress.unwrap().eta.as_deref(), Some("09:00"));
+
+            m.cancel(&id);
+            let rec = wait_for(&m, &id, finished);
+            assert_eq!(rec.status, DlStatus::Cancelled);
+            let child: i32 = fs::read_to_string(out.join("child.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while nix::sys::signal::kill(nix::unistd::Pid::from_raw(child), None).is_ok() {
+                assert!(
+                    Instant::now() < deadline,
+                    "grandchild {child} survived cancel"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn start_rejects_bad_episode_without_running_ani_cli() {
+            let dir = temp_dir("bad-ep");
+            let ran = dir.join("ran");
+            let script = fake_ani_cli(&dir.join("bin"), &format!("touch '{}'", ran.display()));
+            let (m, db) = manager(script, Duration::from_secs(60));
+            let bad = EpisodeRequest {
+                ep: "1\\|x$|touch FILE|e;#".into(),
+                ..req()
+            };
+            let err = m.start(&show(), bad, &dir.join("out")).unwrap_err();
+            assert!(err.to_string().contains("not a valid episode"), "{err}");
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(!ran.exists(), "ani-cli ran for an invalid episode");
+            assert!(m.snapshot().is_empty());
+            assert!(db.lock().unwrap().list_downloads().unwrap().is_empty());
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// A fake ani-cli that logs its episode to `<dir>/started.log`, then
+        /// waits for `<dir>/release` before finishing the download.
+        fn gated_ani_cli(dir: &Path) -> PathBuf {
+            fake_ani_cli(
+                &dir.join("bin"),
+                &format!(
+                    r#"while [ $# -gt 0 ]; do [ "$1" = -e ] && ep=$2; shift; done
+echo "$ep" >> '{log}'
+while [ ! -e '{release}' ]; do sleep 0.05; done
+echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode $ep.mp4""#,
+                    log = dir.join("started.log").display(),
+                    release = dir.join("release").display(),
+                ),
+            )
+        }
+
+        fn started_eps(dir: &Path) -> Vec<String> {
+            let mut eps: Vec<String> = fs::read_to_string(dir.join("started.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect();
+            eps.sort();
+            eps
+        }
+
+        fn start_ep(m: &DownloadManager, dir: &Path, ep: u32) -> String {
+            let req = EpisodeRequest {
+                ep: ep.to_string(),
+                ..req()
+            };
+            m.start(&show(), req, &dir.join(format!("out{ep}")))
+                .unwrap()
+        }
+
+        fn status_of(m: &DownloadManager, id: &str) -> DlStatus {
+            m.snapshot()
+                .into_iter()
+                .find(|(r, _)| r.id == id)
+                .map(|(r, _)| r.status)
+                .unwrap()
+        }
+
+        #[test]
+        fn downloads_run_two_at_a_time() {
+            let dir = temp_dir("queue");
+            let (m, _db) = manager(gated_ani_cli(&dir), Duration::from_secs(60));
+            let ids: Vec<String> = (1..=4).map(|ep| start_ep(&m, &dir, ep)).collect();
+            wait_for(&m, &ids[1], |r| r.status == DlStatus::Running);
+            wait_for(&m, &ids[0], |r| r.status == DlStatus::Running);
+            std::thread::sleep(Duration::from_millis(400));
+            assert_eq!(started_eps(&dir), ["1", "2"]);
+            assert_eq!(status_of(&m, &ids[2]), DlStatus::Queued);
+            assert_eq!(status_of(&m, &ids[3]), DlStatus::Queued);
+
+            fs::write(dir.join("release"), b"").unwrap();
+            for id in &ids {
+                assert_eq!(wait_for(&m, id, finished).status, DlStatus::Done);
+            }
+            assert_eq!(started_eps(&dir), ["1", "2", "3", "4"]);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn cancel_while_queued_never_runs_then_retry_requeues() {
+            let dir = temp_dir("queue-cancel");
+            let (m, db) = manager(gated_ani_cli(&dir), Duration::from_secs(60));
+            let ids: Vec<String> = (1..=3).map(|ep| start_ep(&m, &dir, ep)).collect();
+            wait_for(&m, &ids[0], |r| r.status == DlStatus::Running);
+            wait_for(&m, &ids[1], |r| r.status == DlStatus::Running);
+            m.cancel(&ids[2]);
+            assert_eq!(status_of(&m, &ids[2]), DlStatus::Cancelled);
+            let saved = db.lock().unwrap().list_downloads().unwrap();
+            let saved = saved.iter().find(|r| r.id == ids[2]).unwrap();
+            assert_eq!(saved.status, DlStatus::Cancelled);
+
+            fs::write(dir.join("release"), b"").unwrap();
+            for id in &ids[..2] {
+                assert_eq!(wait_for(&m, id, finished).status, DlStatus::Done);
+            }
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(started_eps(&dir), ["1", "2"]);
+            assert_eq!(status_of(&m, &ids[2]), DlStatus::Cancelled);
+
+            m.retry(&ids[2]).unwrap();
+            assert_eq!(wait_for(&m, &ids[2], finished).status, DlStatus::Done);
+            assert_eq!(started_eps(&dir), ["1", "2", "3"]);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn shutdown_drops_queued_downloads() {
+            let dir = temp_dir("queue-shutdown");
+            let (m, _db) = manager(gated_ani_cli(&dir), Duration::from_secs(60));
+            let ids: Vec<String> = (1..=3).map(|ep| start_ep(&m, &dir, ep)).collect();
+            wait_for(&m, &ids[0], |r| r.status == DlStatus::Running);
+            wait_for(&m, &ids[1], |r| r.status == DlStatus::Running);
+            m.shutdown();
+            fs::write(dir.join("release"), b"").unwrap();
+            std::thread::sleep(Duration::from_millis(600));
+            assert_eq!(started_eps(&dir), ["1", "2"]);
+            for id in &ids {
+                assert_eq!(status_of(&m, id), DlStatus::Failed);
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn download_needs_pick_fails_with_hint() {
+            let dir = temp_dir("pick");
+            let script = fake_ani_cli(
+                &dir.join("bin"),
+                r#"printf '["A","B"]' > "$ANI_GUI_MENU_OUT"
+printf 'Invalid anime selection\n' >&2
+exit 1"#,
+            );
+            let (m, _db) = manager(script, Duration::from_secs(60));
+            let id = m.start(&show(), req(), &dir.join("out")).unwrap();
+            let rec = wait_for(&m, &id, finished);
+            assert_eq!(rec.status, DlStatus::Failed);
+            assert_eq!(
+                rec.error.as_deref(),
+                Some("Pick the matching title on the show page first")
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn download_stall_fails() {
+            let dir = temp_dir("stall");
+            let script = fake_ani_cli(
+                &dir.join("bin"),
+                r#"printf '[download]  40.0%% of ~100.00MiB at  1.00MiB/s ETA 01:00\n'
+sleep 30"#,
+            );
+            let (m, _db) = manager(script, Duration::from_secs(1));
+            let begun = Instant::now();
+            let id = m.start(&show(), req(), &dir.join("out")).unwrap();
+            let rec = wait_for(&m, &id, finished);
+            assert_eq!(rec.status, DlStatus::Failed);
+            assert_eq!(rec.error.as_deref(), Some("stalled"));
+            assert_eq!(rec.progress, 40.0);
+            assert!(begun.elapsed() < Duration::from_secs(8));
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn pty_fds_are_cloexec() {
+            use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+            use std::os::fd::AsFd;
+
+            let (master, slave) = open_pty().unwrap();
+            for fd in [master.as_fd(), slave.as_fd()] {
+                let flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD).unwrap());
+                assert!(flags.contains(FdFlag::FD_CLOEXEC));
+            }
+            assert!(nix::unistd::isatty(&slave).unwrap());
+        }
+
+        #[test]
+        fn concurrent_downloads_all_finish() {
+            let dir = temp_dir("concurrent");
+            let script = fake_ani_cli(
+                &dir.join("bin"),
+                r#"while [ $# -gt 0 ]; do [ "$1" = -e ] && ep=$2; shift; done
+case "$ep" in
+  1|3|5) ;;
+  *) for p in 10 20 30 40 50 60 70 80; do
+       printf '[download]  %s.0%% of ~10.00MiB at  1.00MiB/s ETA 00:01\n' "$p"
+       sleep 0.25
+     done ;;
+esac
+echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode $ep.mp4""#,
+            );
+            let (m, _db) = manager(script, Duration::from_secs(1));
+            let ids: Vec<String> = (1..=6)
+                .map(|ep| {
+                    let req = EpisodeRequest {
+                        ep: ep.to_string(),
+                        ..req()
+                    };
+                    m.start(&show(), req, &dir.join(format!("out{ep}")))
+                        .unwrap()
+                })
+                .collect();
+            for (ep, id) in (1..=6).zip(&ids) {
+                let rec = wait_for(&m, id, finished);
+                assert_eq!(rec.status, DlStatus::Done, "episode {ep}: {rec:?}");
+                assert_eq!(
+                    rec.path.as_deref(),
+                    dir.join(format!("out{ep}/Frieren Episode {ep}.mp4"))
+                        .to_str()
+                );
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn exited_download_does_not_wait_for_lingering_pty_holder() {
+            let dir = temp_dir("linger");
+            // The background sleep keeps the pty open long after ani-cli exits 0.
+            let script = fake_ani_cli(
+                &dir.join("bin"),
+                r#"echo x > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode 3.mp4"
+sleep 8 &
+exit 0"#,
+            );
+            let (m, _db) = manager(script, Duration::from_secs(1));
+            let begun = Instant::now();
+            let id = m.start(&show(), req(), &dir.join("out")).unwrap();
+            let rec = wait_for(&m, &id, finished);
+            assert_eq!(rec.status, DlStatus::Done, "{rec:?}");
+            assert!(
+                begun.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                begun.elapsed()
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn shutdown_stops_active_downloads() {
+            let dir = temp_dir("shutdown");
+            let script = fake_ani_cli(
+                &dir.join("bin"),
+                r#"trap '' TERM
+sleep 30 &
+echo $! > "$ANI_CLI_DOWNLOAD_DIR/child.pid"
+printf '[download]   5.0%% of ~100.00MiB at  1.00MiB/s ETA 09:00\n'
+wait"#,
+            );
+            let (m, db) = manager(script, Duration::from_secs(60));
+            let out = dir.join("out");
+            let id = m.start(&show(), req(), &out).unwrap();
+            wait_for(&m, &id, |r| {
+                r.status == DlStatus::Running && r.progress == 5.0
+            });
+
+            let begun = Instant::now();
+            m.shutdown();
+            assert!(
+                begun.elapsed() < Duration::from_secs(4),
+                "{:?}",
+                begun.elapsed()
+            );
+            let child: i32 = fs::read_to_string(out.join("child.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while nix::sys::signal::kill(nix::unistd::Pid::from_raw(child), None).is_ok() {
+                assert!(
+                    Instant::now() < deadline,
+                    "grandchild {child} survived shutdown"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // The worker winding down afterwards must not overwrite the record.
+            std::thread::sleep(Duration::from_millis(500));
+            let saved = db.lock().unwrap().list_downloads().unwrap().remove(0);
+            assert_eq!(saved.status, DlStatus::Failed);
+            assert_eq!(saved.error.as_deref(), Some("app closed"));
+            assert_eq!(m.snapshot()[0].0, saved);
+            fs::remove_dir_all(&dir).unwrap();
+        }
+
+        #[test]
+        fn download_events_report_started_finished_and_failed() {
+            let dir = temp_dir("events");
+            let ok_script = fake_ani_cli(
+                &dir.join("bin-ok"),
+                r#"printf 'ok' > "$ANI_CLI_DOWNLOAD_DIR/Frieren Episode 3.mp4""#,
+            );
+            let (m, _db) = manager(ok_script, Duration::from_secs(60));
+            let id = m.start(&show(), req(), &dir.join("out-ok")).unwrap();
+            let rec = wait_for(&m, &id, finished);
+            assert_eq!(rec.status, DlStatus::Done, "{rec:?}");
+            let events = m.take_events();
+            assert_eq!(events.len(), 2, "{events:?}");
+            assert!(matches!(
+                &events[0],
+                DownloadEvent::Started { id: eid, ep, .. } if eid == &id && ep == "3"
+            ));
+            assert!(matches!(
+                &events[1],
+                DownloadEvent::Finished { id: eid, ep, .. } if eid == &id && ep == "3"
+            ));
+            assert!(m.take_events().is_empty());
+
+            let fail_script = fake_ani_cli(&dir.join("bin-fail"), "echo 'boom' >&2; exit 1");
+            let (m2, _db2) = manager(fail_script, Duration::from_secs(60));
+            let id2 = m2.start(&show(), req(), &dir.join("out-fail")).unwrap();
+            let rec2 = wait_for(&m2, &id2, finished);
+            assert_eq!(rec2.status, DlStatus::Failed, "{rec2:?}");
+            let events2 = m2.take_events();
+            assert!(matches!(
+                &events2.last(),
+                Some(DownloadEvent::Failed { id: eid, error, .. }) if eid == &id2 && error.contains("boom")
+            ));
+            fs::remove_dir_all(&dir).unwrap();
+        }
     }
 }

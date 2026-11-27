@@ -16,8 +16,10 @@ use anyhow::Result;
 use linux::Inhibitor;
 #[cfg(target_os = "macos")]
 use macos::Inhibitor;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use other::Inhibitor;
+#[cfg(target_os = "windows")]
+use windows::Inhibitor;
 
 /// The application name desktops show next to the inhibition.
 const APP_NAME: &str = "ani-gui";
@@ -446,7 +448,44 @@ mod macos {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+mod windows {
+    //! Keeps the display and system awake on the keep-awake worker thread via
+    //! `SetThreadExecutionState`. Both `acquire` and `drop` always run on the
+    //! same worker thread.
+
+    use anyhow::{Result, bail};
+    use windows_sys::Win32::System::Power::{
+        ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+    };
+
+    pub struct Inhibitor;
+
+    impl Inhibitor {
+        pub fn acquire(_app: &str, _reason: &str) -> Result<Inhibitor> {
+            // SAFETY: SetThreadExecutionState takes only bitflags and has no
+            // pointer or memory preconditions.
+            let prev = unsafe {
+                SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)
+            };
+            if prev == 0 {
+                bail!("SetThreadExecutionState failed");
+            }
+            Ok(Inhibitor)
+        }
+    }
+
+    impl Drop for Inhibitor {
+        fn drop(&mut self) {
+            // SAFETY: clears the display/system requirement for this thread.
+            unsafe {
+                SetThreadExecutionState(ES_CONTINUOUS);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod other {
     //! No inhibition on this platform; the guard does nothing.
 

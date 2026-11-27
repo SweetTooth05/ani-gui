@@ -1141,8 +1141,8 @@ fn parse_dir(typed: &str, home: Option<&Path>) -> Result<PathBuf, String> {
     let typed = typed.trim();
     let dir = match (typed.strip_prefix('~'), home) {
         (Some(""), Some(home)) => home.to_path_buf(),
-        (Some(rest), Some(home)) if rest.starts_with('/') => {
-            home.join(rest.trim_start_matches('/'))
+        (Some(rest), Some(home)) if rest.starts_with('/') || rest.starts_with('\\') => {
+            home.join(rest.trim_start_matches(['/', '\\']))
         }
         _ => PathBuf::from(typed),
     };
@@ -1150,7 +1150,11 @@ fn parse_dir(typed: &str, home: Option<&Path>) -> Result<PathBuf, String> {
         return Err("Type the folder to save downloads in.".into());
     }
     if !dir.is_absolute() {
-        return Err("Use a full path, starting with / or ~/.".into());
+        return Err(if cfg!(target_os = "windows") {
+            "Use a full path, starting with a drive letter (e.g. C:\\) or ~/.".into()
+        } else {
+            "Use a full path, starting with / or ~/.".into()
+        });
     }
     Ok(dir)
 }
@@ -1179,26 +1183,29 @@ mod tests {
         // The probe file is gone afterwards.
         assert_eq!(std::fs::read_dir(&nested).unwrap().count(), 0);
         std::fs::remove_dir_all(&dir).unwrap();
-        // System folders aren't writable by a normal user.
-        // SAFETY: geteuid has no preconditions.
-        if unsafe { nix::libc::geteuid() } != 0 {
-            assert!(prepare_dir(Path::new("/")).is_err());
-            assert!(prepare_dir(Path::new("/usr")).is_err());
+        #[cfg(unix)]
+        {
+            // System folders aren't writable by a normal user.
+            // SAFETY: geteuid has no preconditions.
+            if unsafe { nix::libc::geteuid() } != 0 {
+                assert!(prepare_dir(Path::new("/")).is_err());
+                assert!(prepare_dir(Path::new("/usr")).is_err());
+            }
         }
     }
 
     #[test]
     fn parse_dir_expands_home_and_needs_full_paths() {
-        let home = Path::new("/home/k");
+        #[cfg(windows)]
+        let (home, abs) = (Path::new(r"C:\Users\k"), r"D:\media");
+        #[cfg(not(windows))]
+        let (home, abs) = (Path::new("/home/k"), "/mnt/media");
         assert_eq!(
             parse_dir("~/Videos/anime ", Some(home)),
-            Ok(PathBuf::from("/home/k/Videos/anime"))
+            Ok(home.join("Videos/anime"))
         );
-        assert_eq!(parse_dir("~", Some(home)), Ok(PathBuf::from("/home/k")));
-        assert_eq!(
-            parse_dir("/mnt/media", Some(home)),
-            Ok(PathBuf::from("/mnt/media"))
-        );
+        assert_eq!(parse_dir("~", Some(home)), Ok(home.to_path_buf()));
+        assert_eq!(parse_dir(abs, Some(home)), Ok(PathBuf::from(abs)));
         assert!(parse_dir("Videos", Some(home)).is_err());
         assert!(parse_dir("  ", Some(home)).is_err());
         assert!(parse_dir("~other/x", Some(home)).is_err());
