@@ -6,12 +6,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3] — 2026-11-28
+
 ### Added
 - **Windows (x64, Windows 10+) support**: per-user Inno Setup 6 installer
   (`ani-gui-windows-x86_64-setup.exe`, no administrator privileges required)
   and portable `.tar.gz` archive (`ani-gui-<version>-x86_64-pc-windows-msvc.tar.gz`)
   with `libmpv-2.dll`, `ani-cli` and `busybox.exe` bundled, plus Windows CI and
-  release builds and a Windows download button in the README.
+  release builds and a Windows download button in the README. Installed copies
+  update themselves like on Linux and macOS.
+- Search opens on a preset listing (Trending now, Popular this season,
+  Upcoming, All-time popular, Top rated) and has multi-select AniList filters:
+  genres and tags to include or exclude, format, status, season, year, source,
+  country, score, length and sort, with "Load more" paging.
+- Show pages list genres and AniList tags as chips that open Search filtered
+  to them; spoiler tags stay hidden unless revealed.
+- Themes (Night, Midnight, Dusk and a light Daylight) and five accent colours.
+- New settings: title language, clock, start page, poster hover details, what
+  Search opens with, spoiler tags, auto-skip openings, Up next countdown, skip
+  step and keep screen awake.
+- One-click MyAnimeList sign-in in official builds, with no Client ID to enter.
+
+### Changed
+- New アニグイ logo in the sidebar, nav icons, and the brand mark in empty
+  states, the error screen and Settings › About.
+
+### Fixed
+- The Search grid no longer drops rows further down the list.
 
 ## [0.0.2] — 2026-11-25
 
